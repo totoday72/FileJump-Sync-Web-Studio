@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# FileJump local configuration and generated data
+sync_config.json
+sync_records/
+temp_cache/
