@@ -298,44 +298,92 @@ class FileJumpClient:
         }
 
     def list_folders(self, parent_id=None):
-        """Lista carpetas remotas usando GET /folders."""
-        params = {}
+        """Lista todas las carpetas remotas usando GET /folders con paginación completa."""
+        base_params = {}
         if parent_id is not None:
-            params["parent_id"] = parent_id
-            params["folder_id"] = parent_id
-            params["parentId"] = parent_id
-        try:
-            resp = requests.get(f"{self.base_url}/folders", headers=self._headers(), params=params, timeout=15)
-            if resp.status_code == 200:
+            base_params["parent_id"] = parent_id
+            base_params["folder_id"] = parent_id
+            base_params["parentId"] = parent_id
+
+        all_folders = []
+        seen_ids = set()
+        page = 1
+        per_page = 200
+
+        while True:
+            params = {**base_params, "page": page, "per_page": per_page, "perPage": per_page}
+            try:
+                resp = requests.get(f"{self.base_url}/folders", headers=self._headers(), params=params, timeout=15)
+                if resp.status_code != 200:
+                    break
                 payload = resp.json()
                 items = payload.get("data", payload if isinstance(payload, list) else [])
-                # Si parent_id es None, filtramos las carpetas que están en la raíz (sin padre)
-                if parent_id is None:
-                    root_items = [
-                        f for f in items
-                        if f.get("parent_id") in (None, 0, "0", "")
-                        and f.get("folder_id") in (None, 0, "0", "")
-                        and f.get("parentId") in (None, 0, "0", "")
-                    ]
-                    return root_items if root_items else items
-                return items
-            return []
-        except Exception as e:
-            log_event("error", f"Error listando carpetas remotas: {e}")
-            return []
+                if not items:
+                    break
+
+                new_added = 0
+                for item in items:
+                    item_id = item.get("id")
+                    if item_id is not None and item_id in seen_ids:
+                        continue
+                    if item_id is not None:
+                        seen_ids.add(item_id)
+                    all_folders.append(item)
+                    new_added += 1
+
+                if new_added == 0 or not isinstance(payload, dict):
+                    break
+
+                meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else payload
+                links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+                last_page = meta.get("last_page")
+                next_url = meta.get("next_page_url") or meta.get("next_page") or links.get("next")
+                total_items = meta.get("total")
+                to_item = meta.get("to")
+                current_per_page = meta.get("per_page") or len(items)
+
+                if last_page is not None and page < int(last_page):
+                    page += 1
+                elif next_url:
+                    page += 1
+                elif total_items is not None and to_item is not None and int(to_item) < int(total_items):
+                    page += 1
+                elif total_items is not None and len(all_folders) < int(total_items):
+                    page += 1
+                elif last_page is None and next_url is None and total_items is None and len(items) >= int(current_per_page):
+                    page += 1
+                else:
+                    break
+            except Exception as e:
+                log_event("error", f"Error listando carpetas remotas: {e}")
+                break
+
+        # Si parent_id es None, filtramos las carpetas que están en la raíz (sin padre)
+        if parent_id is None:
+            root_items = [
+                f for f in all_folders
+                if f.get("parent_id") in (None, 0, "0", "")
+                and f.get("folder_id") in (None, 0, "0", "")
+                and f.get("parentId") in (None, 0, "0", "")
+            ]
+            return root_items if root_items else all_folders
+        return all_folders
 
     def list_files(self, folder_id=None):
-        """Lista archivos remotos usando GET /files."""
-        params = {}
+        """Lista todos los archivos remotos usando GET /files recorriendo todas las páginas disponibles."""
+        base_params = {}
         if folder_id is not None:
-            params["folder_id"] = folder_id
-            params["parent_id"] = folder_id
-            params["parentId"] = folder_id
+            base_params["folder_id"] = folder_id
+            base_params["parent_id"] = folder_id
+            base_params["parentId"] = folder_id
+
         all_files = []
+        seen_ids = set()
         page = 1
+        per_page = 200
+
         while True:
-            params["page"] = page
-            params["per_page"] = 100
+            params = {**base_params, "page": page, "per_page": per_page, "perPage": per_page}
             try:
                 resp = requests.get(f"{self.base_url}/files", headers=self._headers(), params=params, timeout=15)
                 if resp.status_code != 200:
@@ -345,13 +393,42 @@ class FileJumpClient:
                 items = payload.get("data", payload if isinstance(payload, list) else [])
                 if not items:
                     break
-                all_files.extend(items)
-                # Verificar paginación estándar de Laravel/REST
-                meta = payload.get("meta", payload) if isinstance(payload, dict) else {}
-                last_page = meta.get("last_page", 1)
-                if page >= last_page:
+
+                new_added = 0
+                for item in items:
+                    item_id = item.get("id")
+                    if item_id is not None and item_id in seen_ids:
+                        continue
+                    if item_id is not None:
+                        seen_ids.add(item_id)
+                    all_files.append(item)
+                    new_added += 1
+
+                # Evitar bucle infinito si la API ignora el parámetro page y devuelve siempre lo mismo
+                if new_added == 0 or not isinstance(payload, dict):
                     break
-                page += 1
+
+                # Detectar paginación en cualquier estructura (Laravel pagination, BeDrive, meta, links)
+                meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else payload
+                links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+                last_page = meta.get("last_page")
+                next_url = meta.get("next_page_url") or meta.get("next_page") or links.get("next")
+                total_items = meta.get("total")
+                to_item = meta.get("to")
+                current_per_page = meta.get("per_page") or len(items)
+
+                if last_page is not None and page < int(last_page):
+                    page += 1
+                elif next_url:
+                    page += 1
+                elif total_items is not None and to_item is not None and int(to_item) < int(total_items):
+                    page += 1
+                elif total_items is not None and len(all_files) < int(total_items):
+                    page += 1
+                elif last_page is None and next_url is None and total_items is None and len(items) >= int(current_per_page):
+                    page += 1
+                else:
+                    break
             except Exception as e:
                 log_event("error", f"Error listando archivos remotos: {e}")
                 break
