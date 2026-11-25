@@ -1720,7 +1720,7 @@ HTML_TEMPLATE = """
                 <div id="musicDockPlayerCol" class="p-4 space-y-3.5 flex flex-col justify-between shrink-0">
                     <!-- Carátula ID3 + Metadatos -->
                     <div id="dockMediaHeader" class="flex items-center gap-3.5">
-                        <div id="dockCoverBox" class="w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner transition-all">
+                        <div id="dockCoverBox" onclick="openCoverLightbox()" class="w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner transition-all">
                             <span id="dockCoverEmoji" class="text-3xl">🎵</span>
                         </div>
                         <div id="dockMetaTextWrap" class="min-w-0 flex-1">
@@ -1838,6 +1838,21 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- MODAL DE CARÁTULA GIGANTE (DELANTE DEL REPRODUCTOR MAXIMIZADO) -->
+    <div id="coverLightboxModal" onclick="if(event.target===this) closeCoverLightbox()" class="fixed inset-0 bg-black/90 backdrop-blur-md hidden items-center justify-center p-4 z-[60]">
+        <div class="relative bg-slate-900 border border-slate-700 rounded-2xl p-3 sm:p-4 max-w-3xl w-full flex flex-col items-center gap-3 shadow-2xl">
+            <div class="w-full flex items-center justify-end gap-2">
+                <a id="coverDownloadBtn" href="#" download="caratula.jpg" class="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white shadow-lg shadow-indigo-600/20 transition flex items-center gap-1.5">
+                    <span>⬇</span><span>Descargar Carátula</span>
+                </a>
+                <button onclick="closeCoverLightbox()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-rose-600/80 text-slate-300 hover:text-white flex items-center justify-center text-lg leading-none transition" title="Cerrar">&times;</button>
+            </div>
+            <div class="w-full flex items-center justify-center overflow-hidden rounded-xl bg-slate-950 border border-slate-800">
+                <img id="coverLightboxImg" src="" alt="Carátula MP3" class="max-h-[78vh] max-w-full w-auto object-contain">
+            </div>
+        </div>
+    </div>
+
     <script>
         let currentConfig = { tasks: [] };
         let wasConnected = false;
@@ -1853,6 +1868,8 @@ HTML_TEMPLATE = """
         let musicSource = 'local';
         let musicShuffle = false;
         let musicDockMode = 'normal'; // 'minimized' | 'normal' | 'maximized'
+        let currentCoverDataUrl = null;
+        let currentCoverFilename = 'caratula.jpg';
         const prefetchedRemoteIds = new Set();
 
         // Estado de Volumen y Ecualizador Web Audio API (5 Bandas)
@@ -2065,6 +2082,36 @@ HTML_TEMPLATE = """
             return `${m}:${s < 10 ? '0' : ''}${s}`;
         }
 
+        function updateCoverBoxCursor() {
+            const coverBox = document.getElementById('dockCoverBox');
+            if (!coverBox) return;
+            if (currentCoverDataUrl) {
+                coverBox.classList.add('cursor-zoom-in', 'hover:ring-2', 'hover:ring-indigo-400/70');
+                coverBox.title = 'Clic para ampliar y descargar carátula';
+            } else {
+                coverBox.classList.remove('cursor-zoom-in', 'hover:ring-2', 'hover:ring-indigo-400/70');
+                coverBox.removeAttribute('title');
+            }
+        }
+
+        function openCoverLightbox() {
+            if (!currentCoverDataUrl) return;
+            const modal = document.getElementById('coverLightboxModal');
+            const img = document.getElementById('coverLightboxImg');
+            const dlBtn = document.getElementById('coverDownloadBtn');
+            img.src = currentCoverDataUrl;
+            dlBtn.href = currentCoverDataUrl;
+            dlBtn.download = currentCoverFilename;
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeCoverLightbox() {
+            const modal = document.getElementById('coverLightboxModal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
         function setMusicDockMode(mode) {
             musicDockMode = mode;
             const widget = document.getElementById('musicDockWidget');
@@ -2085,6 +2132,7 @@ HTML_TEMPLATE = """
                 widget.className = 'fixed bottom-4 right-4 z-50 transition-all duration-200';
                 expEl.classList.add('hidden');
                 minEl.classList.remove('hidden');
+                updateCoverBoxCursor();
                 return;
             }
 
@@ -2097,7 +2145,7 @@ HTML_TEMPLATE = """
                 mainGrid.className = 'grid grid-cols-1 md:grid-cols-12 flex-1 min-h-0 overflow-hidden';
                 playerCol.className = 'md:col-span-6 p-6 flex flex-col justify-between bg-slate-900/90 border-b md:border-b-0 md:border-r border-slate-800 overflow-y-auto gap-3';
                 mediaHeader.className = 'flex flex-col items-center text-center gap-3 my-auto';
-                coverBox.className = 'w-44 h-44 sm:w-52 sm:h-52 rounded-2xl bg-slate-950 border border-slate-700/80 overflow-hidden flex items-center justify-center shrink-0 shadow-2xl';
+                coverBox.className = 'w-44 h-44 sm:w-52 sm:h-52 rounded-2xl bg-slate-950 border border-slate-700/80 overflow-hidden flex items-center justify-center shrink-0 shadow-2xl transition-all';
                 if (coverEmoji) coverEmoji.className = 'text-7xl';
                 metaWrap.className = 'w-full min-w-0 px-2';
                 playlistCol.className = 'md:col-span-6 bg-slate-950/80 flex flex-col min-h-0 overflow-hidden';
@@ -2123,6 +2171,7 @@ HTML_TEMPLATE = """
                 maxBtn.textContent = '⛶';
                 maxBtn.title = 'Maximizar reproductor';
             }
+            updateCoverBoxCursor();
         }
 
         function toggleMusicDockMaximize() {
@@ -2130,6 +2179,7 @@ HTML_TEMPLATE = """
         }
 
         function closeMusicDock() {
+            closeCoverLightbox();
             const audio = document.getElementById('dockAudioElement');
             audio.pause();
             audio.src = '';
@@ -2522,6 +2572,11 @@ HTML_TEMPLATE = """
 
             // Resetear UI temporalmente con el nombre de archivo mientras llegan los tags ID3
             const fallbackTitle = name.replace(/\\.[^/.]+$/, '');
+            currentCoverDataUrl = null;
+            currentCoverFilename = `${fallbackTitle.replace(/[^a-zA-Z0-9_-]/g, '_') || 'caratula'}.jpg`;
+            closeCoverLightbox();
+            updateCoverBoxCursor();
+
             document.getElementById('dockTrackTitle').textContent = fallbackTitle;
             document.getElementById('dockTrackTitle').title = fallbackTitle;
             document.getElementById('dockTrackArtist').textContent = 'Leyendo etiquetas ID3...';
@@ -2570,8 +2625,13 @@ HTML_TEMPLATE = """
                     document.getElementById('miniTrackArtist').textContent = artist;
 
                     if (meta.cover_data_url) {
+                        currentCoverDataUrl = meta.cover_data_url;
+                        const mimeSubtype = (meta.cover_data_url.split(';')[0].split('/')[1] || 'jpeg').toLowerCase();
+                        const mimeExt = mimeSubtype === 'jpeg' ? 'jpg' : mimeSubtype.replace(/[^a-z0-9]/g, '') || 'jpg';
+                        currentCoverFilename = `${title.replace(/[^a-zA-Z0-9_-]/g, '_') || 'caratula'}.${mimeExt}`;
                         document.getElementById('dockCoverBox').innerHTML = `<img src="${meta.cover_data_url}" alt="Carátula" class="w-full h-full object-cover">`;
                         document.getElementById('miniCoverWrap').innerHTML = `<img src="${meta.cover_data_url}" alt="Cover" class="w-full h-full object-cover">`;
+                        updateCoverBoxCursor();
                     }
                     renderMusicPlaylist();
                 }
@@ -3093,6 +3153,14 @@ HTML_TEMPLATE = """
         }
 
         document.addEventListener('keydown', (e) => {
+            const coverModal = document.getElementById('coverLightboxModal');
+            if (coverModal && !coverModal.classList.contains('hidden')) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeCoverLightbox();
+                }
+                return;
+            }
             const modal = document.getElementById('previewModal');
             if (modal.classList.contains('hidden')) return;
             if (e.key === 'ArrowLeft') {

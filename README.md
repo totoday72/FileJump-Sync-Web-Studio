@@ -33,7 +33,7 @@
 
 ### 🎵 Reproductor Musical Flotante (ID3 + EQ 5 Bandas + Visualizador)
 * **3 Modos de Vista:** Minimizado en burbuja compacta tipo chat en vivo, panel flotante normal o vista **Maximizada** con carátula en gran tamaño y lista de reproducción (*Playlist*).
-* **Lector Nativo de Metadatos ID3v2 / ID3v1:** Extrae Título, Artista, Álbum y **carátula incrustada (`APIC`)** directamente desde los MP3 locales o remotos.
+* **Lector Nativo de Metadatos ID3v2 / ID3v1:** Extrae Título, Artista, Álbum y **carátula incrustada (`APIC`)** directamente desde los MP3 locales o remotos; permite ampliar la imagen y descargarla conservando el formato.
 * **Precarga en Caché + Modo Aleatorio:** Genera colas aleatorias y descarga en segundo plano la siguiente canción remota para una reproducción sin interrupciones.
 * **Ecualizador Gráfico de 5 Bandas (`Web Audio API`):** Bandas de `60Hz`, `230Hz`, `910Hz`, `3.6kHz` y `14kHz` (`-12 dB` a `+12 dB`) con presets (*Plano, Bass Boost, Electrónica, Pop, Rock, Vocal*).
 * **Visualizador Rítmico en Tiempo Real:** Analizador de espectro en `<canvas>` activable/desactivable con 3 modos visuales (*Barras, Espejo, Onda*).
