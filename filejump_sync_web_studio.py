@@ -6,8 +6,8 @@ import base64
 import struct
 import string
 import shutil
-import atexit
-import signal
+import hashlib
+import tempfile
 import zipfile
 import mimetypes
 import subprocess
@@ -28,27 +28,9 @@ ENV_FILE = BASE_DIR / ".env"
 CONFIG_FILE = BASE_DIR / "sync_config.json"
 RECORDS_DIR = BASE_DIR / "sync_records"
 TEMP_CACHE_DIR = BASE_DIR / "temp_cache"
+CACHE_META_FILE = TEMP_CACHE_DIR / ".cache_index.json"
 RECORDS_DIR.mkdir(exist_ok=True)
 TEMP_CACHE_DIR.mkdir(exist_ok=True)
-
-def cleanup_temp_cache():
-    """Elimina automáticamente la carpeta temporal de descargas al cerrar el programa."""
-    try:
-        if TEMP_CACHE_DIR.exists():
-            shutil.rmtree(TEMP_CACHE_DIR, ignore_errors=True)
-            print(f"[CLEANUP] Caché temporal eliminada: {TEMP_CACHE_DIR}")
-    except Exception:
-        pass
-
-atexit.register(cleanup_temp_cache)
-
-def _signal_handler(signum, frame):
-    cleanup_temp_cache()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, _signal_handler)
-if hasattr(signal, "SIGTERM"):
-    signal.signal(signal.SIGTERM, _signal_handler)
 
 # Crear .env por defecto si no existe
 if not ENV_FILE.exists():
@@ -58,6 +40,57 @@ if not ENV_FILE.exists():
         f.write('FILEJUMP_UPLOAD_URL="https://uploads.filejump.com/api/upload"\n')
 
 load_dotenv(ENV_FILE)
+
+def _compute_api_key_hash(api_key_str):
+    """Genera una huella SHA-256 del token actual sin almacenar el token en texto plano."""
+    if not api_key_str:
+        return ""
+    return hashlib.sha256(api_key_str.strip().encode("utf-8")).hexdigest()
+
+def load_cache_index():
+    """Carga el índice persistente de archivos en caché y la huella de la API Key."""
+    TEMP_CACHE_DIR.mkdir(exist_ok=True)
+    if CACHE_META_FILE.exists():
+        try:
+            with open(CACHE_META_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data.setdefault("api_key_hash", "")
+                data.setdefault("files", {})
+                return data
+        except Exception:
+            pass
+    return {"api_key_hash": "", "files": {}}
+
+def save_cache_index(index_data):
+    """Guarda el índice persistente de la caché."""
+    TEMP_CACHE_DIR.mkdir(exist_ok=True)
+    with open(CACHE_META_FILE, "w", encoding="utf-8") as f:
+        json.dump(index_data, f, indent=4, ensure_ascii=False)
+
+def ensure_cache_matches_api_key(current_api_key):
+    """
+    Mantiene la caché persistente entre reinicios, pero la vacía por completo
+    si detecta que se cambió la FILEJUMP_API_KEY (cambio de cuenta/credenciales).
+    """
+    current_hash = _compute_api_key_hash(current_api_key)
+    index_data = load_cache_index()
+    stored_hash = index_data.get("api_key_hash", "")
+    has_legacy_cache = any(path.name != CACHE_META_FILE.name for path in TEMP_CACHE_DIR.iterdir())
+    key_changed = bool(stored_hash) and stored_hash != current_hash
+
+    if key_changed or (not stored_hash and has_legacy_cache):
+        shutil.rmtree(TEMP_CACHE_DIR)
+        TEMP_CACHE_DIR.mkdir(exist_ok=True)
+        print("[CACHE] Cambio de API Key detectado: caché anterior eliminada.")
+        index_data = {"api_key_hash": current_hash, "files": {}}
+        save_cache_index(index_data)
+    elif stored_hash != current_hash:
+        index_data["api_key_hash"] = current_hash
+        save_cache_index(index_data)
+
+    return index_data
+
+ensure_cache_matches_api_key(os.getenv("FILEJUMP_API_KEY", "").strip())
 
 app = Flask(__name__)
 
@@ -139,6 +172,7 @@ class FileJumpClient:
         self.api_key = os.getenv("FILEJUMP_API_KEY", "").strip()
         self.base_url = os.getenv("FILEJUMP_BASE_URL", "https://filejump.com/api").rstrip("/")
         self.upload_url = os.getenv("FILEJUMP_UPLOAD_URL", "https://uploads.filejump.com/api/upload").rstrip("/")
+        ensure_cache_matches_api_key(self.api_key)
 
     def _headers(self, is_json=True):
         headers = {
@@ -284,13 +318,46 @@ class FileJumpClient:
             log_event("error", f"Error eliminando archivo remoto {file_id}: {e}")
             return False
 
-    def download_file_to_cache(self, file_id, filename):
-        """Descarga un archivo remoto a TEMP_CACHE_DIR y devuelve la ruta local en caché."""
+    def get_remote_file_mtime(self, file_id):
+        """Consulta la fecha de modificación remota (updated_at) de un archivo específico en FileJump."""
+        try:
+            resp = requests.get(f"{self.base_url}/files/{file_id}", headers=self._headers(), timeout=10)
+            if resp.status_code == 200:
+                payload = resp.json()
+                file_obj = payload.get("data", payload.get("fileEntry", payload)) if isinstance(payload, dict) else {}
+                updated_str = file_obj.get("updated_at") or file_obj.get("created_at") or ""
+                return parse_iso_timestamp(updated_str)
+        except Exception:
+            pass
+        return 0.0
+
+    def download_file_to_cache(self, file_id, filename, remote_mtime=0.0):
+        """
+        Descarga un archivo remoto a TEMP_CACHE_DIR solo si no existe en caché
+        o si la versión remota tiene una fecha de modificación más reciente.
+        """
         TEMP_CACHE_DIR.mkdir(exist_ok=True)
+        cache_index = load_cache_index()
+        rid_key = str(file_id)
+
         safe_name = "".join(c if c.isalnum() or c in (".", "-", "_", " ") else "_" for c in filename).strip() or f"file_{file_id}"
         cached_path = TEMP_CACHE_DIR / f"{file_id}_{safe_name}"
+
+        # Determinar el timestamp remoto más preciso disponible
+        effective_remote_mtime = float(remote_mtime or 0.0)
+        if effective_remote_mtime <= 0.0:
+            effective_remote_mtime = self.get_remote_file_mtime(file_id)
+
+        entry_meta = cache_index.get("files", {}).get(rid_key, {})
+        cached_remote_mtime = float(entry_meta.get("remote_mtime", 0.0))
+
         if cached_path.exists() and cached_path.stat().st_size > 0:
-            return cached_path
+            local_cache_mtime = cached_path.stat().st_mtime
+            ref_cached_ts = cached_remote_mtime if cached_remote_mtime > 0 else local_cache_mtime
+            # Si el archivo remoto NO es más nuevo (tolerancia de 2s), reutilizamos el archivo en caché
+            if effective_remote_mtime <= 0.0 or effective_remote_mtime <= (ref_cached_ts + 2.0):
+                return cached_path
+            log_event("info", f"Archivo remoto #{file_id} actualizado en nube; descargando versión más reciente...")
 
         headers = {"Authorization": f"Bearer {self.api_key}"}
         candidate_urls = [
@@ -298,18 +365,48 @@ class FileJumpClient:
             f"{self.base_url}/drive/file-entries/{file_id}/download"
         ]
         for url in candidate_urls:
+            temporary_path = None
             try:
                 with requests.get(url, headers=headers, stream=True, timeout=120) as resp:
                     if resp.status_code == 200:
-                        with open(cached_path, "wb") as out_f:
+                        fd, temporary_name = tempfile.mkstemp(
+                            prefix=f"{cached_path.name}.",
+                            suffix=".part",
+                            dir=TEMP_CACHE_DIR
+                        )
+                        os.close(fd)
+                        temporary_path = Path(temporary_name)
+                        with open(temporary_path, "wb") as out_f:
                             for chunk in resp.iter_content(chunk_size=65536):
                                 if chunk:
                                     out_f.write(chunk)
-                        log_event("info", f"Archivo remoto #{file_id} descargado en caché temporal.")
+                        os.replace(temporary_path, cached_path)
+                        temporary_path = None
+                        # Actualizar índice persistente con la fecha de modificación remota
+                        cache_index.setdefault("files", {})[rid_key] = {
+                            "filename": cached_path.name,
+                            "remote_mtime": effective_remote_mtime if effective_remote_mtime > 0 else time.time(),
+                            "cached_at": time.time()
+                        }
+                        save_cache_index(cache_index)
+                        # Eliminar cualquier versión transcodificada previa para regenerarla si hace falta
+                        stale_mp4 = TEMP_CACHE_DIR / f"{cached_path.stem}_web.mp4"
+                        if stale_mp4.exists():
+                            try:
+                                stale_mp4.unlink()
+                            except Exception:
+                                pass
+                        log_event("info", f"Archivo remoto #{file_id} guardado en caché persistente.")
                         return cached_path
             except Exception as e:
                 log_event("warning", f"Intento de descarga fallido ({url}): {e}")
-        return None
+            finally:
+                if temporary_path and temporary_path.exists():
+                    try:
+                        temporary_path.unlink()
+                    except OSError as e:
+                        log_event("warning", f"No se pudo eliminar la descarga temporal {temporary_path.name}: {e}")
+        return cached_path if (cached_path.exists() and cached_path.stat().st_size > 0) else None
 
 
 def extract_office_preview_html(file_path):
@@ -880,7 +977,7 @@ def api_remote_children():
     """Carga bajo demanda los hijos inmediatos de una carpeta remota y los compara si hay tarea."""
     client = FileJumpClient()
     if not client.api_key:
-        return jsonify({"error": "Falta FILEJUMP_API_KEY en .env"}), 400
+        return jsonify({"error": "Falta FILEJUMP_API_KEY en el archivo .env"}), 400
 
     parent_id = request.args.get("parent_id", "ROOT").strip() or "ROOT"
     prefix = request.args.get("prefix", "").strip().strip("/")
@@ -930,8 +1027,10 @@ def api_settings():
     data = request.json or {}
     env_updates = data.get("env", {})
     if env_updates.get("FILEJUMP_API_KEY"):
-        set_key(str(ENV_FILE), "FILEJUMP_API_KEY", env_updates["FILEJUMP_API_KEY"].strip())
-        log_event("info", "Clave API actualizada de forma segura en .env")
+        new_key = env_updates["FILEJUMP_API_KEY"].strip()
+        set_key(str(ENV_FILE), "FILEJUMP_API_KEY", new_key)
+        ensure_cache_matches_api_key(new_key)
+        log_event("info", "Clave API actualizada en .env (caché verificada/reiniciada por cambio de credenciales).")
     if env_updates.get("FILEJUMP_BASE_URL"):
         set_key(str(ENV_FILE), "FILEJUMP_BASE_URL", env_updates["FILEJUMP_BASE_URL"].strip())
     if env_updates.get("FILEJUMP_UPLOAD_URL"):
@@ -1125,7 +1224,7 @@ def api_run_sync(task_name):
 
 
 def _resolve_target_file():
-    """Resuelve un archivo local directamente desde disco (sin caché) o descarga remoto a temp_cache."""
+    """Resuelve un archivo local directamente desde disco (sin caché) o valida/descarga remoto a temp_cache."""
     source = request.args.get("source", "local").strip()
     if source == "local":
         direct_path = request.args.get("full_path", "").strip()
@@ -1149,12 +1248,16 @@ def _resolve_target_file():
     else:
         remote_id = request.args.get("remote_id", "").strip()
         filename = request.args.get("name", f"archivo_{remote_id}").strip()
+        try:
+            remote_mtime = float(request.args.get("mtime", 0) or 0)
+        except ValueError:
+            remote_mtime = 0.0
         if not remote_id:
             return None, "Falta remote_id"
         client = FileJumpClient()
         if not client.api_key:
             return None, "Falta FILEJUMP_API_KEY en .env"
-        cached = client.download_file_to_cache(remote_id, filename)
+        cached = client.download_file_to_cache(remote_id, filename, remote_mtime=remote_mtime)
         if not cached or not cached.exists():
             return None, "No se pudo descargar el archivo desde FileJump"
         return cached, None
@@ -1350,25 +1453,51 @@ def api_file_audio_meta():
 
 @app.route("/api/file/prefetch", methods=["GET"])
 def api_file_prefetch():
-    """Descarga en segundo plano a temp_cache la siguiente pista remota para reproducción instantánea."""
+    """Descarga/actualiza en segundo plano en temp_cache la siguiente pista remota verificando su fecha."""
     source = request.args.get("source", "local").strip()
     if source != "remote":
         return jsonify({"prefetched": False, "reason": "local_direct"})
     remote_id = request.args.get("remote_id", "").strip()
     filename = request.args.get("name", f"audio_{remote_id}").strip()
+    try:
+        remote_mtime = float(request.args.get("mtime", 0) or 0)
+    except ValueError:
+        remote_mtime = 0.0
     if not remote_id:
         return jsonify({"prefetched": False, "error": "Falta remote_id"}), 400
     client = FileJumpClient()
     if not client.api_key:
         return jsonify({"prefetched": False, "error": "Sin API key"}), 400
-    cached = client.download_file_to_cache(remote_id, filename)
+    cached = client.download_file_to_cache(remote_id, filename, remote_mtime=remote_mtime)
     return jsonify({"prefetched": bool(cached and cached.exists()), "remote_id": remote_id})
+
+
+@app.route("/api/cache/status", methods=["GET"])
+def api_cache_status():
+    """Devuelve los IDs remotos que ya existen físicamente en la caché persistente."""
+    cache_index = load_cache_index()
+    cached_ids = set()
+
+    for rid, meta in cache_index.get("files", {}).items():
+        fname = meta.get("filename", "")
+        if fname and (TEMP_CACHE_DIR / fname).exists():
+            cached_ids.add(str(rid))
+
+    # Detectar también archivos en temp_cache con prefijo "{remote_id}_" aunque no estén en el índice
+    if TEMP_CACHE_DIR.exists():
+        for entry in TEMP_CACHE_DIR.iterdir():
+            if entry.is_file() and not entry.name.startswith(".") and "_" in entry.name:
+                prefix_id = entry.name.split("_", 1)[0]
+                if prefix_id.isdigit() and entry.stat().st_size > 0:
+                    cached_ids.add(prefix_id)
+
+    return jsonify({"cached_ids": sorted(cached_ids)})
 
 
 # ==============================================================================
 # INTERFAZ WEB (HTML + TAILWIND CSS + VANILLA JS)
 # ==============================================================================
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="es" class="dark">
 <head>
@@ -1578,7 +1707,7 @@ HTML_TEMPLATE = """
         <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
             <div class="flex items-center justify-between mb-2">
                 <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Registro de Actividad en Vivo</h3>
-                <span class="text-[11px] text-slate-500">Endpoint Alta Velocidad Activo</span>
+                <span class="text-[11px] text-slate-500">Caché Persistente Inteligente Activa</span>
             </div>
             <div id="logConsole" class="bg-slate-950 rounded-xl p-3 h-32 overflow-y-auto font-mono text-xs space-y-1 text-slate-300 border border-slate-800/80">
                 <div class="text-slate-500">Esperando acciones...</div>
@@ -1599,7 +1728,7 @@ HTML_TEMPLATE = """
                 <div class="space-y-3 bg-slate-950/60 p-4 rounded-xl border border-slate-800">
                     <h3 class="text-xs font-semibold uppercase tracking-wider text-indigo-400">Seguridad API (.env)</h3>
                     <div>
-                        <label class="block text-xs text-slate-400 mb-1">Bearer Token de FileJump (se guarda cifrado en .env local)</label>
+                        <label class="block text-xs text-slate-400 mb-1">Bearer Token de FileJump (si se cambia, se limpia la caché automáticamente)</label>
                         <input type="password" id="envApiKey" placeholder="Dejar vacío para mantener el token actual..." class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:border-indigo-500 focus:outline-none">
                     </div>
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1848,7 +1977,7 @@ HTML_TEMPLATE = """
                 <button onclick="closeCoverLightbox()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-rose-600/80 text-slate-300 hover:text-white flex items-center justify-center text-lg leading-none transition" title="Cerrar">&times;</button>
             </div>
             <div class="w-full flex items-center justify-center overflow-hidden rounded-xl bg-slate-950 border border-slate-800">
-                <img id="coverLightboxImg" src="" alt="Carátula MP3" class="max-h-[78vh] max-w-full w-auto object-contain">
+                <img id="coverLightboxImg" src="" alt="Carátula MP3" class="max-h-[78vh] w-auto object-contain">
             </div>
         </div>
     </div>
@@ -2085,7 +2214,7 @@ HTML_TEMPLATE = """
         function updateCoverBoxCursor() {
             const coverBox = document.getElementById('dockCoverBox');
             if (!coverBox) return;
-            if (currentCoverDataUrl) {
+            if (musicDockMode === 'maximized' && currentCoverDataUrl) {
                 coverBox.classList.add('cursor-zoom-in', 'hover:ring-2', 'hover:ring-indigo-400/70');
                 coverBox.title = 'Clic para ampliar y descargar carátula';
             } else {
@@ -2095,7 +2224,7 @@ HTML_TEMPLATE = """
         }
 
         function openCoverLightbox() {
-            if (!currentCoverDataUrl) return;
+            if (musicDockMode !== 'maximized' || !currentCoverDataUrl) return;
             const modal = document.getElementById('coverLightboxModal');
             const img = document.getElementById('coverLightboxImg');
             const dlBtn = document.getElementById('coverDownloadBtn');
@@ -2240,7 +2369,7 @@ HTML_TEMPLATE = """
             container.innerHTML = musicPlayOrder.map((origIdx, pos) => {
                 const item = musicPlaylist[origIdx];
                 const isCurrent = pos === musicOrderPos;
-                const displayTitle = item.tagTitle || (item.name || '').replace(/\\.[^/.]+$/, '');
+                const displayTitle = item.tagTitle || (item.name || '').replace(/\.[^/.]+$/, '');
                 const displayArtist = item.tagArtist || '';
                 const isCached = musicSource === 'remote' && prefetchedRemoteIds.has(String(item.id));
                 return `
@@ -2271,18 +2400,31 @@ HTML_TEMPLATE = """
             if (!nextTrack || !nextTrack.id) return;
 
             const rid = String(nextTrack.id);
+            const mtimeParam = nextTrack.mtime ? `&mtime=${encodeURIComponent(nextTrack.mtime)}` : '';
             if (prefetchedRemoteIds.has(rid)) {
                 if (badge) badge.classList.remove('hidden');
-                renderMusicPlaylist();
-                return;
+            } else if (badge) {
+                badge.classList.add('hidden');
             }
-            if (badge) badge.classList.add('hidden');
             try {
-                const res = await fetch(`/api/file/prefetch?source=remote&remote_id=${encodeURIComponent(rid)}&name=${encodeURIComponent(nextTrack.name || 'audio.mp3')}`);
+                const res = await fetch(`/api/file/prefetch?source=remote&remote_id=${encodeURIComponent(rid)}&name=${encodeURIComponent(nextTrack.name || 'audio.mp3')}${mtimeParam}`);
                 const data = await res.json();
                 if (data.prefetched) {
                     prefetchedRemoteIds.add(rid);
                     if (badge) badge.classList.remove('hidden');
+                    renderMusicPlaylist();
+                }
+            } catch (e) {}
+        }
+
+        async function syncCachedRemoteIds() {
+            try {
+                const res = await fetch('/api/cache/status');
+                if (!res.ok) return;
+                const data = await res.json();
+                prefetchedRemoteIds.clear();
+                (data.cached_ids || []).forEach(id => prefetchedRemoteIds.add(String(id)));
+                if (musicSource === 'remote' && musicPlaylist.length > 0) {
                     renderMusicPlaylist();
                 }
             } catch (e) {}
@@ -2556,11 +2698,12 @@ HTML_TEMPLATE = """
                 rebuildMusicPlayOrder(origIdx);
             }
 
+            const mtimeParam = fileMeta.mtime ? `&mtime=${encodeURIComponent(fileMeta.mtime)}` : '';
             const queryParams = source === 'local'
                 ? (fileMeta.full_path
                     ? `source=local&full_path=${encodeURIComponent(fileMeta.full_path)}`
                     : `source=local&task=${encodeURIComponent(taskName)}&rel_path=${encodeURIComponent(fileMeta.rel_path)}`)
-                : `source=remote&remote_id=${encodeURIComponent(fileMeta.id)}&name=${encodeURIComponent(name)}`;
+                : `source=remote&remote_id=${encodeURIComponent(fileMeta.id)}&name=${encodeURIComponent(name)}${mtimeParam}`;
 
             const streamUrl = `/api/file/stream?${queryParams}`;
             const metaUrl = `/api/file/audio_meta?${queryParams}`;
@@ -2571,7 +2714,7 @@ HTML_TEMPLATE = """
             setMusicDockMode(musicDockMode);
 
             // Resetear UI temporalmente con el nombre de archivo mientras llegan los tags ID3
-            const fallbackTitle = name.replace(/\\.[^/.]+$/, '');
+            const fallbackTitle = name.replace(/\.[^/.]+$/, '');
             currentCoverDataUrl = null;
             currentCoverFilename = `${fallbackTitle.replace(/[^a-zA-Z0-9_-]/g, '_') || 'caratula'}.jpg`;
             closeCoverLightbox();
@@ -2590,6 +2733,7 @@ HTML_TEMPLATE = """
             document.getElementById('miniCoverWrap').innerHTML = '<span class="text-base">🎵</span>';
 
             renderMusicPlaylist();
+            syncCachedRemoteIds();
             // Iniciar precarga en caché de la siguiente pista remota
             prefetchNextRemoteTrack();
 
@@ -2626,8 +2770,7 @@ HTML_TEMPLATE = """
 
                     if (meta.cover_data_url) {
                         currentCoverDataUrl = meta.cover_data_url;
-                        const mimeSubtype = (meta.cover_data_url.split(';')[0].split('/')[1] || 'jpeg').toLowerCase();
-                        const mimeExt = mimeSubtype === 'jpeg' ? 'jpg' : mimeSubtype.replace(/[^a-z0-9]/g, '') || 'jpg';
+                        const mimeExt = meta.cover_data_url.startsWith('data:image/png') ? 'png' : 'jpg';
                         currentCoverFilename = `${title.replace(/[^a-zA-Z0-9_-]/g, '_') || 'caratula'}.${mimeExt}`;
                         document.getElementById('dockCoverBox').innerHTML = `<img src="${meta.cover_data_url}" alt="Carátula" class="w-full h-full object-cover">`;
                         document.getElementById('miniCoverWrap').innerHTML = `<img src="${meta.cover_data_url}" alt="Cover" class="w-full h-full object-cover">`;
@@ -2873,7 +3016,7 @@ HTML_TEMPLATE = """
                 const encodedFull = encodeURIComponent(item.full_path || '');
                 const encodedName = encodeURIComponent(item.name || '');
                 return `
-                <tr ${isFolder ? `ondblclick="selectLocalFolder('${safeRel}')"` : `ondblclick="openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}')})"`}
+                <tr ${isFolder ? `ondblclick="selectLocalFolder('${safeRel}')"` : `ondblclick="openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}'), mtime: ${item.mtime || 0}})"`}
                     class="hover:bg-slate-800/50 transition ${isFolder ? 'cursor-pointer' : 'cursor-pointer'}">
                     <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[200px]">
                         <div class="flex items-center gap-1.5 truncate">
@@ -2885,7 +3028,7 @@ HTML_TEMPLATE = """
                     <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
                     <td class="py-2 px-2.5 text-right whitespace-nowrap">
                         <div class="inline-flex items-center gap-1.5">
-                            ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}')})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-sky-600/30 text-sky-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
+                            ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}'), mtime: ${item.mtime || 0}})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-sky-600/30 text-sky-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
                             ${getStatusBadge(item.sync_status)}
                         </div>
                     </td>
@@ -3086,8 +3229,9 @@ HTML_TEMPLATE = """
                 const isFolder = item.type === 'folder';
                 const folderKey = String(item.id);
                 const encodedName = encodeURIComponent(item.name || '');
+                const mtimeVal = item.mtime || 0;
                 return `
-                <tr ${isFolder ? `ondblclick="selectRemoteNode('${folderKey}')"` : `ondblclick="openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}')})"`}
+                <tr ${isFolder ? `ondblclick="selectRemoteNode('${folderKey}')"` : `ondblclick="openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}'), mtime: ${mtimeVal}})"`}
                     class="hover:bg-slate-800/50 transition cursor-pointer">
                     <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[200px]">
                         <div class="flex items-center gap-1.5 truncate">
@@ -3099,7 +3243,7 @@ HTML_TEMPLATE = """
                     <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
                     <td class="py-2 px-2.5 text-right whitespace-nowrap">
                         <div class="inline-flex items-center gap-1.5">
-                            ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}')})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 text-indigo-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
+                            ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}'), mtime: ${mtimeVal}})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 text-indigo-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
                             <span class="text-[10px] text-slate-500 font-mono">#${item.id}</span>
                             ${getStatusBadge(item.sync_status)}
                         </div>
@@ -3194,16 +3338,17 @@ HTML_TEMPLATE = """
                 return;
             }
 
+            const mtimeParam = fileMeta.mtime ? `&mtime=${encodeURIComponent(fileMeta.mtime)}` : '';
             const queryParams = source === 'local'
                 ? (fileMeta.full_path
                     ? `source=local&full_path=${encodeURIComponent(fileMeta.full_path)}`
                     : `source=local&task=${encodeURIComponent(taskName)}&rel_path=${encodeURIComponent(fileMeta.rel_path)}`)
-                : `source=remote&remote_id=${encodeURIComponent(fileMeta.id)}&name=${encodeURIComponent(name)}`;
+                : `source=remote&remote_id=${encodeURIComponent(fileMeta.id)}&name=${encodeURIComponent(name)}${mtimeParam}`;
 
             const streamUrl = `/api/file/stream?${queryParams}`;
             const previewUrl = `/api/file/preview?${queryParams}`;
 
-            // 1. PDF -> Descarga en caché temporal (si es remoto) y abre en nueva ventana
+            // 1. PDF -> Descarga/actualiza en caché persistente (si es remoto) y abre en nueva ventana
             if (ext === 'pdf') {
                 window.open(streamUrl, '_blank', 'noopener');
                 return;
@@ -3500,6 +3645,7 @@ HTML_TEMPLATE = """
                 body: JSON.stringify(payload)
             });
 
+            prefetchedRemoteIds.clear();
             closeSettingsModal();
             wasConnected = false; // Forzar recarga de directorios remotos si cambió el token
             await refreshStatusAndLogs();
@@ -3508,6 +3654,7 @@ HTML_TEMPLATE = """
 
         // Inicialización
         refreshStatusAndLogs();
+        syncCachedRemoteIds();
         fetchLocalDrives(true);
         loadInitialConfig();
         setInterval(refreshStatusAndLogs, 4000);
@@ -3517,5 +3664,5 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == "__main__":
-    log_event("info", "Servidor Web FileJump Sync Studio iniciado en http://127.0.0.1:5000")
+    log_event("info", "Iniciando FileJump Sync Studio en http://127.0.0.1:5000")
     app.run(host="127.0.0.1", port=5000, debug=False)

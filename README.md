@@ -23,8 +23,8 @@
 * **Panel Dividido (Árbol + Contenido):** Árbol jerárquico lateral izquierdo con **carga perezosa (`+` / `−`)** bajo demanda y tabla de contenido a la derecha con barra de ruta (*breadcrumbs*) y navegación por doble clic.
 * **Exploración Completa de Discos Locales:** Detección automática de unidades locales (`C:\`, `D:\`, `E:\`, montajes Unix) con apertura directa sin duplicar archivos en caché.
 
-### 🎬 Visor Universal de Archivos y Caché Temporal Automática
-* **Caché Temporal Inteligente (`temp_cache`):** Descarga archivos remotos únicamente bajo demanda al abrirlos y **elimina automáticamente** toda la carpeta temporal al cerrar el servidor (`atexit` + manejadores de señales).
+### 🎬 Visor Universal de Archivos y Caché Persistente
+* **Caché Persistente (`temp_cache`):** Descarga archivos remotos únicamente bajo demanda y conserva las copias al cerrar el servidor. Al abrir un archivo en caché, verifica la fecha de modificación remota y descarga la versión más reciente cuando detecta cambios. Si cambia la API key, elimina la caché asociada a las credenciales anteriores.
 * **Soporte Multiformato:**
   * **PDF:** Apertura directa en nueva ventana con visor nativo.
   * **Ofimática (`.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods`):** Extracción y renderizado de vista previa estructurada sin dependencias externas pesadas.
@@ -58,6 +58,7 @@
    ```bash
    python filejump_sync_web_studio.py
    ```
+   En Windows también puedes iniciar la aplicación con `exec.bat`. Python debe estar instalado y disponible en las variables de entorno `PATH`.
 
 4. **Abrir en el navegador:**
    Ingresa a `http://127.0.0.1:5000`, abre **Configuración & .env**, pega tu `FILEJUMP_API_KEY` y añade tus carpetas locales a sincronizar.
@@ -68,11 +69,12 @@
 
 ```text
 ├── filejump_sync_web_studio.py # Servidor Flask, UI, visor y reproductor Web Audio
+├── exec.bat               # Lanzador para Windows (requiere Python en PATH)
 ├── requirements.txt        # Dependencias de Python
 ├── .env                    # Credenciales API (ignorado en Git por seguridad)
 ├── sync_config.json        # Tareas y parámetros de sincronización
 ├── sync_records/           # Historial JSON de archivos sincronizados por tarea
-└── temp_cache/             # Caché temporal de descargas (se auto-elimina al cerrar)
+└── temp_cache/             # Caché persistente; se elimina al cambiar la API key
 ```
 
 ---
