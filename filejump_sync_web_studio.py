@@ -7,7 +7,6 @@ import struct
 import string
 import shutil
 import hashlib
-import tempfile
 import zipfile
 import mimetypes
 import subprocess
@@ -75,16 +74,18 @@ def ensure_cache_matches_api_key(current_api_key):
     current_hash = _compute_api_key_hash(current_api_key)
     index_data = load_cache_index()
     stored_hash = index_data.get("api_key_hash", "")
-    has_legacy_cache = any(path.name != CACHE_META_FILE.name for path in TEMP_CACHE_DIR.iterdir())
-    key_changed = bool(stored_hash) and stored_hash != current_hash
 
-    if key_changed or (not stored_hash and has_legacy_cache):
-        shutil.rmtree(TEMP_CACHE_DIR)
-        TEMP_CACHE_DIR.mkdir(exist_ok=True)
-        print("[CACHE] Cambio de API Key detectado: caché anterior eliminada.")
+    if stored_hash and current_hash and stored_hash != current_hash:
+        try:
+            if TEMP_CACHE_DIR.exists():
+                shutil.rmtree(TEMP_CACHE_DIR, ignore_errors=True)
+            TEMP_CACHE_DIR.mkdir(exist_ok=True)
+            print("[CACHE] Cambio de API Key detectado: caché anterior eliminada.")
+        except Exception:
+            pass
         index_data = {"api_key_hash": current_hash, "files": {}}
         save_cache_index(index_data)
-    elif stored_hash != current_hash:
+    elif current_hash and stored_hash != current_hash:
         index_data["api_key_hash"] = current_hash
         save_cache_index(index_data)
 
@@ -116,6 +117,7 @@ def load_config():
         "max_workers": 4,
         "min_impact_percentage": 40,
         "use_high_speed_upload": True,
+        "account_profiles": {},
         "tasks": []
     }
     if not CONFIG_FILE.exists():
@@ -197,6 +199,103 @@ class FileJumpClient:
                 return False, f"Respuesta inesperada de la API: HTTP {resp.status_code}"
         except Exception as e:
             return False, f"Error de red al conectar con FileJump: {str(e)}"
+
+    def get_user_storage_info(self):
+        """Obtiene el nombre de usuario y el uso real de almacenamiento desde GET /api/auth/user y GET /api/auth/usage."""
+        if not self.api_key:
+            return None
+
+        key_hash = _compute_api_key_hash(self.api_key)[:16]
+        cfg = load_config()
+        saved_profile = cfg.get("account_profiles", {}).get(key_hash, {})
+
+        user_name = None
+        used_bytes = 0
+        total_bytes = 0
+        api_percentage = None
+
+        # Normalizar URL base para apuntar siempre a .../api
+        api_root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+
+        # 1. Consultar GET /api/auth/usage (used, limit, percentage)
+        try:
+            resp_usage = requests.get(f"{api_root}/auth/usage", headers=self._headers(), timeout=10)
+            if resp_usage.status_code == 200:
+                payload = resp_usage.json()
+                u_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                if isinstance(u_data, dict):
+                    if u_data.get("used") is not None:
+                        used_bytes = int(float(u_data["used"]))
+                    if u_data.get("limit") is not None:
+                        total_bytes = int(float(u_data["limit"]))
+                    elif u_data.get("available") is not None:
+                        total_bytes = int(float(u_data["available"]))
+                    if u_data.get("percentage") is not None:
+                        api_percentage = float(u_data["percentage"])
+        except Exception as e:
+            log_event("warning", f"No se pudo leer /auth/usage: {e}")
+
+        # 2. Consultar GET /api/auth/user (perfil autenticado y cuota)
+        try:
+            resp_user = requests.get(f"{api_root}/auth/user", headers=self._headers(), timeout=10)
+            if resp_user.status_code == 200:
+                payload = resp_user.json()
+                candidates = []
+                if isinstance(payload, dict):
+                    candidates.append(payload)
+                    for key in ("user", "data", "profile", "attributes", "account"):
+                        if isinstance(payload.get(key), dict):
+                            candidates.append(payload[key])
+                            if isinstance(payload[key].get("user"), dict):
+                                candidates.append(payload[key]["user"])
+                for u_obj in candidates:
+                    found_name = (
+                        u_obj.get("display_name")
+                        or u_obj.get("full_name")
+                        or u_obj.get("name")
+                        or u_obj.get("username")
+                        or (f"{u_obj.get('first_name', '')} {u_obj.get('last_name', '')}".strip())
+                        or u_obj.get("email")
+                    )
+                    if found_name:
+                        user_name = str(found_name).strip()
+                        break
+        except Exception as e:
+            log_event("warning", f"No se pudo leer /auth/user: {e}")
+
+        # 3. Respaldo: intentar obtener nombre del token personal en GET /api/user/tokens
+        if not user_name:
+            try:
+                resp_tokens = requests.get(f"{api_root}/user/tokens", headers=self._headers(), timeout=8)
+                if resp_tokens.status_code == 200:
+                    t_payload = resp_tokens.json()
+                    t_list = t_payload.get("data") or t_payload.get("tokens") or (t_payload if isinstance(t_payload, list) else [])
+                    if isinstance(t_list, list) and len(t_list) > 0 and isinstance(t_list[0], dict):
+                        t_user = t_list[0].get("tokenable") or t_list[0].get("user") or {}
+                        if isinstance(t_user, dict):
+                            user_name = t_user.get("display_name") or t_user.get("name") or t_user.get("email")
+            except Exception:
+                pass
+
+        # 4. Nombre personalizado guardado localmente o etiqueta por defecto
+        if saved_profile.get("user_name"):
+            user_name = saved_profile["user_name"]
+        elif not user_name:
+            user_name = "Cuenta FileJump"
+
+        free_bytes = max(0, total_bytes - used_bytes) if total_bytes > 0 else 0
+        if api_percentage is not None:
+            pct = round(api_percentage, 1)
+        else:
+            pct = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else 0.0
+
+        return {
+            "user_name": user_name,
+            "used_bytes": used_bytes,
+            "free_bytes": free_bytes,
+            "total_bytes": total_bytes,
+            "used_pct": min(100.0, pct)
+        }
 
     def list_folders(self, parent_id=None):
         """Lista carpetas remotas usando GET /folders."""
@@ -365,23 +464,13 @@ class FileJumpClient:
             f"{self.base_url}/drive/file-entries/{file_id}/download"
         ]
         for url in candidate_urls:
-            temporary_path = None
             try:
                 with requests.get(url, headers=headers, stream=True, timeout=120) as resp:
                     if resp.status_code == 200:
-                        fd, temporary_name = tempfile.mkstemp(
-                            prefix=f"{cached_path.name}.",
-                            suffix=".part",
-                            dir=TEMP_CACHE_DIR
-                        )
-                        os.close(fd)
-                        temporary_path = Path(temporary_name)
-                        with open(temporary_path, "wb") as out_f:
+                        with open(cached_path, "wb") as out_f:
                             for chunk in resp.iter_content(chunk_size=65536):
                                 if chunk:
                                     out_f.write(chunk)
-                        os.replace(temporary_path, cached_path)
-                        temporary_path = None
                         # Actualizar índice persistente con la fecha de modificación remota
                         cache_index.setdefault("files", {})[rid_key] = {
                             "filename": cached_path.name,
@@ -400,12 +489,6 @@ class FileJumpClient:
                         return cached_path
             except Exception as e:
                 log_event("warning", f"Intento de descarga fallido ({url}): {e}")
-            finally:
-                if temporary_path and temporary_path.exists():
-                    try:
-                        temporary_path.unlink()
-                    except OSError as e:
-                        log_event("warning", f"No se pudo eliminar la descarga temporal {temporary_path.name}: {e}")
         return cached_path if (cached_path.exists() and cached_path.stat().st_size > 0) else None
 
 
@@ -879,6 +962,31 @@ def api_status():
         "logs": activity_logs[-50:]
     })
 
+@app.route("/api/user/profile", methods=["GET", "POST"])
+def api_user_profile():
+    """Devuelve el perfil/almacenamiento desde FileJump y permite guardar el nombre visible."""
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"connected": False})
+
+    if request.method == "POST":
+        data = request.json or {}
+        key_hash = _compute_api_key_hash(client.api_key)[:16]
+        cfg = load_config()
+        profiles = cfg.setdefault("account_profiles", {})
+        entry = profiles.setdefault(key_hash, {})
+
+        if "user_name" in data:
+            entry["user_name"] = str(data["user_name"]).strip()
+
+        save_config(cfg)
+        log_event("info", "Nombre visible de cuenta actualizado.")
+
+    info = client.get_user_storage_info()
+    if not info:
+        return jsonify({"connected": False})
+    return jsonify({"connected": True, **info})
+
 @app.route("/api/remote/directories", methods=["GET"])
 def api_remote_directories():
     """Obtiene todas las carpetas disponibles en la raíz de FileJump al conectarse."""
@@ -1037,7 +1145,10 @@ def api_settings():
         set_key(str(ENV_FILE), "FILEJUMP_UPLOAD_URL", env_updates["FILEJUMP_UPLOAD_URL"].strip())
 
     if "config" in data:
-        save_config(data["config"])
+        existing_cfg = load_config()
+        incoming_cfg = data["config"]
+        incoming_cfg.setdefault("account_profiles", existing_cfg.get("account_profiles", {}))
+        save_config(incoming_cfg)
         log_event("info", "Parámetros de sincronización guardados en sync_config.json")
 
     return jsonify({"success": True})
@@ -1494,6 +1605,47 @@ def api_cache_status():
     return jsonify({"cached_ids": sorted(cached_ids)})
 
 
+@app.route("/api/cache/clear", methods=["GET", "POST"])
+def api_cache_clear():
+    """Consulta el tamaño de la caché o elimina todos los archivos definitivamente sin pasar por la papelera."""
+    if request.method == "GET":
+        total_size = 0
+        file_count = 0
+        if TEMP_CACHE_DIR.exists():
+            for entry in TEMP_CACHE_DIR.iterdir():
+                if entry.is_file() and not entry.name.startswith("."):
+                    file_count += 1
+                    try:
+                        total_size += entry.stat().st_size
+                    except OSError:
+                        pass
+        return jsonify({"file_count": file_count, "total_bytes": total_size})
+
+    # Eliminación definitiva directa en disco (os.unlink / shutil.rmtree, sin papelera)
+    deleted_count = 0
+    freed_bytes = 0
+    current_hash = _compute_api_key_hash(os.getenv("FILEJUMP_API_KEY", "").strip())
+
+    if TEMP_CACHE_DIR.exists():
+        for entry in list(TEMP_CACHE_DIR.iterdir()):
+            try:
+                if entry.is_file() or entry.is_symlink():
+                    size = entry.stat().st_size if not entry.name.startswith(".") else 0
+                    entry.unlink()
+                    if not entry.name.startswith("."):
+                        deleted_count += 1
+                        freed_bytes += size
+                elif entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+            except Exception as e:
+                log_event("warning", f"No se pudo eliminar '{entry.name}' de caché: {e}")
+
+    TEMP_CACHE_DIR.mkdir(exist_ok=True)
+    save_cache_index({"api_key_hash": current_hash, "files": {}})
+    log_event("info", f"Caché local eliminada definitivamente ({deleted_count} archivo(s) borrados sin papelera).")
+    return jsonify({"success": True, "deleted_count": deleted_count, "freed_bytes": freed_bytes})
+
+
 # ==============================================================================
 # INTERFAZ WEB (HTML + TAILWIND CSS + VANILLA JS)
 # ==============================================================================
@@ -1518,7 +1670,7 @@ HTML_TEMPLATE = r"""
 
     <!-- Barra Superior -->
     <header class="bg-slate-900/90 backdrop-blur border-b border-slate-800 px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0 z-30">
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-3 shrink-0">
             <div class="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
                 <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
@@ -1530,7 +1682,28 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
 
-        <div class="flex items-center gap-3">
+        <!-- Información de Usuario y Barra de Almacenamiento FileJump -->
+        <div id="userStorageWidget" class="hidden flex-1 max-w-2xl mx-2 bg-slate-950/90 border border-slate-800/90 rounded-xl px-3.5 py-2 flex flex-col justify-center gap-1.5 shadow-inner">
+            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span class="w-5 h-5 rounded-full bg-indigo-600/25 border border-indigo-500/40 text-indigo-300 flex items-center justify-center text-[11px] shrink-0">👤</span>
+                    <span id="headerUserName" class="font-semibold text-white truncate">Usuario</span>
+                    <button onclick="openAccountQuotaModal()" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 border border-slate-700 text-[10px] text-slate-300 hover:text-indigo-200 transition shrink-0" title="Ajustar cuota o nombre manualmente">✏️</button>
+                </div>
+                <div class="flex items-center gap-2 sm:gap-3 text-[11px] font-mono shrink-0">
+                    <span class="text-sky-300" title="Espacio ocupado">Ocupado: <strong id="headerStorageUsed">0 B</strong></span>
+                    <span class="text-slate-600">|</span>
+                    <span class="text-emerald-300" title="Espacio disponible">Libre: <strong id="headerStorageFree">-</strong></span>
+                    <span class="text-slate-600">|</span>
+                    <span class="text-slate-300" title="Capacidad total">Total: <strong id="headerStorageTotal">-</strong></span>
+                </div>
+            </div>
+            <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden flex items-center">
+                <div id="headerStorageBar" class="h-full bg-gradient-to-r from-sky-500 via-indigo-500 to-purple-500 rounded-full transition-all duration-500" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <div class="flex items-center gap-3 shrink-0">
             <!-- Estado de Conexión API -->
             <div id="apiStatusBadge" class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-800 border border-slate-700 text-slate-300">
                 <span id="apiStatusDot" class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
@@ -1613,9 +1786,9 @@ HTML_TEMPLATE = r"""
             </div>
 
             <!-- Cuerpo Dividido estilo Explorador de Windows: Árbol de Carpetas (Izq) + Contenido (Der) -->
-            <div class="flex flex-col sm:flex-row flex-1 min-h-0 overflow-hidden">
+            <div class="flex flex-1 min-h-0 overflow-hidden">
                 <!-- Panel Izquierdo: Árbol Jerárquico de Carpetas (Lazy Load con +) -->
-                <div class="h-28 sm:h-auto sm:w-40 md:w-52 2xl:w-64 bg-slate-950/60 border-b sm:border-b-0 sm:border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
+                <div class="w-44 sm:w-52 xl:w-64 bg-slate-950/60 border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
                     <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500 px-2 py-1">Carpetas</div>
                     <div id="localFolderTree" class="space-y-0.5 text-xs">
                         <div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>
@@ -1628,8 +1801,8 @@ HTML_TEMPLATE = r"""
                         <thead class="bg-slate-950/70 text-slate-400 sticky top-0 z-10">
                             <tr>
                                 <th class="py-2 px-2.5 font-medium">Nombre</th>
-                                <th class="hidden xl:table-cell py-2 px-2.5 font-medium">Tamaño</th>
-                                <th class="hidden 2xl:table-cell py-2 px-2.5 font-medium">Modificado</th>
+                                <th class="py-2 px-2.5 font-medium">Tamaño</th>
+                                <th class="py-2 px-2.5 font-medium">Modificado</th>
                                 <th class="py-2 px-2.5 font-medium text-right">Estado</th>
                             </tr>
                         </thead>
@@ -1673,9 +1846,9 @@ HTML_TEMPLATE = r"""
             </div>
 
             <!-- Cuerpo Dividido estilo Explorador de Windows: Árbol de Carpetas (Izq) + Contenido (Der) -->
-            <div class="flex flex-col sm:flex-row flex-1 min-h-0 overflow-hidden">
+            <div class="flex flex-1 min-h-0 overflow-hidden">
                 <!-- Panel Izquierdo: Árbol Jerárquico Remoto (Lazy Load con +) -->
-                <div class="h-28 sm:h-auto sm:w-40 md:w-52 2xl:w-64 bg-slate-950/60 border-b sm:border-b-0 sm:border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
+                <div class="w-44 sm:w-52 xl:w-64 bg-slate-950/60 border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
                     <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500 px-2 py-1">Carpetas Nube</div>
                     <div id="remoteFolderTree" class="space-y-0.5 text-xs">
                         <div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>
@@ -1688,9 +1861,9 @@ HTML_TEMPLATE = r"""
                         <thead class="bg-slate-950/70 text-slate-400 sticky top-0 z-10">
                             <tr>
                                 <th class="py-2 px-2.5 font-medium">Nombre</th>
-                                <th class="hidden xl:table-cell py-2 px-2.5 font-medium">Tamaño</th>
-                                <th class="hidden 2xl:table-cell py-2 px-2.5 font-medium">Actualizado</th>
-                                <th class="py-2 px-2.5 font-medium text-right"><span class="hidden xl:inline">ID / </span>Estado</th>
+                                <th class="py-2 px-2.5 font-medium">Tamaño</th>
+                                <th class="py-2 px-2.5 font-medium">Actualizado</th>
+                                <th class="py-2 px-2.5 font-medium text-right">ID / Estado</th>
                             </tr>
                         </thead>
                         <tbody id="remoteTableBody" class="divide-y divide-slate-800/60">
@@ -1755,10 +1928,22 @@ HTML_TEMPLATE = r"""
                     </div>
                     <div class="flex items-center pt-5">
                         <label class="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
-                            <input type="checkbox" id="cfgHighSpeed" class="rounded bg-slate-950 border-slate-700 text-indigo-600">
+                            <input type="checkbox" id="cfgHighSpeed" class="rounded bg-slate-950 border border-slate-700 text-indigo-600">
                             <span>Subida Directa Alta Velocidad</span>
                         </label>
                     </div>
+                </div>
+
+                <!-- Gestión de Caché Local Persistente -->
+                <div class="bg-slate-950/60 p-4 rounded-xl border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div class="space-y-0.5">
+                        <h3 class="text-xs font-semibold uppercase tracking-wider text-rose-400">Almacenamiento Caché Local (temp_cache)</h3>
+                        <p id="cacheUsageSummary" class="text-xs text-slate-400">Calculando espacio ocupado en disco...</p>
+                    </div>
+                    <button type="button" onclick="confirmAndClearLocalCache()" id="clearCacheBtn" class="px-3.5 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/35 border border-rose-500/40 text-xs font-semibold text-rose-300 transition flex items-center gap-1.5 shrink-0">
+                        <span>🗑️</span>
+                        <span>Eliminar Caché Definitivamente</span>
+                    </button>
                 </div>
 
                 <!-- Gestión de Carpetas / Tareas -->
@@ -1774,6 +1959,46 @@ HTML_TEMPLATE = r"""
             <div class="px-6 py-4 border-t border-slate-800 flex justify-end gap-3">
                 <button onclick="closeSettingsModal()" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300">Cancelar</button>
                 <button onclick="saveSettings()" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar Cambios</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL DE NOMBRE DE USUARIO Y RESUMEN DE ALMACENAMIENTO (SOLO LECTURA) -->
+    <div id="accountQuotaModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4 z-50">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div class="flex items-center justify-between">
+                <h3 class="text-base font-bold text-white">Perfil de Cuenta FileJump</h3>
+                <button onclick="closeAccountQuotaModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="space-y-3 text-xs">
+                <div>
+                    <label class="block text-slate-400 mb-1">Nombre de Usuario / Cuenta (Editable)</label>
+                    <input type="text" id="quotaUserNameInput" placeholder="Dejar vacío para usar el nombre de la API..." class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white focus:border-indigo-500 focus:outline-none">
+                </div>
+                <div class="bg-slate-950/80 border border-slate-800 rounded-xl p-3 space-y-1.5">
+                    <div class="flex items-center justify-between">
+                        <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Almacenamiento en Nube</span>
+                        <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">Lectura API</span>
+                    </div>
+                    <div class="grid grid-cols-3 gap-2 pt-1 text-center font-mono">
+                        <div class="bg-slate-900/90 rounded-lg p-2 border border-slate-800">
+                            <div class="text-[10px] text-slate-400">Ocupado</div>
+                            <div id="readonlyModalUsed" class="text-sky-300 font-semibold mt-0.5">-</div>
+                        </div>
+                        <div class="bg-slate-900/90 rounded-lg p-2 border border-slate-800">
+                            <div class="text-[10px] text-slate-400">Libre</div>
+                            <div id="readonlyModalFree" class="text-emerald-300 font-semibold mt-0.5">-</div>
+                        </div>
+                        <div class="bg-slate-900/90 rounded-lg p-2 border border-slate-800">
+                            <div class="text-[10px] text-slate-400">Total</div>
+                            <div id="readonlyModalTotal" class="text-slate-200 font-semibold mt-0.5">-</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="flex justify-end gap-2.5 pt-2">
+                <button onclick="closeAccountQuotaModal()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Cancelar</button>
+                <button onclick="saveAccountQuota()" class="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar Nombre</button>
             </div>
         </div>
     </div>
@@ -1985,6 +2210,7 @@ HTML_TEMPLATE = r"""
     <script>
         let currentConfig = { tasks: [] };
         let wasConnected = false;
+        let lastProfileInfo = null;
         let currentPreviewList = [];
         let currentPreviewIndex = -1;
         let currentPreviewSource = 'local';
@@ -2093,15 +2319,18 @@ HTML_TEMPLATE = r"""
                 if (data.connected) {
                     dot.className = 'w-2 h-2 rounded-full bg-emerald-400';
                     txt.textContent = `Conectado (${data.masked_key})`;
-                    // Al conectarse por primera vez o reconectarse, actualizar directorios remotos automáticamente
+                    // Al conectarse por primera vez o reconectarse, actualizar directorios remotos y perfil/almacenamiento
                     if (!wasConnected) {
                         wasConnected = true;
+                        fetchUserStorageInfo();
                         await fetchRemoteDirectories(true);
                     }
                 } else {
                     wasConnected = false;
                     dot.className = 'w-2 h-2 rounded-full bg-rose-500';
                     txt.textContent = data.has_key ? 'Error de Token API' : 'Falta API Key en .env';
+                    const storageWidget = document.getElementById('userStorageWidget');
+                    if (storageWidget) storageWidget.classList.add('hidden');
                 }
 
                 const consoleEl = document.getElementById('logConsole');
@@ -2113,6 +2342,68 @@ HTML_TEMPLATE = r"""
                     consoleEl.scrollTop = consoleEl.scrollHeight;
                 }
             } catch (e) {}
+        }
+
+        async function fetchUserStorageInfo() {
+            try {
+                const res = await fetch('/api/user/profile');
+                const data = await res.json();
+                const widget = document.getElementById('userStorageWidget');
+                if (!data.connected) {
+                    widget.classList.add('hidden');
+                    return;
+                }
+                lastProfileInfo = data;
+                document.getElementById('headerUserName').textContent = data.user_name || 'Cuenta FileJump';
+                document.getElementById('headerStorageUsed').textContent = formatBytes(data.used_bytes || 0);
+
+                if (data.total_bytes && data.total_bytes > 0) {
+                    document.getElementById('headerStorageFree').textContent = formatBytes(data.free_bytes || 0);
+                    document.getElementById('headerStorageTotal').textContent = formatBytes(data.total_bytes);
+                    const pct = Math.min(100, Math.max(0, data.used_pct || 0));
+                    const bar = document.getElementById('headerStorageBar');
+                    bar.style.width = `${pct}%`;
+                    bar.className = pct >= 90
+                        ? 'h-full bg-gradient-to-r from-amber-500 to-rose-500 rounded-full transition-all duration-500'
+                        : 'h-full bg-gradient-to-r from-sky-500 via-indigo-500 to-purple-500 rounded-full transition-all duration-500';
+                } else {
+                    document.getElementById('headerStorageFree').textContent = 'Configurar plan';
+                    document.getElementById('headerStorageTotal').textContent = 'N/D';
+                    document.getElementById('headerStorageBar').style.width = '12%';
+                }
+                widget.classList.remove('hidden');
+            } catch (e) {}
+        }
+
+        function openAccountQuotaModal() {
+            const modal = document.getElementById('accountQuotaModal');
+            document.getElementById('quotaUserNameInput').value = (lastProfileInfo && lastProfileInfo.user_name !== 'Cuenta FileJump') ? lastProfileInfo.user_name : '';
+            document.getElementById('readonlyModalUsed').textContent = lastProfileInfo ? formatBytes(lastProfileInfo.used_bytes || 0) : '-';
+            document.getElementById('readonlyModalFree').textContent = (lastProfileInfo && lastProfileInfo.total_bytes > 0) ? formatBytes(lastProfileInfo.free_bytes || 0) : '-';
+            document.getElementById('readonlyModalTotal').textContent = (lastProfileInfo && lastProfileInfo.total_bytes > 0) ? formatBytes(lastProfileInfo.total_bytes) : '-';
+
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeAccountQuotaModal() {
+            const modal = document.getElementById('accountQuotaModal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        async function saveAccountQuota() {
+            const userName = document.getElementById('quotaUserNameInput').value.trim();
+
+            await fetch('/api/user/profile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_name: userName
+                })
+            });
+            closeAccountQuotaModal();
+            await fetchUserStorageInfo();
         }
 
         async function fetchRemoteDirectories(autoRefreshInspect = false) {
@@ -2885,14 +3176,28 @@ HTML_TEMPLATE = r"""
                 node = {
                     path: relPath,
                     name: relPath.split('/').pop() || (localActiveDriveRoot || 'Raíz'),
-                    expanded: false,
+                    expanded: true,
                     loaded: false,
                     loading: false,
                     has_children: true,
                     items: []
                 };
                 localNodes.set(relPath, node);
+            } else {
+                node.expanded = true;
             }
+
+            // Asegurar que toda la cadena de carpetas padre también quede desplegada en el árbol
+            if (relPath) {
+                const parts = relPath.split('/');
+                let acc = '';
+                for (let i = 0; i < parts.length - 1; i++) {
+                    acc = acc ? `${acc}/${parts[i]}` : parts[i];
+                    const ancestor = localNodes.get(acc);
+                    if (ancestor) ancestor.expanded = true;
+                }
+            }
+
             renderLocalTree();
             if (!node.loaded) {
                 await fetchLocalNodeChildren(relPath);
@@ -3024,8 +3329,8 @@ HTML_TEMPLATE = r"""
                             <span class="truncate" title="${item.rel_path}">${item.name}</span>
                         </div>
                     </td>
-                    <td class="hidden xl:table-cell py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
-                    <td class="hidden 2xl:table-cell py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
+                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
+                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
                     <td class="py-2 px-2.5 text-right whitespace-nowrap">
                         <div class="inline-flex items-center gap-1.5">
                             ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}'), mtime: ${item.mtime || 0}})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-sky-600/30 text-sky-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
@@ -3104,6 +3409,17 @@ HTML_TEMPLATE = r"""
             remoteSelectedKey = key;
             const node = remoteNodes.get(key);
             if (!node) return;
+
+            // Desplegar automáticamente la carpeta abierta y toda su cadena de ancestros en el árbol
+            node.expanded = true;
+            let pKey = node.parentKey;
+            while (pKey) {
+                const ancestor = remoteNodes.get(String(pKey));
+                if (!ancestor) break;
+                ancestor.expanded = true;
+                pKey = ancestor.parentKey;
+            }
+
             renderRemoteTree();
             if (!node.loaded) {
                 await fetchRemoteNodeChildren(key);
@@ -3197,6 +3513,8 @@ HTML_TEMPLATE = r"""
             const tbody = document.getElementById('remoteTableBody');
             const badge = document.getElementById('remoteCountBadge');
             const breadcrumbBar = document.getElementById('remoteBreadcrumbBar');
+            const subtitleEl = document.getElementById('remotePathSubtitle');
+            const dirSelector = document.getElementById('remoteDirSelector');
 
             const trail = [];
             let cursor = remoteNodes.get(remoteSelectedKey);
@@ -3206,6 +3524,51 @@ HTML_TEMPLATE = r"""
             }
 
             const currentNode = remoteNodes.get(remoteSelectedKey);
+            const items = currentNode ? (currentNode.items || []) : [];
+
+            // Actualizar activamente el ID Remoto mostrado en el encabezado
+            if (subtitleEl) {
+                const activeId = currentNode ? currentNode.id : 'ROOT';
+                const pathText = trail.length > 0 ? trail.map(n => n.name).join(' / ') : '/ (Raíz de FileJump)';
+                subtitleEl.textContent = `ID Remoto: ${activeId} • ${pathText}`;
+            }
+
+            // Actualizar dinámicamente el selector superior con la carpeta actual, ancestros y subcarpetas
+            if (dirSelector && currentNode) {
+                const activeVal = String(currentNode.id);
+                const subfolders = items.filter(i => i.type === 'folder');
+                const addedIds = new Set();
+
+                let optsHtml = `
+                    <option value="">Auto (Carpeta de Tarea)</option>
+                    <option value="ROOT">/ (Raíz de FileJump)</option>
+                `;
+                addedIds.add('');
+                addedIds.add('ROOT');
+
+                // Incluir la ruta de carpetas padre y la carpeta actual
+                trail.forEach((n, idx) => {
+                    const idStr = String(n.id);
+                    if (!addedIds.has(idStr)) {
+                        addedIds.add(idStr);
+                        const prefixIcon = idx === trail.length - 1 ? '📂' : '📁';
+                        optsHtml += `<option value="${idStr}">${prefixIcon} ${n.name} (#${idStr})</option>`;
+                    }
+                });
+
+                // Incluir las subcarpetas inmediatas de la carpeta que se está viendo en este momento
+                subfolders.forEach(sf => {
+                    const idStr = String(sf.id);
+                    if (!addedIds.has(idStr)) {
+                        addedIds.add(idStr);
+                        optsHtml += `<option value="${idStr}">↳ 📁 ${sf.name} (#${idStr})</option>`;
+                    }
+                });
+
+                dirSelector.innerHTML = optsHtml;
+                dirSelector.value = activeVal;
+            }
+
             let bcHtml = '';
             if (currentNode && currentNode.parentKey) {
                 bcHtml += `<button onclick="selectRemoteNode('${currentNode.parentKey}')" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium shrink-0">⬅ Subir</button>`;
@@ -3217,7 +3580,6 @@ HTML_TEMPLATE = r"""
             });
             breadcrumbBar.innerHTML = bcHtml || `<span class="text-slate-400">☁️ Raíz</span>`;
 
-            const items = currentNode ? (currentNode.items || []) : [];
             badge.textContent = `${items.length} elementos`;
 
             if (items.length === 0) {
@@ -3239,12 +3601,12 @@ HTML_TEMPLATE = r"""
                             <span class="truncate" title="${item.rel_path}">${item.name}</span>
                         </div>
                     </td>
-                    <td class="hidden xl:table-cell py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
-                    <td class="hidden 2xl:table-cell py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
+                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
+                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
                     <td class="py-2 px-2.5 text-right whitespace-nowrap">
                         <div class="inline-flex items-center gap-1.5">
                             ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}'), mtime: ${mtimeVal}})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 text-indigo-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
-                            <span class="hidden xl:inline text-[10px] text-slate-500 font-mono">#${item.id}</span>
+                            <span class="text-[10px] text-slate-500 font-mono">#${item.id}</span>
                             ${getStatusBadge(item.sync_status)}
                         </div>
                     </td>
@@ -3570,6 +3932,7 @@ HTML_TEMPLATE = r"""
                 } else if (data.error) {
                     showNotice('Error de Sincronización', data.error);
                 } else {
+                    await fetchUserStorageInfo();
                     await inspectSelectedTask();
                 }
             } catch (e) {
@@ -3596,8 +3959,69 @@ HTML_TEMPLATE = r"""
             container.innerHTML = '';
             (currentConfig.tasks || []).forEach(t => addTaskRow(t.name, t.path));
 
+            refreshCacheUsageSummary();
+
             document.getElementById('settingsModal').classList.remove('hidden');
             document.getElementById('settingsModal').classList.add('flex');
+        }
+
+        async function refreshCacheUsageSummary() {
+            const summaryEl = document.getElementById('cacheUsageSummary');
+            if (!summaryEl) return;
+            try {
+                const res = await fetch('/api/cache/clear');
+                const data = await res.json();
+                summaryEl.textContent = `${data.file_count || 0} archivo(s) almacenados (${formatBytes(data.total_bytes || 0)}) • Eliminación permanente sin papelera.`;
+            } catch (e) {
+                summaryEl.textContent = 'No se pudo calcular el tamaño de la caché.';
+            }
+        }
+
+        function confirmAndClearLocalCache() {
+            const titleEl = document.getElementById('noticeTitle');
+            const msgEl = document.getElementById('noticeMessage');
+            const actions = document.getElementById('noticeActions');
+
+            titleEl.textContent = 'Eliminar Caché Local Definitivamente';
+            msgEl.textContent = 'Se eliminarán permanentemente todos los archivos descargados en temp_cache sin pasar por la Papelera de Reciclaje. ¿Deseas continuar?';
+            actions.innerHTML = '';
+
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300';
+            cancelBtn.textContent = 'Cancelar';
+            cancelBtn.onclick = () => {
+                document.getElementById('noticeModal').classList.add('hidden');
+                document.getElementById('noticeModal').classList.remove('flex');
+            };
+            actions.appendChild(cancelBtn);
+
+            const delBtn = document.createElement('button');
+            delBtn.className = 'px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-white';
+            delBtn.textContent = 'Sí, Eliminar Definitivamente';
+            delBtn.onclick = async () => {
+                cancelBtn.click();
+                const btn = document.getElementById('clearCacheBtn');
+                if (btn) btn.disabled = true;
+                try {
+                    const res = await fetch('/api/cache/clear', { method: 'POST' });
+                    const data = await res.json();
+                    prefetchedRemoteIds.clear();
+                    if (musicSource === 'remote' && musicPlaylist.length > 0) {
+                        renderMusicPlaylist();
+                    }
+                    await refreshCacheUsageSummary();
+                    await refreshStatusAndLogs();
+                    showNotice('Caché Eliminada', `Se eliminaron definitivamente ${data.deleted_count || 0} archivo(s) (${formatBytes(data.freed_bytes || 0)} liberados) sin pasar por la papelera.`);
+                } catch (e) {
+                    showNotice('Error', 'No se pudo limpiar la caché local.');
+                } finally {
+                    if (btn) btn.disabled = false;
+                }
+            };
+            actions.appendChild(delBtn);
+
+            document.getElementById('noticeModal').classList.remove('hidden');
+            document.getElementById('noticeModal').classList.add('flex');
         }
 
         function closeSettingsModal() {
