@@ -22,6 +22,7 @@
 ### 🗂️ Explorador Dual Estilo Windows
 * **Panel Dividido (Árbol + Contenido):** Árbol jerárquico lateral izquierdo con **carga perezosa (`+` / `−`)** bajo demanda y tabla de contenido a la derecha con barra de ruta (*breadcrumbs*) y navegación por doble clic.
 * **Exploración Completa de Discos Locales:** Detección automática de unidades locales (`C:\`, `D:\`, `E:\`, montajes Unix) con apertura directa sin duplicar archivos en caché.
+* **Diseño Adaptable:** Los exploradores ocupan el ancho disponible y se ajustan a la altura de la ventana en escritorio; en pantallas estrechas apilan árbol y contenido, priorizando nombres y estados de archivos.
 
 ### 🎬 Visor Universal de Archivos y Caché Persistente
 * **Caché Persistente (`temp_cache`):** Descarga archivos remotos únicamente bajo demanda y conserva las copias al cerrar el servidor. Al abrir un archivo en caché, verifica la fecha de modificación remota y descarga la versión más reciente cuando detecta cambios. Si cambia la API key, elimina la caché asociada a las credenciales anteriores.

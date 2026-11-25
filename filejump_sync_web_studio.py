@@ -1514,10 +1514,10 @@ HTML_TEMPLATE = r"""
         ::-webkit-scrollbar-thumb:hover { background: #475569; }
     </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
+<body class="bg-slate-950 text-slate-100 min-h-screen lg:h-screen lg:overflow-hidden flex flex-col">
 
     <!-- Barra Superior -->
-    <header class="bg-slate-900/90 backdrop-blur border-b border-slate-800 px-4 sm:px-6 py-3.5 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
+    <header class="bg-slate-900/90 backdrop-blur border-b border-slate-800 px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0 z-30">
         <div class="flex items-center gap-3">
             <div class="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
                 <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -1548,8 +1548,8 @@ HTML_TEMPLATE = r"""
     </header>
 
     <!-- Barra de Control de Tareas -->
-    <section class="max-w-7xl w-full mx-auto px-4 sm:px-6 pt-5 pb-3">
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-sm">
+    <section class="w-full px-3 sm:px-5 pt-3 pb-2 shrink-0">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl px-4 py-3 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm">
             <div class="flex flex-col sm:flex-row sm:items-center gap-3 flex-1">
                 <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Tarea Activa:</label>
                 <select id="taskSelector" onchange="inspectSelectedTask()" class="bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 min-w-[220px]">
@@ -1571,7 +1571,7 @@ HTML_TEMPLATE = r"""
         </div>
 
         <!-- Leyenda de Estados -->
-        <div class="flex flex-wrap items-center gap-4 mt-3 px-1 text-xs text-slate-400">
+        <div class="flex flex-wrap items-center gap-4 mt-2 px-1 text-xs text-slate-400">
             <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500"></span> Sincronizado</span>
             <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-sky-500"></span> Nuevo (Pendiente subir)</span>
             <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-amber-500"></span> Modificado (Tamaño/Fecha distinta)</span>
@@ -1579,12 +1579,12 @@ HTML_TEMPLATE = r"""
         </div>
     </section>
 
-    <!-- DOBLE VENTANA DE COMPARACIÓN (LOCAL VS REMOTO) -->
-    <main class="max-w-7xl w-full mx-auto px-4 sm:px-6 py-2 flex-1 grid grid-cols-1 lg:grid-cols-2 gap-5">
+    <!-- DOBLE VENTANA DE COMPARACIÓN (100% ANCHO Y ALTO RESPONSIVO) -->
+    <main class="w-full px-3 sm:px-5 py-1.5 flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-2 gap-4">
         
         <!-- VENTANA 1: EXPLORADOR LOCAL ESTILO WINDOWS -->
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col overflow-hidden shadow-md h-[510px]">
-            <div class="px-4 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col overflow-hidden shadow-md h-[460px] lg:h-full min-h-0">
+            <div class="px-3.5 py-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
                 <div class="flex items-center gap-2 min-w-0 flex-1">
                     <span class="p-1.5 rounded-lg bg-slate-800 text-sky-400 shrink-0">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
@@ -1599,7 +1599,7 @@ HTML_TEMPLATE = r"""
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                             </button>
                         </div>
-                        <p id="localPathSubtitle" class="text-[11px] text-slate-400 truncate max-w-[280px]">Sin ruta seleccionada</p>
+                        <p id="localPathSubtitle" class="text-[11px] text-slate-400 truncate">Sin ruta seleccionada</p>
                     </div>
                 </div>
                 <span id="localCountBadge" class="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 font-medium shrink-0">0 elementos</span>
@@ -1613,9 +1613,9 @@ HTML_TEMPLATE = r"""
             </div>
 
             <!-- Cuerpo Dividido estilo Explorador de Windows: Árbol de Carpetas (Izq) + Contenido (Der) -->
-            <div class="flex flex-1 min-h-0 overflow-hidden">
+            <div class="flex flex-col sm:flex-row flex-1 min-h-0 overflow-hidden">
                 <!-- Panel Izquierdo: Árbol Jerárquico de Carpetas (Lazy Load con +) -->
-                <div class="w-44 sm:w-52 bg-slate-950/60 border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
+                <div class="h-28 sm:h-auto sm:w-40 md:w-52 2xl:w-64 bg-slate-950/60 border-b sm:border-b-0 sm:border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
                     <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500 px-2 py-1">Carpetas</div>
                     <div id="localFolderTree" class="space-y-0.5 text-xs">
                         <div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>
@@ -1628,8 +1628,8 @@ HTML_TEMPLATE = r"""
                         <thead class="bg-slate-950/70 text-slate-400 sticky top-0 z-10">
                             <tr>
                                 <th class="py-2 px-2.5 font-medium">Nombre</th>
-                                <th class="py-2 px-2.5 font-medium">Tamaño</th>
-                                <th class="py-2 px-2.5 font-medium">Modificado</th>
+                                <th class="hidden xl:table-cell py-2 px-2.5 font-medium">Tamaño</th>
+                                <th class="hidden 2xl:table-cell py-2 px-2.5 font-medium">Modificado</th>
                                 <th class="py-2 px-2.5 font-medium text-right">Estado</th>
                             </tr>
                         </thead>
@@ -1642,8 +1642,8 @@ HTML_TEMPLATE = r"""
         </div>
 
         <!-- VENTANA 2: EXPLORADOR REMOTO (FILEJUMP) ESTILO WINDOWS -->
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col overflow-hidden shadow-md h-[510px]">
-            <div class="px-4 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col overflow-hidden shadow-md h-[460px] lg:h-full min-h-0">
+            <div class="px-3.5 py-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
                 <div class="flex items-center gap-2 min-w-0 flex-1">
                     <span class="p-1.5 rounded-lg bg-indigo-950 text-indigo-400 shrink-0">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"/></svg>
@@ -1673,9 +1673,9 @@ HTML_TEMPLATE = r"""
             </div>
 
             <!-- Cuerpo Dividido estilo Explorador de Windows: Árbol de Carpetas (Izq) + Contenido (Der) -->
-            <div class="flex flex-1 min-h-0 overflow-hidden">
+            <div class="flex flex-col sm:flex-row flex-1 min-h-0 overflow-hidden">
                 <!-- Panel Izquierdo: Árbol Jerárquico Remoto (Lazy Load con +) -->
-                <div class="w-44 sm:w-52 bg-slate-950/60 border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
+                <div class="h-28 sm:h-auto sm:w-40 md:w-52 2xl:w-64 bg-slate-950/60 border-b sm:border-b-0 sm:border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
                     <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500 px-2 py-1">Carpetas Nube</div>
                     <div id="remoteFolderTree" class="space-y-0.5 text-xs">
                         <div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>
@@ -1688,9 +1688,9 @@ HTML_TEMPLATE = r"""
                         <thead class="bg-slate-950/70 text-slate-400 sticky top-0 z-10">
                             <tr>
                                 <th class="py-2 px-2.5 font-medium">Nombre</th>
-                                <th class="py-2 px-2.5 font-medium">Tamaño</th>
-                                <th class="py-2 px-2.5 font-medium">Actualizado</th>
-                                <th class="py-2 px-2.5 font-medium text-right">ID / Estado</th>
+                                <th class="hidden xl:table-cell py-2 px-2.5 font-medium">Tamaño</th>
+                                <th class="hidden 2xl:table-cell py-2 px-2.5 font-medium">Actualizado</th>
+                                <th class="py-2 px-2.5 font-medium text-right"><span class="hidden xl:inline">ID / </span>Estado</th>
                             </tr>
                         </thead>
                         <tbody id="remoteTableBody" class="divide-y divide-slate-800/60">
@@ -1703,13 +1703,13 @@ HTML_TEMPLATE = r"""
     </main>
 
     <!-- CONSOLA DE ACTIVIDAD EN TIEMPO REAL -->
-    <section class="max-w-7xl w-full mx-auto px-4 sm:px-6 py-4">
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
-            <div class="flex items-center justify-between mb-2">
+    <section class="w-full px-3 sm:px-5 pt-2 pb-3 shrink-0">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3">
+            <div class="flex items-center justify-between mb-1.5">
                 <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Registro de Actividad en Vivo</h3>
                 <span class="text-[11px] text-slate-500">Caché Persistente Inteligente Activa</span>
             </div>
-            <div id="logConsole" class="bg-slate-950 rounded-xl p-3 h-32 overflow-y-auto font-mono text-xs space-y-1 text-slate-300 border border-slate-800/80">
+            <div id="logConsole" class="bg-slate-950 rounded-xl p-2.5 h-24 overflow-y-auto font-mono text-xs space-y-1 text-slate-300 border border-slate-800/80">
                 <div class="text-slate-500">Esperando acciones...</div>
             </div>
         </div>
@@ -3018,14 +3018,14 @@ HTML_TEMPLATE = r"""
                 return `
                 <tr ${isFolder ? `ondblclick="selectLocalFolder('${safeRel}')"` : `ondblclick="openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}'), mtime: ${item.mtime || 0}})"`}
                     class="hover:bg-slate-800/50 transition ${isFolder ? 'cursor-pointer' : 'cursor-pointer'}">
-                    <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[200px]">
+                    <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[240px] xl:max-w-[380px] 2xl:max-w-[520px]">
                         <div class="flex items-center gap-1.5 truncate">
                             <span class="shrink-0">${isFolder ? '📁' : '📄'}</span>
                             <span class="truncate" title="${item.rel_path}">${item.name}</span>
                         </div>
                     </td>
-                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
-                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
+                    <td class="hidden xl:table-cell py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
+                    <td class="hidden 2xl:table-cell py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
                     <td class="py-2 px-2.5 text-right whitespace-nowrap">
                         <div class="inline-flex items-center gap-1.5">
                             ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}'), mtime: ${item.mtime || 0}})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-sky-600/30 text-sky-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
@@ -3233,18 +3233,18 @@ HTML_TEMPLATE = r"""
                 return `
                 <tr ${isFolder ? `ondblclick="selectRemoteNode('${folderKey}')"` : `ondblclick="openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}'), mtime: ${mtimeVal}})"`}
                     class="hover:bg-slate-800/50 transition cursor-pointer">
-                    <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[200px]">
+                    <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[240px] xl:max-w-[380px] 2xl:max-w-[520px]">
                         <div class="flex items-center gap-1.5 truncate">
                             <span class="shrink-0">${isFolder ? '📁' : '☁️'}</span>
                             <span class="truncate" title="${item.rel_path}">${item.name}</span>
                         </div>
                     </td>
-                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
-                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
+                    <td class="hidden xl:table-cell py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
+                    <td class="hidden 2xl:table-cell py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
                     <td class="py-2 px-2.5 text-right whitespace-nowrap">
                         <div class="inline-flex items-center gap-1.5">
                             ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}'), mtime: ${mtimeVal}})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 text-indigo-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
-                            <span class="text-[10px] text-slate-500 font-mono">#${item.id}</span>
+                            <span class="hidden xl:inline text-[10px] text-slate-500 font-mono">#${item.id}</span>
                             ${getStatusBadge(item.sync_status)}
                         </div>
                     </td>
