@@ -10,6 +10,8 @@ import hashlib
 import zipfile
 import mimetypes
 import subprocess
+import threading
+import webbrowser
 import xml.etree.ElementTree as ET
 import datetime
 from datetime import timezone
@@ -455,35 +457,141 @@ class FileJumpClient:
 
     def upload_file(self, local_path, folder_id=None, use_high_speed=True):
         """
-        Sube un archivo utilizando el endpoint de alta velocidad
-        (https://uploads.filejump.com/api/upload) o el estándar (/files).
+        Sube un archivo utilizando el endpoint REST autenticado POST /api/files/upload
+        con soporte para alta velocidad y respaldo automático.
         """
-        target_url = self.upload_url if use_high_speed else f"{self.base_url}/files"
-        file_name = os.path.basename(local_path)
-        data = {}
-        if folder_id is not None:
-            data["folder_id"] = str(folder_id)
+        rest_upload_url = f"{self.base_url}/files/upload"
+        rest_alias_url = f"{self.base_url}/files"
 
+        # Priorizar el endpoint REST principal autenticado con Bearer Token
+        if use_high_speed and self.upload_url:
+            candidate_urls = [rest_upload_url, self.upload_url, rest_alias_url]
+        else:
+            candidate_urls = [rest_upload_url, rest_alias_url]
+
+        # Eliminar duplicados manteniendo el orden
+        ordered_urls = []
+        for u in candidate_urls:
+            if u and u not in ordered_urls:
+                ordered_urls.append(u)
+
+        file_name = os.path.basename(local_path)
+        mime_type, _ = mimetypes.guess_type(local_path)
+        mime_type = mime_type or "application/octet-stream"
+
+        st = os.stat(local_path)
+        mtime_sec = int(st.st_mtime)
+        mtime_ms = int(st.st_mtime * 1000)
+        mtime_iso = datetime.datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mtime_sql = datetime.datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        data = {
+            "last_modified": str(mtime_ms),
+            "lastModified": str(mtime_ms),
+            "mtime": str(mtime_sec),
+            "updated_at": mtime_iso,
+            "created_at": mtime_iso
+        }
+        if folder_id not in (None, "", "ROOT", 0, "0"):
+            fid_str = str(folder_id)
+            data["folder_id"] = fid_str
+            data["parent_id"] = fid_str
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+            "X-File-Last-Modified": str(mtime_ms),
+            "X-File-Mtime": mtime_iso
+        }
+
+        last_error_detail = "Sin respuesta del servidor"
+
+        for target_url in ordered_urls:
+            try:
+                with open(local_path, "rb") as f:
+                    files = {"file": (file_name, f, mime_type)}
+                    resp = requests.post(
+                        target_url,
+                        headers=headers,
+                        files=files,
+                        data=data,
+                        timeout=300
+                    )
+                if resp.status_code in (200, 201):
+                    try:
+                        res_json = resp.json()
+                    except Exception:
+                        res_json = {"uploaded": True}
+
+                    file_obj = (
+                        res_json.get("data")
+                        or res_json.get("file")
+                        or res_json.get("fileEntry")
+                        or res_json
+                    )
+                    if isinstance(file_obj, list) and len(file_obj) > 0:
+                        file_obj = file_obj[0]
+
+                    new_id = file_obj.get("id") if isinstance(file_obj, dict) else None
+                    if new_id:
+                        self._sync_remote_timestamp("file", new_id, st.st_mtime)
+
+                    if isinstance(file_obj, dict):
+                        return file_obj
+                    return {"id": new_id, "raw": res_json}
+                else:
+                    try:
+                        err_json = resp.json()
+                        last_error_detail = err_json.get("message") or err_json.get("error") or resp.text[:250]
+                    except Exception:
+                        last_error_detail = f"HTTP {resp.status_code}: {resp.text[:250]}"
+                    log_event("warning", f"Intento en {target_url} falló ({resp.status_code}): {last_error_detail}")
+            except Exception as e:
+                last_error_detail = str(e)
+                log_event("warning", f"Excepción subiendo '{file_name}' a {target_url}: {e}")
+
+        log_event("error", f"Error definitivo subiendo '{file_name}': {last_error_detail}")
+        self.last_upload_error = last_error_detail
+        return None
+
+    def _sync_remote_timestamp(self, item_type, item_id, mtime_float):
+        """Intenta actualizar la fecha de modificación en FileJump y guarda respaldo local por ID."""
+        if not item_id or not mtime_float:
+            return
+        mtime_sec = int(mtime_float)
+        mtime_ms = int(mtime_float * 1000)
+        mtime_iso = datetime.datetime.fromtimestamp(mtime_float, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mtime_sql = datetime.datetime.fromtimestamp(mtime_float, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Guardar respaldo en sync_config.json por si la API de FileJump no permite sobrescribir updated_at
         try:
-            with open(local_path, "rb") as f:
-                files = {"file": (file_name, f, "application/octet-stream")}
-                resp = requests.post(
-                    target_url,
-                    headers=self._headers(is_json=False),
-                    files=files,
-                    data=data,
-                    timeout=300
-                )
-            if resp.status_code in (200, 201):
-                res_json = resp.json()
-                file_obj = res_json.get("data", res_json.get("fileEntry", res_json))
-                return file_obj
-            else:
-                log_event("error", f"Error subiendo '{file_name}': HTTP {resp.status_code} - {resp.text}")
-                return None
-        except Exception as e:
-            log_event("error", f"Excepción subiendo '{file_name}': {e}")
-            return None
+            cfg = load_config()
+            ts_map = cfg.setdefault("preserved_mtimes", {})
+            ts_map[f"{item_type}:{item_id}"] = float(mtime_float)
+            save_config(cfg)
+        except Exception:
+            pass
+
+        payload = {
+            "updated_at": mtime_iso,
+            "created_at": mtime_iso,
+            "last_modified": mtime_ms,
+            "lastModified": mtime_ms,
+            "mtime": mtime_sec,
+            "modified_at": mtime_sql
+        }
+        endpoints = (
+            [f"{self.base_url}/folders/{item_id}", f"{self.base_url}/file-entries/{item_id}"]
+            if item_type == "folder"
+            else [f"{self.base_url}/files/{item_id}", f"{self.base_url}/file-entries/{item_id}"]
+        )
+        for ep in endpoints:
+            try:
+                resp = requests.put(ep, headers=self._headers(), json=payload, timeout=8)
+                if resp.status_code in (200, 201, 204):
+                    break
+            except Exception:
+                pass
 
     def delete_file(self, file_id):
         """Elimina un archivo remoto usando DELETE /files/{id}."""
@@ -493,6 +601,60 @@ class FileJumpClient:
         except Exception as e:
             log_event("error", f"Error eliminando archivo remoto {file_id}: {e}")
             return False
+
+    def delete_folder(self, folder_id):
+        """Elimina una carpeta remota usando DELETE /folders/{id} o /file-entries/{id}."""
+        for endpoint in (f"{self.base_url}/folders/{folder_id}", f"{self.base_url}/file-entries/{folder_id}"):
+            try:
+                resp = requests.delete(endpoint, headers=self._headers(), timeout=15)
+                if resp.status_code in (200, 204):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def rename_item(self, item_type, item_id, new_name):
+        """Renombra un archivo o carpeta remota en FileJump."""
+        endpoints = (
+            [f"{self.base_url}/folders/{item_id}", f"{self.base_url}/file-entries/{item_id}"]
+            if item_type == "folder"
+            else [f"{self.base_url}/files/{item_id}", f"{self.base_url}/file-entries/{item_id}"]
+        )
+        for ep in endpoints:
+            try:
+                resp = requests.put(ep, headers=self._headers(), json={"name": new_name}, timeout=15)
+                if resp.status_code in (200, 201, 204):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def download_file_direct(self, file_id, dest_path, remote_mtime=0.0):
+        """Descarga un archivo remoto directamente a una ruta local y preserva su fecha de modificación."""
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        candidate_urls = [
+            f"{self.base_url}/files/{file_id}/download",
+            f"{self.base_url}/drive/file-entries/{file_id}/download"
+        ]
+        for url in candidate_urls:
+            try:
+                with requests.get(url, headers=headers, stream=True, timeout=180) as resp:
+                    if resp.status_code == 200:
+                        with open(dest, "wb") as out_f:
+                            for chunk in resp.iter_content(chunk_size=65536):
+                                if chunk:
+                                    out_f.write(chunk)
+                        if remote_mtime and remote_mtime > 0:
+                            try:
+                                os.utime(dest, (remote_mtime, remote_mtime))
+                            except Exception:
+                                pass
+                        return True
+            except Exception as e:
+                log_event("warning", f"Error descargando #{file_id} desde {url}: {e}")
+        return False
 
     def get_remote_file_mtime(self, file_id):
         """Consulta la fecha de modificación remota (updated_at) de un archivo específico en FileJump."""
@@ -812,6 +974,7 @@ def list_remote_immediate_children(client, parent_id="ROOT", current_prefix=""):
     folders = client.list_folders(parent_id=query_parent)
     files = client.list_files(folder_id=query_parent)
     items = []
+    preserved_mtimes = load_config().get("preserved_mtimes", {})
 
     for fld in sorted(folders, key=lambda x: (x.get("name") or x.get("file_name") or "").lower()):
         fname = fld.get("name") or fld.get("file_name") or ""
@@ -830,7 +993,7 @@ def list_remote_immediate_children(client, parent_id="ROOT", current_prefix=""):
 
         rel_path = f"{current_prefix}/{fname}".lstrip("/")
         updated_str = fld.get("updated_at") or fld.get("created_at") or ""
-        mtime = parse_iso_timestamp(updated_str)
+        mtime = preserved_mtimes.get(f"folder:{fid}") or parse_iso_timestamp(updated_str)
         items.append({
             "type": "folder",
             "id": fid,
@@ -860,7 +1023,7 @@ def list_remote_immediate_children(client, parent_id="ROOT", current_prefix=""):
 
         rel_path = f"{current_prefix}/{fname}".lstrip("/")
         updated_str = fl.get("updated_at") or fl.get("created_at") or ""
-        mtime = parse_iso_timestamp(updated_str)
+        mtime = preserved_mtimes.get(f"file:{fid}") or parse_iso_timestamp(updated_str)
         size = fl.get("size") or fl.get("file_size") or 0
         items.append({
             "type": "file",
@@ -887,6 +1050,7 @@ def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_dep
     remote_items = []
     folders = client.list_folders(parent_id=query_parent)
     files = client.list_files(folder_id=query_parent)
+    preserved_mtimes = load_config().get("preserved_mtimes", {})
 
     # Ordenar carpetas alfabéticamente para mantener consistencia jerárquica
     sorted_folders = sorted(folders, key=lambda x: (x.get("name") or x.get("file_name") or "").lower())
@@ -908,7 +1072,7 @@ def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_dep
 
         rel_path = f"{current_prefix}/{fname}".lstrip("/")
         updated_str = fld.get("updated_at") or fld.get("created_at") or ""
-        mtime = parse_iso_timestamp(updated_str)
+        mtime = preserved_mtimes.get(f"folder:{fid}") or parse_iso_timestamp(updated_str)
         remote_items.append({
             "type": "folder",
             "id": fid,
@@ -943,7 +1107,7 @@ def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_dep
 
         rel_path = f"{current_prefix}/{fname}".lstrip("/")
         updated_str = fl.get("updated_at") or fl.get("created_at") or ""
-        mtime = parse_iso_timestamp(updated_str)
+        mtime = preserved_mtimes.get(f"file:{fid}") or parse_iso_timestamp(updated_str)
         size = fl.get("size") or fl.get("file_size") or 0
         remote_items.append({
             "type": "file",
@@ -1395,17 +1559,17 @@ def api_run_sync(task_name):
         futures = [executor.submit(upload_worker, item) for item in to_upload]
         for fut in as_completed(futures):
             f_item, api_res, folder_id = fut.result()
-            if api_res and api_res.get("id"):
+            if api_res is not None:
                 uploaded_count += 1
+                remote_file_id = api_res.get("id") if isinstance(api_res, dict) else None
                 record["files"][f_item["rel_path"]] = {
-                    "remote_id": api_res["id"],
+                    "remote_id": remote_file_id,
                     "folder_id": folder_id,
                     "size": f_item["size"],
                     "local_mtime": f_item["mtime"],
                     "updated_at": datetime.datetime.now(timezone.utc).isoformat()
                 }
-                log_event("success", f"Sincronizado: {f_item['rel_path']} (ID: {api_res['id']})")
-
+                log_event("success", f"Sincronizado: {f_item['rel_path']} (ID: {remote_file_id or 'OK'})")
     save_task_record(task_name, record)
     log_event("info", f"Sincronización finalizada: {uploaded_count}/{len(to_upload)} archivos subidos.")
     return jsonify({"success": True, "uploaded": uploaded_count, "total": len(to_upload)})
@@ -1723,6 +1887,365 @@ def api_cache_clear():
     return jsonify({"success": True, "deleted_count": deleted_count, "freed_bytes": freed_bytes})
 
 
+def _resolve_local_explorer_target(data):
+    """Resuelve la ruta absoluta de un archivo o carpeta seleccionada en el explorador local."""
+    full_path = (data.get("full_path") or "").strip()
+    if full_path:
+        return Path(full_path).resolve()
+    root_path = (data.get("root_path") or "").strip()
+    task_name = (data.get("task") or "").strip()
+    rel_path = (data.get("rel_path") or "").strip().strip("/")
+    if root_path:
+        base = Path(root_path).resolve()
+        return (base / rel_path).resolve() if rel_path else base
+    if task_name:
+        cfg = load_config()
+        task = next((t for t in cfg.get("tasks", []) if t["name"] == task_name), None)
+        if task:
+            base = Path(task["path"]).resolve()
+            return (base / rel_path).resolve() if rel_path else base
+    return None
+
+
+@app.route("/api/explorer/audio_collect", methods=["POST"])
+def api_explorer_audio_collect():
+    """Recorre recursivamente una carpeta (local o remota) y devuelve todos los archivos multimedia de audio."""
+    data = request.json or {}
+    source = data.get("source", "local")
+    audio_exts = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
+    tracks = []
+
+    if source == "local":
+        target = _resolve_local_explorer_target(data)
+        if not target or not target.exists():
+            return jsonify({"error": "Ruta local no encontrada"}), 404
+        if target.is_file():
+            if target.suffix.lower() in audio_exts:
+                st = target.stat()
+                tracks.append({
+                    "type": "file",
+                    "name": target.name,
+                    "rel_path": target.name,
+                    "full_path": str(target),
+                    "size": st.st_size,
+                    "mtime": st.st_mtime
+                })
+        else:
+            for root, dirs, files in os.walk(target):
+                dirs.sort(key=str.lower)
+                for fname in sorted(files, key=str.lower):
+                    fp = Path(root) / fname
+                    if fp.suffix.lower() in audio_exts:
+                        try:
+                            st = fp.stat()
+                            tracks.append({
+                                "type": "file",
+                                "name": fname,
+                                "rel_path": fp.relative_to(target).as_posix(),
+                                "full_path": str(fp),
+                                "size": st.st_size,
+                                "mtime": st.st_mtime
+                            })
+                        except OSError:
+                            pass
+        return jsonify({"tracks": tracks})
+
+    # Remoto: explorar recursivamente la carpeta en FileJump
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY"}), 400
+    folder_id = data.get("id")
+    if folder_id in (None, "", "ROOT"):
+        folder_id = "ROOT"
+    elif str(folder_id).isdigit():
+        folder_id = int(folder_id)
+
+    remote_entries = scan_remote_tree(client, folder_id, current_prefix="", depth=0, max_depth=12)
+    for item in remote_entries:
+        if item["type"] == "file" and Path(item["name"]).suffix.lower() in audio_exts:
+            tracks.append(item)
+    return jsonify({"tracks": tracks})
+
+
+@app.route("/api/explorer/rename", methods=["POST"])
+def api_explorer_rename():
+    """Cambia el nombre de un archivo o carpeta local o remota."""
+    data = request.json or {}
+    source = data.get("source", "local")
+    new_name = (data.get("new_name") or "").strip()
+    if not new_name or any(sep in new_name for sep in ("/", "\\")):
+        return jsonify({"error": "Nombre inválido"}), 400
+
+    if source == "local":
+        target = _resolve_local_explorer_target(data)
+        if not target or not target.exists():
+            return jsonify({"error": "Elemento local no encontrado"}), 404
+        dest = target.parent / new_name
+        if dest.exists():
+            return jsonify({"error": "Ya existe un elemento con ese nombre"}), 400
+        try:
+            target.rename(dest)
+            log_event("info", f"Local renombrado: '{target.name}' -> '{new_name}'")
+            return jsonify({"success": True, "new_path": str(dest)})
+        except Exception as e:
+            return jsonify({"error": f"No se pudo renombrar: {e}"}), 500
+
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY"}), 400
+    item_id = data.get("id")
+    item_type = data.get("type", "file")
+    if not item_id or item_id == "ROOT":
+        return jsonify({"error": "ID remoto inválido"}), 400
+    ok = client.rename_item(item_type, item_id, new_name)
+    if ok:
+        log_event("info", f"Remoto #{item_id} renombrado a '{new_name}'")
+        return jsonify({"success": True})
+    return jsonify({"error": "La API de FileJump no permitió renombrar este elemento"}), 400
+
+
+@app.route("/api/explorer/delete", methods=["POST"])
+def api_explorer_delete():
+    """Elimina un archivo o carpeta local (definitivo) o remoto."""
+    data = request.json or {}
+    source = data.get("source", "local")
+
+    if source == "local":
+        target = _resolve_local_explorer_target(data)
+        if not target or not target.exists():
+            return jsonify({"error": "Elemento local no encontrado"}), 404
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            log_event("info", f"Eliminado localmente: '{target.name}'")
+            return jsonify({"success": True})
+        except Exception as e:
+            return jsonify({"error": f"No se pudo eliminar: {e}"}), 500
+
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY"}), 400
+    item_id = data.get("id")
+    item_type = data.get("type", "file")
+    if not item_id or item_id == "ROOT":
+        return jsonify({"error": "No se puede eliminar la raíz"}), 400
+    ok = client.delete_folder(item_id) if item_type == "folder" else client.delete_file(item_id)
+    if ok:
+        log_event("info", f"Eliminado en FileJump: #{item_id}")
+        return jsonify({"success": True})
+    return jsonify({"error": "No se pudo eliminar el elemento en FileJump"}), 400
+
+
+@app.route("/api/explorer/properties", methods=["POST"])
+def api_explorer_properties():
+    """Obtiene propiedades detalladas (tamaño, conteo de hijos, fechas, IDs) de un archivo o carpeta."""
+    data = request.json or {}
+    source = data.get("source", "local")
+
+    if source == "local":
+        target = _resolve_local_explorer_target(data)
+        if not target or not target.exists():
+            return jsonify({"error": "Elemento local no encontrado"}), 404
+        st = target.stat()
+        total_size = 0
+        file_count = 0
+        folder_count = 0
+        if target.is_file():
+            total_size = st.st_size
+            file_count = 1
+        else:
+            for root, dirs, files in os.walk(target):
+                folder_count += len(dirs)
+                for fn in files:
+                    file_count += 1
+                    try:
+                        total_size += (Path(root) / fn).stat().st_size
+                    except OSError:
+                        pass
+        return jsonify({
+            "name": target.name,
+            "type": "Carpeta Local" if target.is_dir() else "Archivo Local",
+            "location": str(target),
+            "size": total_size,
+            "file_count": file_count,
+            "folder_count": folder_count,
+            "modified": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "created": datetime.datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY"}), 400
+    item_id = data.get("id")
+    item_type = data.get("type", "file")
+    item_name = data.get("name", f"#{item_id}")
+    mtime = float(data.get("mtime") or 0)
+    size = int(data.get("size") or 0)
+    file_count = 1 if item_type == "file" else 0
+    folder_count = 0
+
+    if item_type == "folder" and item_id not in (None, "", "ROOT"):
+        tid = int(item_id) if str(item_id).isdigit() else item_id
+        descendants = scan_remote_tree(client, tid, current_prefix="", depth=0, max_depth=10)
+        for d in descendants:
+            if d["type"] == "folder":
+                folder_count += 1
+            else:
+                file_count += 1
+                size += int(d.get("size") or 0)
+
+    return jsonify({
+        "name": item_name,
+        "type": "Carpeta Remota (FileJump)" if item_type == "folder" else "Archivo Remoto (FileJump)",
+        "location": f"FileJump ID #{item_id}",
+        "size": size,
+        "file_count": file_count,
+        "folder_count": folder_count,
+        "modified": datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S") if mtime > 0 else "N/D",
+        "created": "N/D"
+    })
+
+
+@app.route("/api/explorer/download_to_local", methods=["POST"])
+def api_explorer_download_to_local():
+    """Descarga un archivo o carpeta completa de FileJump hacia la carpeta local destino copiando su mtime."""
+    data = request.json or {}
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY"}), 400
+
+    dest_dir = _resolve_local_explorer_target({
+        "full_path": data.get("dest_full_path"),
+        "root_path": data.get("dest_root_path"),
+        "task": data.get("dest_task"),
+        "rel_path": data.get("dest_rel_path")
+    })
+    if not dest_dir or not dest_dir.exists() or not dest_dir.is_dir():
+        return jsonify({"error": "Selecciona primero una carpeta válida en el explorador local destino"}), 400
+
+    item_type = data.get("type", "file")
+    item_id = data.get("id")
+    item_name = data.get("name", f"item_{item_id}")
+    remote_mtime = float(data.get("mtime") or 0)
+
+    downloaded_files = 0
+    if item_type == "file":
+        if remote_mtime <= 0:
+            remote_mtime = client.get_remote_file_mtime(item_id)
+        target_file = dest_dir / item_name
+        if client.download_file_direct(item_id, target_file, remote_mtime=remote_mtime):
+            downloaded_files = 1
+            log_event("success", f"Descargado '{item_name}' -> '{target_file}' (fecha preservada).")
+        else:
+            return jsonify({"error": f"No se pudo descargar '{item_name}'"}), 500
+    else:
+        tid = int(item_id) if str(item_id).isdigit() else item_id
+        base_local_folder = dest_dir / item_name
+        base_local_folder.mkdir(parents=True, exist_ok=True)
+        tree_items = scan_remote_tree(client, tid, current_prefix="", depth=0, max_depth=12)
+
+        for entry in tree_items:
+            rel_sub = Path(entry["rel_path"])
+            local_target = base_local_folder / rel_sub
+            if entry["type"] == "folder":
+                local_target.mkdir(parents=True, exist_ok=True)
+            else:
+                rmtime = float(entry.get("mtime") or 0)
+                if client.download_file_direct(entry["id"], local_target, remote_mtime=rmtime):
+                    downloaded_files += 1
+
+        # Aplicar también la fecha de modificación de la carpeta raíz descargada si está disponible
+        if remote_mtime > 0:
+            try:
+                os.utime(base_local_folder, (remote_mtime, remote_mtime))
+            except Exception:
+                pass
+        log_event("success", f"Carpeta '{item_name}' descargada ({downloaded_files} archivo(s)) hacia '{dest_dir}'.")
+
+    return jsonify({"success": True, "downloaded_files": downloaded_files})
+
+
+@app.route("/api/explorer/upload_to_remote", methods=["POST"])
+def api_explorer_upload_to_remote():
+    """Sube un archivo o carpeta completa desde local hacia la carpeta remota destino copiando su mtime."""
+    data = request.json or {}
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY"}), 400
+
+    src_target = _resolve_local_explorer_target(data)
+    if not src_target or not src_target.exists():
+        return jsonify({"error": "Archivo o carpeta local no encontrado"}), 404
+
+    dest_remote_id = data.get("dest_remote_id", "ROOT")
+    target_parent_id = None if dest_remote_id in (None, "", "ROOT", 0, "0") else (int(dest_remote_id) if str(dest_remote_id).isdigit() else dest_remote_id)
+
+    cfg = load_config()
+    use_hs = cfg.get("use_high_speed_upload", True)
+    uploaded_files = 0
+
+    def _upload_with_mtime(local_file_path, remote_parent):
+        st = local_file_path.stat()
+        mtime_iso = datetime.datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+        res = client.upload_file(str(local_file_path), folder_id=remote_parent, use_high_speed=use_hs)
+        if res is not None:
+            new_id = res.get("id") if isinstance(res, dict) else None
+            # Intentar sincronizar la fecha de modificación original en FileJump si la API devolvió un ID
+            if new_id:
+                try:
+                    requests.put(
+                        f"{client.base_url}/files/{new_id}",
+                        headers=client._headers(),
+                        json={"updated_at": mtime_iso, "last_modified": int(st.st_mtime * 1000)},
+                        timeout=10
+                    )
+                except Exception:
+                    pass
+            return True
+        return False
+
+    if src_target.is_file():
+        if _upload_with_mtime(src_target, target_parent_id):
+            uploaded_files = 1
+            log_event("success", f"Archivo '{src_target.name}' subido a FileJump (carpeta #{dest_remote_id}).")
+        else:
+            detail = getattr(client, "last_upload_error", "Error desconocido de la API")
+            return jsonify({"error": f"Fallo al subir '{src_target.name}': {detail}"}), 500
+    else:
+        src_mtime = src_target.stat().st_mtime
+        root_remote_folder_id = client.create_folder(src_target.name, parent_id=target_parent_id)
+        if not root_remote_folder_id:
+            return jsonify({"error": f"No se pudo crear la carpeta remota '{src_target.name}'"}), 500
+        client._sync_remote_timestamp("folder", root_remote_folder_id, src_mtime)
+
+        folder_map = {"": root_remote_folder_id}
+        for root, dirs, files in os.walk(src_target):
+            rel_root = Path(root).relative_to(src_target).as_posix()
+            if rel_root == ".":
+                rel_root = ""
+            curr_parent_id = folder_map.get(rel_root, root_remote_folder_id)
+
+            for d in sorted(dirs):
+                rel_d = f"{rel_root}/{d}".lstrip("/")
+                sub_dir_path = Path(root) / d
+                sub_dir_mtime = sub_dir_path.stat().st_mtime
+                new_fid = client.create_folder(d, parent_id=curr_parent_id)
+                if new_fid:
+                    folder_map[rel_d] = new_fid
+                    client._sync_remote_timestamp("folder", new_fid, sub_dir_mtime)
+
+            for fn in sorted(files):
+                fp = Path(root) / fn
+                if _upload_with_mtime(fp, curr_parent_id):
+                    uploaded_files += 1
+
+        log_event("success", f"Carpeta '{src_target.name}' subida a FileJump ({uploaded_files} archivo(s)).")
+
+    return jsonify({"success": True, "uploaded_files": uploaded_files})
+
+
 # ==============================================================================
 # INTERFAZ WEB (HTML + TAILWIND CSS + VANILLA JS)
 # ==============================================================================
@@ -1877,10 +2400,18 @@ HTML_TEMPLATE = r"""
                     <table class="w-full text-left border-collapse text-xs select-none">
                         <thead class="bg-slate-950/70 text-slate-400 sticky top-0 z-10">
                             <tr>
-                                <th class="py-2 px-2.5 font-medium">Nombre</th>
-                                <th class="py-2 px-2.5 font-medium">Tamaño</th>
-                                <th class="py-2 px-2.5 font-medium">Modificado</th>
-                                <th class="py-2 px-2.5 font-medium text-right">Estado</th>
+                                <th onclick="toggleExplorerSort('local', 'name')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Nombre</span><span id="sortIcon_local_name" class="text-sky-400 font-bold text-[11px]">↑</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('local', 'size')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Tamaño</span><span id="sortIcon_local_size" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('local', 'mtime')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Modificado</span><span id="sortIcon_local_mtime" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('local', 'status')" class="py-2 px-2.5 font-medium text-right cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center justify-end gap-1.5"><span>Estado</span><span id="sortIcon_local_status" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
                             </tr>
                         </thead>
                         <tbody id="localTableBody" class="divide-y divide-slate-800/60">
@@ -1902,8 +2433,8 @@ HTML_TEMPLATE = r"""
                         <div class="flex items-center gap-2">
                             <h2 class="text-sm font-semibold text-white shrink-0">Nube FileJump</h2>
                             <select id="remoteDirSelector" onchange="onRemoteDirectoryChange()" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-0.5 text-[11px] text-indigo-300 focus:outline-none focus:border-indigo-500 max-w-[180px] truncate">
+                                <option value="ROOT" selected>/ (Raíz de FileJump)</option>
                                 <option value="">Auto (Carpeta de Tarea)</option>
-                                <option value="ROOT">/ (Raíz de FileJump)</option>
                             </select>
                             <button onclick="fetchRemoteDirectories(true)" class="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition shrink-0" title="Actualizar directorios remotos">
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
@@ -1937,10 +2468,18 @@ HTML_TEMPLATE = r"""
                     <table class="w-full text-left border-collapse text-xs select-none">
                         <thead class="bg-slate-950/70 text-slate-400 sticky top-0 z-10">
                             <tr>
-                                <th class="py-2 px-2.5 font-medium">Nombre</th>
-                                <th class="py-2 px-2.5 font-medium">Tamaño</th>
-                                <th class="py-2 px-2.5 font-medium">Actualizado</th>
-                                <th class="py-2 px-2.5 font-medium text-right">ID / Estado</th>
+                                <th onclick="toggleExplorerSort('remote', 'name')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Nombre</span><span id="sortIcon_remote_name" class="text-indigo-400 font-bold text-[11px]">↑</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('remote', 'size')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Tamaño</span><span id="sortIcon_remote_size" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('remote', 'mtime')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Actualizado</span><span id="sortIcon_remote_mtime" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('remote', 'status')" class="py-2 px-2.5 font-medium text-right cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center justify-end gap-1.5"><span>ID / Estado</span><span id="sortIcon_remote_status" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
                             </tr>
                         </thead>
                         <tbody id="remoteTableBody" class="divide-y divide-slate-800/60">
@@ -2284,6 +2823,45 @@ HTML_TEMPLATE = r"""
         </div>
     </div>
 
+    <!-- MENÚ CONTEXTUAL PARA EXPLORADORES LOCAL Y REMOTO -->
+    <div id="explorerContextMenu" class="fixed hidden z-[70] min-w-[235px] bg-slate-900/95 backdrop-blur border border-slate-700 rounded-xl shadow-2xl py-1.5 text-xs text-slate-200 select-none">
+        <!-- Opciones dinámicas -->
+    </div>
+
+    <!-- MODAL DE CAMBIO DE NOMBRE -->
+    <div id="renameItemModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4 z-[65]">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div class="flex items-center justify-between">
+                <h3 class="text-base font-bold text-white">Cambiar de Nombre</h3>
+                <button onclick="closeRenameModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1.5">Nuevo nombre:</label>
+                <input type="text" id="renameNewNameInput" onkeydown="if(event.key==='Enter') submitRenameModal()" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div class="flex justify-end gap-2.5 pt-1">
+                <button onclick="closeRenameModal()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Cancelar</button>
+                <button onclick="submitRenameModal()" class="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL DE PROPIEDADES -->
+    <div id="propertiesItemModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4 z-[65]">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div class="flex items-center justify-between">
+                <h3 class="text-base font-bold text-white flex items-center gap-2"><span>ℹ️</span><span>Propiedades</span></h3>
+                <button onclick="closePropertiesModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div id="propertiesModalBody" class="space-y-2.5 text-xs bg-slate-950/80 border border-slate-800 rounded-xl p-4">
+                <div class="text-slate-400 animate-pulse">Calculando propiedades...</div>
+            </div>
+            <div class="flex justify-end">
+                <button onclick="closePropertiesModal()" class="px-4 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200">Cerrar</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let currentConfig = { tasks: [] };
         let wasConnected = false;
@@ -2336,54 +2914,188 @@ HTML_TEMPLATE = r"""
         let remoteNodes = new Map();
         let remoteBaseRootId = 'ROOT';
         let remoteSelectedKey = 'ROOT';
+        let activeContextTarget = null;
+        let renamePendingTarget = null;
+
+        // Estado de Ordenamiento por Explorador ('name' | 'size' | 'mtime' | 'status')
+        const explorerSortState = {
+            local: { field: 'name', dir: 'asc' },
+            remote: { field: 'name', dir: 'asc' }
+        };
+
+        function updateSortHeaderIcons(source) {
+            const state = explorerSortState[source];
+            const activeColor = source === 'local' ? 'text-sky-400' : 'text-indigo-400';
+            ['name', 'size', 'mtime', 'status'].forEach(col => {
+                const iconEl = document.getElementById(`sortIcon_${source}_${col}`);
+                if (!iconEl) return;
+                if (state.field === col) {
+                    iconEl.textContent = state.dir === 'asc' ? '↑' : '↓';
+                    iconEl.className = `${activeColor} font-bold text-[11px]`;
+                } else {
+                    iconEl.textContent = '⇅';
+                    iconEl.className = 'text-slate-500 text-[11px]';
+                }
+            });
+        }
+
+        function sortExplorerItems(items, source) {
+            const state = explorerSortState[source];
+            const mult = state.dir === 'asc' ? 1 : -1;
+            const statusOrder = { modified: 1, new: 2, remote_only: 3, local_only: 4, synced: 5 };
+
+            return [...items].sort((a, b) => {
+                // Mantener carpetas separadas arriba de los archivos
+                if (a.type !== b.type) {
+                    return a.type === 'folder' ? -1 : 1;
+                }
+                if (state.field === 'size') {
+                    const diff = (Number(a.size || 0) - Number(b.size || 0));
+                    if (diff !== 0) return diff * mult;
+                } else if (state.field === 'mtime') {
+                    const diff = (Number(a.mtime || 0) - Number(b.mtime || 0));
+                    if (diff !== 0) return diff * mult;
+                } else if (state.field === 'status') {
+                    const sa = statusOrder[a.sync_status] || 99;
+                    const sb = statusOrder[b.sync_status] || 99;
+                    if (sa !== sb) return (sa - sb) * mult;
+                    if (source === 'remote' && a.id !== b.id) {
+                        return (Number(a.id || 0) - Number(b.id || 0)) * mult;
+                    }
+                }
+                return (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' }) * mult;
+            });
+        }
+
+        function toggleExplorerSort(source, field) {
+            const state = explorerSortState[source];
+            if (state.field === field) {
+                state.dir = state.dir === 'asc' ? 'desc' : 'asc';
+            } else {
+                state.field = field;
+                state.dir = (field === 'size' || field === 'mtime') ? 'desc' : 'asc';
+            }
+            updateSortHeaderIcons(source);
+            if (source === 'local') {
+                renderLocalContentsPanel();
+            } else {
+                renderRemoteContentsPanel();
+            }
+        }
 
         function formatBytes(bytes) {
-            if (!bytes || bytes === 0) return '0 B';
+            const num = Number(bytes || 0);
+            if (num === 0) return '0 B';
             const k = 1024;
             const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+            const i = Math.floor(Math.log(num) / Math.log(k));
+            return `${parseFloat((num / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
         }
 
         function getStatusBadge(status) {
-            const map = {
-                synced: '<span class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-500/15 text-emerald-400 border border-emerald-500/20">Sincronizado</span>',
-                new: '<span class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-sky-500/15 text-sky-400 border border-sky-500/20">Nuevo</span>',
-                modified: '<span class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/15 text-amber-400 border border-amber-500/20">Modificado</span>',
-                remote_only: '<span class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-purple-500/15 text-purple-400 border border-purple-500/20">Solo Remoto</span>',
-                local_only: '<span class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-700/40 text-slate-300 border border-slate-600/30">Disco Local</span>'
+            const badges = {
+                synced: '<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/15 text-emerald-400 border border-emerald-500/20">Sincronizado</span>',
+                new: '<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-sky-500/15 text-sky-400 border border-sky-500/20">Nuevo</span>',
+                modified: '<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-500/15 text-amber-400 border border-amber-500/20">Modificado</span>',
+                remote_only: '<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-purple-500/15 text-purple-400 border border-purple-500/20">Solo Remoto</span>',
+                local_only: '<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-700/50 text-slate-300 border border-slate-600/40">Disco Local</span>'
             };
-            return map[status] || status;
+            return badges[status] || '';
         }
 
-        function showNotice(title, message, confirmCallback = null) {
+        function showNotice(title, message, onConfirm = null) {
             document.getElementById('noticeTitle').textContent = title;
             document.getElementById('noticeMessage').textContent = message;
             const actions = document.getElementById('noticeActions');
             actions.innerHTML = '';
 
-            const closeBtn = document.createElement('button');
-            closeBtn.className = 'px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300';
-            closeBtn.textContent = confirmCallback ? 'Cancelar' : 'Cerrar';
-            closeBtn.onclick = () => {
-                document.getElementById('noticeModal').classList.add('hidden');
-                document.getElementById('noticeModal').classList.remove('flex');
-            };
-            actions.appendChild(closeBtn);
+            if (onConfirm) {
+                const cancelBtn = document.createElement('button');
+                cancelBtn.className = 'px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300';
+                cancelBtn.textContent = 'Cancelar';
+                cancelBtn.onclick = closeNoticeModal;
+                actions.appendChild(cancelBtn);
 
-            if (confirmCallback) {
+                const confirmBtn = document.createElement('button');
+                confirmBtn.className = 'px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white';
+                confirmBtn.textContent = 'Confirmar y Forzar';
+                confirmBtn.onclick = () => { closeNoticeModal(); onConfirm(); };
+                actions.appendChild(confirmBtn);
+            } else {
                 const okBtn = document.createElement('button');
-                okBtn.className = 'px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-xs font-semibold text-white';
-                okBtn.textContent = 'Forzar Sincronización';
-                okBtn.onclick = () => {
-                    closeBtn.click();
-                    confirmCallback();
-                };
+                okBtn.className = 'px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white';
+                okBtn.textContent = 'Entendido';
+                okBtn.onclick = closeNoticeModal;
                 actions.appendChild(okBtn);
             }
 
             document.getElementById('noticeModal').classList.remove('hidden');
             document.getElementById('noticeModal').classList.add('flex');
+        }
+
+        function closeNoticeModal() {
+            document.getElementById('noticeModal').classList.add('hidden');
+            document.getElementById('noticeModal').classList.remove('flex');
+        }
+
+        async function fetchUserStorageInfo() {
+            const widget = document.getElementById('userStorageWidget');
+            if (!widget) return;
+            try {
+                const res = await fetch('/api/user/profile');
+                const data = await res.json();
+                if (!data.connected) {
+                    widget.classList.add('hidden');
+                    return;
+                }
+                lastProfileInfo = data;
+                document.getElementById('headerUserName').textContent = data.user_name || 'Cuenta FileJump';
+                document.getElementById('headerStorageUsed').textContent = formatBytes(data.used_bytes || 0);
+                document.getElementById('headerStorageFree').textContent = data.total_bytes > 0 ? formatBytes(data.free_bytes || 0) : 'N/D';
+                document.getElementById('headerStorageTotal').textContent = data.total_bytes > 0 ? formatBytes(data.total_bytes) : 'N/D';
+
+                const bar = document.getElementById('headerStorageBar');
+                const pct = data.total_bytes > 0 ? Math.min(100, Math.max(2, data.used_pct || 0)) : 8;
+                bar.style.width = `${pct}%`;
+                if ((data.used_pct || 0) >= 90) {
+                    bar.className = 'h-full bg-gradient-to-r from-amber-500 to-rose-500 rounded-full transition-all duration-500';
+                } else {
+                    bar.className = 'h-full bg-gradient-to-r from-sky-500 via-indigo-500 to-purple-500 rounded-full transition-all duration-500';
+                }
+                widget.classList.remove('hidden');
+            } catch (e) {
+                widget.classList.add('hidden');
+            }
+        }
+
+        function openAccountQuotaModal() {
+            const modal = document.getElementById('accountQuotaModal');
+            if (!modal) return;
+            const info = lastProfileInfo || {};
+            document.getElementById('quotaUserNameInput').value = info.user_name || '';
+            document.getElementById('readonlyModalUsed').textContent = formatBytes(info.used_bytes || 0);
+            document.getElementById('readonlyModalFree').textContent = info.total_bytes > 0 ? formatBytes(info.free_bytes || 0) : 'N/D';
+            document.getElementById('readonlyModalTotal').textContent = info.total_bytes > 0 ? formatBytes(info.total_bytes) : 'N/D';
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeAccountQuotaModal() {
+            const modal = document.getElementById('accountQuotaModal');
+            if (!modal) return;
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        async function saveAccountQuota() {
+            const userName = document.getElementById('quotaUserNameInput').value.trim();
+            await fetch('/api/user/profile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_name: userName })
+            });
+            closeAccountQuotaModal();
+            await fetchUserStorageInfo();
         }
 
         async function refreshStatusAndLogs() {
@@ -2392,211 +3104,628 @@ HTML_TEMPLATE = r"""
                 const data = await res.json();
                 const dot = document.getElementById('apiStatusDot');
                 const txt = document.getElementById('apiStatusText');
-
                 if (data.connected) {
                     dot.className = 'w-2 h-2 rounded-full bg-emerald-400';
                     txt.textContent = `Conectado (${data.masked_key})`;
-                    // Al conectarse por primera vez o reconectarse, actualizar directorios remotos y perfil/almacenamiento
                     if (!wasConnected) {
                         wasConnected = true;
                         fetchUserStorageInfo();
-                        await fetchRemoteDirectories(true);
+                        fetchRemoteDirectories(true);
                     }
                 } else {
                     wasConnected = false;
+                    const widget = document.getElementById('userStorageWidget');
+                    if (widget) widget.classList.add('hidden');
                     dot.className = 'w-2 h-2 rounded-full bg-rose-500';
-                    txt.textContent = data.has_key ? 'Error de Token API' : 'Falta API Key en .env';
-                    const storageWidget = document.getElementById('userStorageWidget');
-                    if (storageWidget) storageWidget.classList.add('hidden');
+                    txt.textContent = data.has_key ? 'Error de Autenticación' : 'Sin API Key (.env)';
                 }
 
                 const consoleEl = document.getElementById('logConsole');
                 if (data.logs && data.logs.length > 0) {
                     consoleEl.innerHTML = data.logs.map(l => {
-                        const color = l.level === 'error' ? 'text-rose-400' : l.level === 'success' ? 'text-emerald-400' : l.level === 'warning' ? 'text-amber-400' : 'text-slate-300';
-                        return `<div><span class="text-slate-500">[${l.time}]</span> <span class="${color}">${l.message}</span></div>`;
+                        const color = l.level === 'error' ? 'text-rose-400' : (l.level === 'success' ? 'text-emerald-400' : (l.level === 'warning' ? 'text-amber-400' : 'text-slate-300'));
+                        return `<div class="${color}"><span class="text-slate-500">[${l.time}]</span> ${l.message}</div>`;
                     }).join('');
                     consoleEl.scrollTop = consoleEl.scrollHeight;
                 }
             } catch (e) {}
         }
 
-        async function fetchUserStorageInfo() {
+        async function syncCachedRemoteIds() {
             try {
-                const res = await fetch('/api/user/profile');
+                const res = await fetch('/api/cache/status');
                 const data = await res.json();
-                const widget = document.getElementById('userStorageWidget');
-                if (!data.connected) {
-                    widget.classList.add('hidden');
-                    return;
-                }
-                lastProfileInfo = data;
-                document.getElementById('headerUserName').textContent = data.user_name || 'Cuenta FileJump';
-                document.getElementById('headerStorageUsed').textContent = formatBytes(data.used_bytes || 0);
-
-                if (data.total_bytes && data.total_bytes > 0) {
-                    document.getElementById('headerStorageFree').textContent = formatBytes(data.free_bytes || 0);
-                    document.getElementById('headerStorageTotal').textContent = formatBytes(data.total_bytes);
-                    const pct = Math.min(100, Math.max(0, data.used_pct || 0));
-                    const bar = document.getElementById('headerStorageBar');
-                    bar.style.width = `${pct}%`;
-                    bar.className = pct >= 90
-                        ? 'h-full bg-gradient-to-r from-amber-500 to-rose-500 rounded-full transition-all duration-500'
-                        : 'h-full bg-gradient-to-r from-sky-500 via-indigo-500 to-purple-500 rounded-full transition-all duration-500';
-                } else {
-                    document.getElementById('headerStorageFree').textContent = 'Configurar plan';
-                    document.getElementById('headerStorageTotal').textContent = 'N/D';
-                    document.getElementById('headerStorageBar').style.width = '12%';
-                }
-                widget.classList.remove('hidden');
-            } catch (e) {}
-        }
-
-        function openAccountQuotaModal() {
-            const modal = document.getElementById('accountQuotaModal');
-            document.getElementById('quotaUserNameInput').value = (lastProfileInfo && lastProfileInfo.user_name !== 'Cuenta FileJump') ? lastProfileInfo.user_name : '';
-            document.getElementById('readonlyModalUsed').textContent = lastProfileInfo ? formatBytes(lastProfileInfo.used_bytes || 0) : '-';
-            document.getElementById('readonlyModalFree').textContent = (lastProfileInfo && lastProfileInfo.total_bytes > 0) ? formatBytes(lastProfileInfo.free_bytes || 0) : '-';
-            document.getElementById('readonlyModalTotal').textContent = (lastProfileInfo && lastProfileInfo.total_bytes > 0) ? formatBytes(lastProfileInfo.total_bytes) : '-';
-
-            modal.classList.remove('hidden');
-            modal.classList.add('flex');
-        }
-
-        function closeAccountQuotaModal() {
-            const modal = document.getElementById('accountQuotaModal');
-            modal.classList.add('hidden');
-            modal.classList.remove('flex');
-        }
-
-        async function saveAccountQuota() {
-            const userName = document.getElementById('quotaUserNameInput').value.trim();
-
-            await fetch('/api/user/profile', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user_name: userName
-                })
-            });
-            closeAccountQuotaModal();
-            await fetchUserStorageInfo();
-        }
-
-        async function fetchRemoteDirectories(autoRefreshInspect = false) {
-            try {
-                const res = await fetch('/api/remote/directories');
-                const data = await res.json();
-                if (!data.connected) return;
-
-                const dirSelector = document.getElementById('remoteDirSelector');
-                const currentVal = dirSelector.value;
-                dirSelector.innerHTML = `
-                    <option value="">Auto (Carpeta de Tarea)</option>
-                    <option value="ROOT">/ (Raíz de FileJump)</option>
-                `;
-                (data.directories || []).forEach(dir => {
-                    const opt = document.createElement('option');
-                    opt.value = dir.id;
-                    opt.textContent = `📁 ${dir.name} (#${dir.id})`;
-                    dirSelector.appendChild(opt);
-                });
-
-                if (currentVal) {
-                    dirSelector.value = currentVal;
-                }
-
-                if (autoRefreshInspect) {
-                    if (document.getElementById('taskSelector').value) {
-                        await inspectSelectedTask();
-                    } else {
-                        // Si no hay tarea local seleccionada, mostrar la raíz remota por defecto
-                        dirSelector.value = 'ROOT';
-                        await inspectSelectedTask();
+                if (Array.isArray(data.cached_ids)) {
+                    data.cached_ids.forEach(id => prefetchedRemoteIds.add(String(id)));
+                    if (musicSource === 'remote' && musicPlaylist.length > 0) {
+                        renderMusicPlaylist();
                     }
                 }
             } catch (e) {}
         }
 
-        function onRemoteDirectoryChange() {
-            const selectedRemoteId = document.getElementById('remoteDirSelector').value;
-            inspectSelectedTask(selectedRemoteId);
-        }
-
-        async function fetchLocalDrives(autoBrowse = false) {
+        async function fetchLocalDrives(autoBrowseFirst = false) {
+            const selector = document.getElementById('localDriveSelector');
+            if (!selector) return;
             try {
                 const res = await fetch('/api/local/drives');
                 const data = await res.json();
-                const driveSelector = document.getElementById('localDriveSelector');
-                const prevVal = driveSelector.value;
-                driveSelector.innerHTML = '<option value="">Auto (Carpeta de Tarea)</option>';
-                (data.drives || []).forEach(d => {
+                const drives = data.drives || [];
+                const prevVal = selector.value;
+                selector.innerHTML = '<option value="">Auto (Carpeta de Tarea)</option>';
+                drives.forEach(d => {
                     const opt = document.createElement('option');
                     opt.value = d.id;
-                    opt.textContent = `💾 ${d.name}`;
-                    driveSelector.appendChild(opt);
+                    opt.textContent = d.name;
+                    selector.appendChild(opt);
                 });
-                if (prevVal) driveSelector.value = prevVal;
-
-                if (autoBrowse && !document.getElementById('taskSelector').value && (data.drives || []).length > 0) {
-                    driveSelector.value = data.drives[0].id;
-                    await onLocalDriveChange();
+                if (prevVal && Array.from(selector.options).some(o => o.value === prevVal)) {
+                    selector.value = prevVal;
+                } else if (autoBrowseFirst && !document.getElementById('taskSelector').value && drives.length > 0) {
+                    selector.value = drives[0].id;
+                    onLocalDriveChange();
                 }
             } catch (e) {}
         }
 
         async function onLocalDriveChange() {
-            const drivePath = document.getElementById('localDriveSelector').value;
-            if (!drivePath) {
+            const driveVal = document.getElementById('localDriveSelector').value;
+            if (!driveVal) {
                 localActiveDriveRoot = '';
-                await inspectSelectedTask();
+                inspectSelectedTask();
                 return;
             }
-            localActiveDriveRoot = drivePath;
-            const localBody = document.getElementById('localTableBody');
-            localBody.innerHTML = '<tr><td colspan="4" class="py-10 text-center text-slate-400">Cargando unidad local...</td></tr>';
+            localActiveDriveRoot = driveVal;
+            document.getElementById('localPathSubtitle').textContent = driveVal;
+            document.getElementById('localTableBody').innerHTML = '<tr><td colspan="4" class="py-10 text-center text-slate-400">Cargando unidad local...</td></tr>';
             try {
-                const res = await fetch(`/api/local/browse?root_path=${encodeURIComponent(drivePath)}`);
+                const res = await fetch(`/api/local/browse?root_path=${encodeURIComponent(driveVal)}`);
                 const data = await res.json();
-                if (data.error) {
-                    showNotice('Error', data.error);
-                    return;
-                }
-                document.getElementById('localPathSubtitle').textContent = drivePath;
-                initLocalExplorer(data.items || [], drivePath);
+                initLocalExplorer(data.items || []);
             } catch (e) {
-                showNotice('Error', 'No se pudo leer la unidad local.');
+                showNotice('Error', 'No se pudo leer la unidad local seleccionada.');
             }
         }
 
+        async function fetchRemoteDirectories(autoBrowseIfNoTask = false) {
+            const selector = document.getElementById('remoteDirSelector');
+            if (!selector) return;
+            try {
+                const res = await fetch('/api/remote/directories');
+                const data = await res.json();
+                if (!data.connected) return;
+
+                const prevVal = selector.value;
+                selector.innerHTML = `
+                    <option value="ROOT">/ (Raíz de FileJump)</option>
+                    <option value="">Auto (Carpeta de Tarea)</option>
+                `;
+                (data.directories || []).forEach(dir => {
+                    const opt = document.createElement('option');
+                    opt.value = String(dir.id);
+                    opt.textContent = `📁 ${dir.name} (#${dir.id})`;
+                    selector.appendChild(opt);
+                });
+
+                if (prevVal && Array.from(selector.options).some(o => o.value === prevVal)) {
+                    selector.value = prevVal;
+                    if (autoBrowseIfNoTask && prevVal === 'ROOT') {
+                        inspectSelectedTask('ROOT');
+                    }
+                } else {
+                    selector.value = 'ROOT';
+                    inspectSelectedTask('ROOT');
+                }
+            } catch (e) {}
+        }
+
+        function onRemoteDirectoryChange() {
+            const selectedDirId = document.getElementById('remoteDirSelector').value;
+            inspectSelectedTask(selectedDirId);
+        }
+
         // =========================================================================
-        // REPRODUCTOR MUSICAL FLOTANTE MINIMIZABLE Y MAXIMIZABLE CON TAGS ID3 + PLAYLIST
+        // REPRODUCTOR MUSICAL FLOTANTE (ID3 + PLAYLIST + EQ 5 BANDAS + VISUALIZADOR)
         // =========================================================================
-        function formatAudioTime(sec) {
-            if (!sec || isNaN(sec) || !isFinite(sec)) return '0:00';
-            const m = Math.floor(sec / 60);
-            const s = Math.floor(sec % 60);
+        function rebuildMusicPlayOrder(startIndex = 0) {
+            const total = musicPlaylist.length;
+            if (total === 0) {
+                musicPlayOrder = [];
+                musicOrderPos = -1;
+                return;
+            }
+            const indices = Array.from({ length: total }, (_, i) => i);
+            if (musicShuffle && total > 1) {
+                const others = indices.filter(i => i !== startIndex);
+                for (let i = others.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [others[i], others[j]] = [others[j], others[i]];
+                }
+                musicPlayOrder = [startIndex, ...others];
+            } else {
+                musicPlayOrder = indices;
+            }
+            musicOrderPos = Math.max(0, musicPlayOrder.indexOf(startIndex));
+        }
+
+        function setMusicDockMode(mode) {
+            musicDockMode = mode;
+            const widget = document.getElementById('musicDockWidget');
+            const minEl = document.getElementById('musicDockMinimized');
+            const expEl = document.getElementById('musicDockExpanded');
+            const mainGrid = document.getElementById('musicDockMainGrid');
+            const playerCol = document.getElementById('musicDockPlayerCol');
+            const playlistCol = document.getElementById('musicDockPlaylistCol');
+            const playlistItems = document.getElementById('dockPlaylistItems');
+            const coverBox = document.getElementById('dockCoverBox');
+            const maxBtn = document.getElementById('dockMaxRestoreBtn');
+
+            widget.classList.remove('hidden');
+
+            if (mode === 'minimized') {
+                widget.className = 'fixed bottom-4 right-4 z-50 transition-all duration-200';
+                minEl.classList.remove('hidden');
+                expEl.classList.add('hidden');
+                return;
+            }
+
+            minEl.classList.add('hidden');
+            expEl.classList.remove('hidden');
+
+            if (mode === 'maximized') {
+                widget.className = 'fixed inset-4 sm:inset-8 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm rounded-2xl transition-all duration-200';
+                expEl.className = 'w-full h-full max-w-5xl max-h-[88vh] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                mainGrid.className = 'grid grid-cols-1 md:grid-cols-12 flex-1 min-h-0 overflow-hidden';
+                playerCol.className = 'md:col-span-6 p-5 sm:p-6 space-y-4 flex flex-col justify-between overflow-y-auto';
+                playlistCol.className = 'md:col-span-6 border-t md:border-t-0 md:border-l border-slate-800 bg-slate-950/75 flex flex-col min-h-0';
+                playlistItems.className = 'flex-1 overflow-y-auto divide-y divide-slate-800/40 text-xs';
+                coverBox.className = 'w-28 h-28 sm:w-36 sm:h-36 rounded-2xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-xl cursor-zoom-in transition-all';
+                if (maxBtn) { maxBtn.textContent = '🗗'; maxBtn.title = 'Restaurar tamaño'; }
+            } else {
+                widget.className = 'fixed bottom-4 right-4 z-50 transition-all duration-200';
+                expEl.className = 'w-80 sm:w-[410px] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                mainGrid.className = 'flex flex-col flex-1 min-h-0 overflow-hidden';
+                playerCol.className = 'p-4 space-y-3.5 flex flex-col justify-between shrink-0';
+                playlistCol.className = 'border-t border-slate-800 bg-slate-950/75 flex flex-col min-h-0';
+                playlistItems.className = 'max-h-44 overflow-y-auto divide-y divide-slate-800/40 text-xs';
+                coverBox.className = 'w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner cursor-zoom-in transition-all';
+                if (maxBtn) { maxBtn.textContent = '⛶'; maxBtn.title = 'Maximizar reproductor'; }
+            }
+        }
+
+        function toggleMusicDockMaximize() {
+            setMusicDockMode(musicDockMode === 'maximized' ? 'normal' : 'maximized');
+        }
+
+        function closeMusicDock() {
+            const audioEl = document.getElementById('dockAudioElement');
+            if (audioEl) {
+                audioEl.pause();
+                audioEl.removeAttribute('src');
+                audioEl.load();
+            }
+            if (visualizerRafId) {
+                cancelAnimationFrame(visualizerRafId);
+                visualizerRafId = null;
+            }
+            document.getElementById('musicDockWidget').classList.add('hidden');
+        }
+
+        function buildAudioQueryParams(source, track) {
+            const taskName = document.getElementById('taskSelector').value || '';
+            const mtimeParam = track.mtime ? `&mtime=${encodeURIComponent(track.mtime)}` : '';
+            if (source === 'local') {
+                return track.full_path
+                    ? `source=local&full_path=${encodeURIComponent(track.full_path)}`
+                    : `source=local&task=${encodeURIComponent(taskName)}&rel_path=${encodeURIComponent(track.rel_path || '')}`;
+            }
+            return `source=remote&remote_id=${encodeURIComponent(track.id)}&name=${encodeURIComponent(track.name || 'audio')}${mtimeParam}`;
+        }
+
+        function initDockWebAudio(audioEl) {
+            if (eqInitialized) return;
+            try {
+                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                if (!AudioContextClass) return;
+                audioCtx = new AudioContextClass();
+                const sourceNode = audioCtx.createMediaElementSource(audioEl);
+
+                eqFilters = EQ_BANDS_CONFIG.map((cfg, idx) => {
+                    const filter = audioCtx.createBiquadFilter();
+                    filter.type = cfg.type;
+                    filter.frequency.value = cfg.freq;
+                    filter.Q.value = 1.0;
+                    const slider = document.getElementById(`eqBand${idx}`);
+                    filter.gain.value = slider ? Number(slider.value || 0) : 0;
+                    return filter;
+                });
+
+                analyserNode = audioCtx.createAnalyser();
+                analyserNode.fftSize = 128;
+
+                let prevNode = sourceNode;
+                eqFilters.forEach(f => {
+                    prevNode.connect(f);
+                    prevNode = f;
+                });
+                prevNode.connect(analyserNode);
+                analyserNode.connect(audioCtx.destination);
+                eqInitialized = true;
+            } catch (e) {}
+        }
+
+        function startVisualizerLoop() {
+            if (visualizerRafId) cancelAnimationFrame(visualizerRafId);
+            const canvas = document.getElementById('dockVisualizerCanvas');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+
+            function draw() {
+                visualizerRafId = requestAnimationFrame(draw);
+                if (!visualizerEnabled) return;
+                const w = canvas.width;
+                const h = canvas.height;
+                ctx.clearRect(0, 0, w, h);
+
+                if (!analyserNode) return;
+                const bufferLength = analyserNode.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+
+                if (visualizerStyle === 'wave') {
+                    analyserNode.getByteTimeDomainData(dataArray);
+                    ctx.lineWidth = 2;
+                    ctx.strokeStyle = '#818cf8';
+                    ctx.beginPath();
+                    const sliceWidth = w / bufferLength;
+                    let x = 0;
+                    for (let i = 0; i < bufferLength; i++) {
+                        const v = dataArray[i] / 128.0;
+                        const y = (v * h) / 2;
+                        if (i === 0) ctx.moveTo(x, y);
+                        else ctx.lineTo(x, y);
+                        x += sliceWidth;
+                    }
+                    ctx.lineTo(w, h / 2);
+                    ctx.stroke();
+                } else {
+                    analyserNode.getByteFrequencyData(dataArray);
+                    const bars = Math.min(40, bufferLength);
+                    const barWidth = (w / bars) - 2;
+                    for (let i = 0; i < bars; i++) {
+                        const val = dataArray[i] / 255;
+                        const barHeight = Math.max(2, val * (h - 4));
+                        const x = i * (barWidth + 2);
+                        const grad = ctx.createLinearGradient(0, h, 0, 0);
+                        grad.addColorStop(0, '#4f46e5');
+                        grad.addColorStop(0.6, '#38bdf8');
+                        grad.addColorStop(1, '#34d399');
+                        ctx.fillStyle = grad;
+
+                        if (visualizerStyle === 'mirror') {
+                            const halfH = barHeight / 2;
+                            ctx.fillRect(x, (h / 2) - halfH, barWidth, barHeight);
+                        } else {
+                            ctx.fillRect(x, h - barHeight, barWidth, barHeight);
+                        }
+                    }
+                }
+            }
+            draw();
+        }
+
+        function formatTrackTime(secs) {
+            if (!isFinite(secs) || secs < 0) return '0:00';
+            const m = Math.floor(secs / 60);
+            const s = Math.floor(secs % 60);
             return `${m}:${s < 10 ? '0' : ''}${s}`;
         }
 
-        function updateCoverBoxCursor() {
-            const coverBox = document.getElementById('dockCoverBox');
-            if (!coverBox) return;
-            if (musicDockMode === 'maximized' && currentCoverDataUrl) {
-                coverBox.classList.add('cursor-zoom-in', 'hover:ring-2', 'hover:ring-indigo-400/70');
-                coverBox.title = 'Clic para ampliar y descargar carátula';
+        async function openMusicDockPlayer(source, fileMeta, keepExistingPlaylist = false) {
+            musicSource = source;
+            if (!keepExistingPlaylist) {
+                const folderFiles = getCurrentFolderFiles(source);
+                const audioFiles = folderFiles.filter(f => isAudioFilename(f.name));
+                musicPlaylist = audioFiles.length > 0 ? audioFiles : [fileMeta];
+                const clickedIdx = musicPlaylist.findIndex(f =>
+                    source === 'local'
+                        ? (f.full_path && fileMeta.full_path ? f.full_path === fileMeta.full_path : f.rel_path === fileMeta.rel_path)
+                        : String(f.id) === String(fileMeta.id)
+                );
+                rebuildMusicPlayOrder(clickedIdx >= 0 ? clickedIdx : 0);
+            }
+
+            if (musicDockMode === 'minimized') {
+                setMusicDockMode('normal');
             } else {
-                coverBox.classList.remove('cursor-zoom-in', 'hover:ring-2', 'hover:ring-indigo-400/70');
-                coverBox.removeAttribute('title');
+                setMusicDockMode(musicDockMode || 'normal');
+            }
+
+            await playDockTrackAtOrderPos(musicOrderPos >= 0 ? musicOrderPos : 0);
+        }
+
+        async function playDockTrackAtOrderPos(orderPos) {
+            if (musicPlayOrder.length === 0 || orderPos < 0 || orderPos >= musicPlayOrder.length) return;
+            musicOrderPos = orderPos;
+            const realIdx = musicPlayOrder[musicOrderPos];
+            const track = musicPlaylist[realIdx];
+            if (!track) return;
+
+            const audioEl = document.getElementById('dockAudioElement');
+            const qParams = buildAudioQueryParams(musicSource, track);
+            const streamUrl = `/api/file/stream?${qParams}`;
+            const metaUrl = `/api/file/audio_meta?${qParams}`;
+
+            // Actualizar etiquetas iniciales antes de recibir ID3
+            const fallbackTitle = (track.name || 'Pista de audio').replace(/\.[^/.]+$/, '');
+            document.getElementById('dockTrackTitle').textContent = fallbackTitle;
+            document.getElementById('dockTrackTitle').title = track.name || fallbackTitle;
+            document.getElementById('dockTrackArtist').textContent = musicSource === 'remote' ? 'Cargando desde FileJump...' : 'Archivo local';
+            document.getElementById('dockTrackAlbum').textContent = '';
+            document.getElementById('miniTrackTitle').textContent = fallbackTitle;
+            document.getElementById('miniTrackArtist').textContent = 'Reproduciendo...';
+            document.getElementById('dockTrackCounter').textContent = `(${musicOrderPos + 1}/${musicPlayOrder.length})`;
+            document.getElementById('dockSourceBadge').textContent = musicSource === 'remote' ? '☁️ Nube' : '💻 Local';
+
+            currentCoverDataUrl = null;
+            currentCoverFilename = `${fallbackTitle}_caratula.jpg`;
+            document.getElementById('dockCoverBox').innerHTML = '<span id="dockCoverEmoji" class="text-3xl">🎵</span>';
+            document.getElementById('miniCoverWrap').innerHTML = '<span class="text-base">🎵</span>';
+
+            renderMusicPlaylist();
+
+            initDockWebAudio(audioEl);
+            if (audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(() => {});
+            }
+
+            audioEl.src = streamUrl;
+            const volSlider = document.getElementById('dockVolumeBar');
+            if (volSlider) audioEl.volume = Number(volSlider.value || 85) / 100;
+
+            audioEl.onloadedmetadata = () => {
+                document.getElementById('dockTotalTime').textContent = formatTrackTime(audioEl.duration);
+            };
+            audioEl.ontimeupdate = () => {
+                const cur = audioEl.currentTime || 0;
+                const dur = audioEl.duration || 0;
+                document.getElementById('dockCurrentTime').textContent = formatTrackTime(cur);
+                document.getElementById('dockTotalTime').textContent = formatTrackTime(dur);
+                document.getElementById('dockSeekBar').value = dur > 0 ? Math.round((cur / dur) * 100) : 0;
+            };
+            audioEl.onplay = () => {
+                document.getElementById('dockPlayPauseBtn').textContent = '⏸';
+                document.getElementById('miniPlayPauseBtn').textContent = '⏸';
+                startVisualizerLoop();
+            };
+            audioEl.onpause = () => {
+                document.getElementById('dockPlayPauseBtn').textContent = '▶';
+                document.getElementById('miniPlayPauseBtn').textContent = '▶';
+            };
+            audioEl.onended = () => {
+                if (musicOrderPos + 1 < musicPlayOrder.length) {
+                    playDockTrackAtOrderPos(musicOrderPos + 1);
+                } else if (musicPlayOrder.length > 1) {
+                    playDockTrackAtOrderPos(0);
+                }
+            };
+
+            try {
+                await audioEl.play();
+            } catch (e) {}
+
+            if (musicSource === 'remote' && track.id) {
+                prefetchedRemoteIds.add(String(track.id));
+                renderMusicPlaylist();
+            }
+
+            // Cargar metadatos ID3 y carátula incrustada en paralelo
+            fetch(metaUrl)
+                .then(r => r.json())
+                .then(meta => {
+                    if (!meta || meta.error) return;
+                    const title = meta.title || fallbackTitle;
+                    const artist = meta.artist || 'Artista desconocido';
+                    const album = meta.album || '';
+                    document.getElementById('dockTrackTitle').textContent = title;
+                    document.getElementById('dockTrackTitle').title = title;
+                    document.getElementById('dockTrackArtist').textContent = artist;
+                    document.getElementById('dockTrackAlbum').textContent = album;
+                    document.getElementById('miniTrackTitle').textContent = title;
+                    document.getElementById('miniTrackArtist').textContent = artist;
+
+                    if (meta.cover_data_url) {
+                        currentCoverDataUrl = meta.cover_data_url;
+                        document.getElementById('dockCoverBox').innerHTML = `<img src="${meta.cover_data_url}" alt="Cover" class="w-full h-full object-cover">`;
+                        document.getElementById('miniCoverWrap').innerHTML = `<img src="${meta.cover_data_url}" alt="Cover" class="w-full h-full object-cover">`;
+                    }
+                })
+                .catch(() => {});
+
+            prefetchNextRemoteTrack();
+        }
+
+        function prefetchNextRemoteTrack() {
+            const badge = document.getElementById('dockPrefetchBadge');
+            if (badge) badge.classList.add('hidden');
+            if (musicSource !== 'remote' || musicPlayOrder.length <= 1) return;
+
+            const nextOrderPos = (musicOrderPos + 1) % musicPlayOrder.length;
+            const nextTrack = musicPlaylist[musicPlayOrder[nextOrderPos]];
+            if (!nextTrack || !nextTrack.id) return;
+
+            if (prefetchedRemoteIds.has(String(nextTrack.id))) {
+                if (badge) badge.classList.remove('hidden');
+                return;
+            }
+
+            const qParams = buildAudioQueryParams('remote', nextTrack);
+            fetch(`/api/file/prefetch?${qParams}`)
+                .then(r => r.json())
+                .then(data => {
+                    if (data && data.prefetched) {
+                        prefetchedRemoteIds.add(String(nextTrack.id));
+                        if (badge) badge.classList.remove('hidden');
+                        renderMusicPlaylist();
+                    }
+                })
+                .catch(() => {});
+        }
+
+        function renderMusicPlaylist() {
+            const container = document.getElementById('dockPlaylistItems');
+            const orderTag = document.getElementById('dockPlaylistOrderTag');
+            if (!container) return;
+
+            if (orderTag) {
+                orderTag.textContent = musicShuffle ? '🔀 Aleatorio activo' : 'Orden normal';
+            }
+
+            if (musicPlayOrder.length === 0) {
+                container.innerHTML = '<div class="px-3.5 py-4 text-center text-slate-500">Cola vacía</div>';
+                return;
+            }
+
+            container.innerHTML = musicPlayOrder.map((realIdx, pos) => {
+                const tr = musicPlaylist[realIdx];
+                const isCurrent = pos === musicOrderPos;
+                const isCached = musicSource === 'remote' && tr.id && prefetchedRemoteIds.has(String(tr.id));
+                return `
+                    <div onclick="playDockTrackAtOrderPos(${pos})"
+                         class="px-3.5 py-2 flex items-center justify-between gap-2 cursor-pointer transition ${isCurrent ? 'bg-indigo-600/25 text-white font-semibold' : 'text-slate-300 hover:bg-slate-800/70'}">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <span class="text-[10px] font-mono ${isCurrent ? 'text-indigo-300' : 'text-slate-500'} w-5 shrink-0">${isCurrent ? '▶' : (pos + 1)}</span>
+                            <span class="truncate" title="${tr.name}">${tr.name}</span>
+                        </div>
+                        <div class="flex items-center gap-1.5 shrink-0">
+                            ${isCached ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">⚡ Caché</span>' : ''}
+                            <span class="text-[10px] text-slate-500">${formatBytes(tr.size)}</span>
+                        </div>
+                    </div>`;
+            }).join('');
+        }
+
+        function toggleDockPlayPause() {
+            const audioEl = document.getElementById('dockAudioElement');
+            if (!audioEl || !audioEl.src) return;
+            if (audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(() => {});
+            }
+            if (audioEl.paused) audioEl.play().catch(() => {});
+            else audioEl.pause();
+        }
+
+        function playDockPrev() {
+            const audioEl = document.getElementById('dockAudioElement');
+            if (audioEl && audioEl.currentTime > 4) {
+                audioEl.currentTime = 0;
+                return;
+            }
+            if (musicPlayOrder.length === 0) return;
+            const prevPos = (musicOrderPos - 1 + musicPlayOrder.length) % musicPlayOrder.length;
+            playDockTrackAtOrderPos(prevPos);
+        }
+
+        function playDockNext() {
+            if (musicPlayOrder.length === 0) return;
+            const nextPos = (musicOrderPos + 1) % musicPlayOrder.length;
+            playDockTrackAtOrderPos(nextPos);
+        }
+
+        function seekDockAudio(pct) {
+            const audioEl = document.getElementById('dockAudioElement');
+            if (!audioEl || !isFinite(audioEl.duration) || audioEl.duration <= 0) return;
+            audioEl.currentTime = (Number(pct) / 100) * audioEl.duration;
+        }
+
+        function toggleDockShuffle() {
+            musicShuffle = !musicShuffle;
+            const btn = document.getElementById('dockShuffleBtn');
+            if (btn) {
+                btn.className = musicShuffle
+                    ? 'px-2 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-500/60 text-xs text-indigo-300 transition flex items-center gap-1'
+                    : 'px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-400 transition flex items-center gap-1';
+            }
+            const currentRealIdx = musicOrderPos >= 0 ? musicPlayOrder[musicOrderPos] : 0;
+            rebuildMusicPlayOrder(currentRealIdx);
+            document.getElementById('dockTrackCounter').textContent = `(${musicOrderPos + 1}/${musicPlayOrder.length})`;
+            renderMusicPlaylist();
+            prefetchNextRemoteTrack();
+        }
+
+        function setDockVolume(val) {
+            const num = Math.max(0, Math.min(100, Number(val)));
+            const audioEl = document.getElementById('dockAudioElement');
+            if (audioEl) {
+                audioEl.volume = num / 100;
+                audioEl.muted = num === 0;
+            }
+            if (num > 0) lastNonZeroVolume = num;
+            document.getElementById('dockVolumeLabel').textContent = `${num}%`;
+            document.getElementById('dockMuteBtn').textContent = num === 0 ? '🔇' : (num < 45 ? '🔉' : '🔊');
+        }
+
+        function toggleDockMute() {
+            const slider = document.getElementById('dockVolumeBar');
+            const current = Number(slider.value || 0);
+            const target = current > 0 ? 0 : (lastNonZeroVolume || 85);
+            slider.value = target;
+            setDockVolume(target);
+        }
+
+        function toggleDockEqPanel() {
+            const panel = document.getElementById('dockEqPanel');
+            const btn = document.getElementById('dockEqToggleBtn');
+            const isHidden = panel.classList.toggle('hidden');
+            btn.className = !isHidden
+                ? 'px-2 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-500/60 text-[10px] font-medium text-indigo-300 transition flex items-center gap-1'
+                : 'px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-medium text-slate-300 transition flex items-center gap-1';
+        }
+
+        function setEqBandGain(bandIdx, gainDb) {
+            const val = Number(gainDb || 0);
+            const label = document.getElementById(`eqVal${bandIdx}`);
+            if (label) label.textContent = `${val > 0 ? '+' : ''}${val}dB`;
+            if (eqFilters[bandIdx]) {
+                eqFilters[bandIdx].gain.value = val;
             }
         }
 
+        function applyEqPreset(presetName) {
+            const gains = EQ_PRESETS[presetName] || EQ_PRESETS.flat;
+            const selectEl = document.getElementById('dockEqPreset');
+            if (selectEl) selectEl.value = presetName;
+            gains.forEach((g, idx) => {
+                const slider = document.getElementById(`eqBand${idx}`);
+                if (slider) slider.value = g;
+                setEqBandGain(idx, g);
+            });
+        }
+
+        function toggleDockVisualizer() {
+            visualizerEnabled = !visualizerEnabled;
+            const wrap = document.getElementById('dockVisualizerWrap');
+            const btn = document.getElementById('dockVisToggleBtn');
+            wrap.classList.toggle('hidden', !visualizerEnabled);
+            btn.className = visualizerEnabled
+                ? 'px-2 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-500/60 text-[10px] font-medium text-indigo-300 transition flex items-center gap-1'
+                : 'px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-medium text-slate-400 transition flex items-center gap-1';
+            if (visualizerEnabled) startVisualizerLoop();
+        }
+
+        function cycleVisualizerStyle() {
+            const order = ['bars', 'mirror', 'wave'];
+            const labels = { bars: 'Barras', mirror: 'Espejo', wave: 'Onda' };
+            const nextIdx = (order.indexOf(visualizerStyle) + 1) % order.length;
+            visualizerStyle = order[nextIdx];
+            const btn = document.getElementById('dockVisStyleBtn');
+            if (btn) btn.textContent = labels[visualizerStyle];
+        }
+
         function openCoverLightbox() {
-            if (musicDockMode !== 'maximized' || !currentCoverDataUrl) return;
+            if (!currentCoverDataUrl) return;
             const modal = document.getElementById('coverLightboxModal');
-            const img = document.getElementById('coverLightboxImg');
+            document.getElementById('coverLightboxImg').src = currentCoverDataUrl;
             const dlBtn = document.getElementById('coverDownloadBtn');
-            img.src = currentCoverDataUrl;
             dlBtn.href = currentCoverDataUrl;
             dlBtn.download = currentCoverFilename;
             modal.classList.remove('hidden');
@@ -2609,1392 +3738,919 @@ HTML_TEMPLATE = r"""
             modal.classList.remove('flex');
         }
 
-        function setMusicDockMode(mode) {
-            musicDockMode = mode;
-            const widget = document.getElementById('musicDockWidget');
-            const minEl = document.getElementById('musicDockMinimized');
-            const expEl = document.getElementById('musicDockExpanded');
-            const mainGrid = document.getElementById('musicDockMainGrid');
-            const playerCol = document.getElementById('musicDockPlayerCol');
-            const mediaHeader = document.getElementById('dockMediaHeader');
-            const coverBox = document.getElementById('dockCoverBox');
-            const coverEmoji = document.getElementById('dockCoverEmoji');
-            const metaWrap = document.getElementById('dockMetaTextWrap');
-            const playlistCol = document.getElementById('musicDockPlaylistCol');
-            const playlistItems = document.getElementById('dockPlaylistItems');
-            const maxBtn = document.getElementById('dockMaxRestoreBtn');
-            const eqPanel = document.getElementById('dockEqPanel');
-
-            if (mode === 'minimized') {
-                widget.className = 'fixed bottom-4 right-4 z-50 transition-all duration-200';
-                expEl.classList.add('hidden');
-                minEl.classList.remove('hidden');
-                updateCoverBoxCursor();
-                return;
-            }
-
-            minEl.classList.add('hidden');
-            expEl.classList.remove('hidden');
-
-            if (mode === 'maximized') {
-                widget.className = 'fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 transition-all duration-200';
-                expEl.className = 'w-full max-w-5xl h-[86vh] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
-                mainGrid.className = 'grid grid-cols-1 md:grid-cols-12 flex-1 min-h-0 overflow-hidden';
-                playerCol.className = 'md:col-span-6 p-6 flex flex-col justify-between bg-slate-900/90 border-b md:border-b-0 md:border-r border-slate-800 overflow-y-auto gap-3';
-                mediaHeader.className = 'flex flex-col items-center text-center gap-3 my-auto';
-                coverBox.className = 'w-44 h-44 sm:w-52 sm:h-52 rounded-2xl bg-slate-950 border border-slate-700/80 overflow-hidden flex items-center justify-center shrink-0 shadow-2xl transition-all';
-                if (coverEmoji) coverEmoji.className = 'text-7xl';
-                metaWrap.className = 'w-full min-w-0 px-2';
-                playlistCol.className = 'md:col-span-6 bg-slate-950/80 flex flex-col min-h-0 overflow-hidden';
-                playlistItems.className = 'flex-1 overflow-y-auto divide-y divide-slate-800/50 text-xs';
-                if (eqPanel) eqPanel.classList.remove('hidden');
-                const visCanvas = document.getElementById('dockVisualizerCanvas');
-                if (visCanvas) visCanvas.className = 'w-full h-20 block rounded-lg';
-                maxBtn.textContent = '❐';
-                maxBtn.title = 'Restaurar tamaño normal';
-            } else {
-                widget.className = 'fixed bottom-4 right-4 z-50 transition-all duration-200';
-                expEl.className = 'w-80 sm:w-[410px] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
-                mainGrid.className = 'flex flex-col flex-1 min-h-0 overflow-hidden';
-                playerCol.className = 'p-4 space-y-3 flex flex-col justify-between shrink-0';
-                mediaHeader.className = 'flex items-center gap-3.5';
-                coverBox.className = 'w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner transition-all';
-                if (coverEmoji) coverEmoji.className = 'text-3xl';
-                metaWrap.className = 'min-w-0 flex-1';
-                playlistCol.className = 'border-t border-slate-800 bg-slate-950/75 flex flex-col min-h-0';
-                playlistItems.className = 'max-h-40 overflow-y-auto divide-y divide-slate-800/40 text-xs';
-                const visCanvas = document.getElementById('dockVisualizerCanvas');
-                if (visCanvas) visCanvas.className = 'w-full h-12 sm:h-14 block rounded-lg';
-                maxBtn.textContent = '⛶';
-                maxBtn.title = 'Maximizar reproductor';
-            }
-            updateCoverBoxCursor();
-        }
-
-        function toggleMusicDockMaximize() {
-            setMusicDockMode(musicDockMode === 'maximized' ? 'normal' : 'maximized');
-        }
-
-        function closeMusicDock() {
-            closeCoverLightbox();
-            const audio = document.getElementById('dockAudioElement');
-            audio.pause();
-            audio.src = '';
-            if (visualizerRafId) {
-                cancelAnimationFrame(visualizerRafId);
-                visualizerRafId = null;
-            }
-            document.getElementById('musicDockWidget').classList.add('hidden');
-        }
-
-        function rebuildMusicPlayOrder(keepCurrentOriginalIdx) {
-            const total = musicPlaylist.length;
-            const indices = Array.from({ length: total }, (_, i) => i);
-            if (!musicShuffle || total <= 1) {
-                musicPlayOrder = indices;
-                musicOrderPos = Math.max(0, keepCurrentOriginalIdx);
-                document.getElementById('dockPlaylistOrderTag').textContent = 'Orden normal';
-                return;
-            }
-            const others = indices.filter(i => i !== keepCurrentOriginalIdx);
-            for (let i = others.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [others[i], others[j]] = [others[j], others[i]];
-            }
-            musicPlayOrder = keepCurrentOriginalIdx >= 0 ? [keepCurrentOriginalIdx, ...others] : others;
-            musicOrderPos = 0;
-            document.getElementById('dockPlaylistOrderTag').textContent = '🔀 Orden aleatorio';
-        }
-
-        function toggleDockShuffle() {
-            musicShuffle = !musicShuffle;
-            const btn = document.getElementById('dockShuffleBtn');
-            btn.className = musicShuffle
-                ? 'px-2.5 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-500/60 text-xs text-indigo-300 transition flex items-center gap-1'
-                : 'px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-400 transition flex items-center gap-1';
-
-            const currentOrigIdx = musicPlayOrder[musicOrderPos] ?? 0;
-            rebuildMusicPlayOrder(currentOrigIdx);
-            document.getElementById('dockTrackCounter').textContent = `(${musicOrderPos + 1}/${musicPlayOrder.length})`;
-            renderMusicPlaylist();
-            prefetchNextRemoteTrack();
-        }
-
-        function playDockAtOrderPos(orderPos) {
-            if (orderPos < 0 || orderPos >= musicPlayOrder.length) return;
-            musicOrderPos = orderPos;
-            const origIdx = musicPlayOrder[musicOrderPos];
-            openMusicDockPlayer(musicSource, musicPlaylist[origIdx], true);
-        }
-
-        function renderMusicPlaylist() {
-            const container = document.getElementById('dockPlaylistItems');
-            if (!container) return;
-            if (musicPlayOrder.length === 0) {
-                container.innerHTML = '<div class="px-3 py-4 text-center text-slate-500">Sin canciones en la cola</div>';
-                return;
-            }
-            container.innerHTML = musicPlayOrder.map((origIdx, pos) => {
-                const item = musicPlaylist[origIdx];
-                const isCurrent = pos === musicOrderPos;
-                const displayTitle = item.tagTitle || (item.name || '').replace(/\.[^/.]+$/, '');
-                const displayArtist = item.tagArtist || '';
-                const isCached = musicSource === 'remote' && prefetchedRemoteIds.has(String(item.id));
-                return `
-                    <div onclick="playDockAtOrderPos(${pos})"
-                         class="px-3.5 py-2 flex items-center justify-between gap-2 cursor-pointer transition ${isCurrent ? 'bg-indigo-600/25 text-white font-semibold' : 'text-slate-300 hover:bg-slate-800/70'}">
-                        <div class="flex items-center gap-2 min-w-0">
-                            <span class="w-4 text-[10px] font-mono ${isCurrent ? 'text-indigo-300' : 'text-slate-500'} shrink-0">${isCurrent ? '▶' : (pos + 1)}</span>
-                            <div class="min-w-0">
-                                <div class="truncate">${displayTitle}</div>
-                                ${displayArtist ? `<div class="text-[10px] text-slate-400 truncate">${displayArtist}</div>` : ''}
-                            </div>
-                        </div>
-                        <div class="flex items-center gap-1.5 shrink-0">
-                            ${isCached ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">⚡ Caché</span>' : ''}
-                        </div>
-                    </div>`;
-            }).join('');
-        }
-
-        async function prefetchNextRemoteTrack() {
-            const badge = document.getElementById('dockPrefetchBadge');
-            if (musicSource !== 'remote' || musicPlayOrder.length <= 1) {
-                if (badge) badge.classList.add('hidden');
-                return;
-            }
-            const nextOrderPos = (musicOrderPos + 1) % musicPlayOrder.length;
-            const nextTrack = musicPlaylist[musicPlayOrder[nextOrderPos]];
-            if (!nextTrack || !nextTrack.id) return;
-
-            const rid = String(nextTrack.id);
-            const mtimeParam = nextTrack.mtime ? `&mtime=${encodeURIComponent(nextTrack.mtime)}` : '';
-            if (prefetchedRemoteIds.has(rid)) {
-                if (badge) badge.classList.remove('hidden');
-            } else if (badge) {
-                badge.classList.add('hidden');
-            }
-            try {
-                const res = await fetch(`/api/file/prefetch?source=remote&remote_id=${encodeURIComponent(rid)}&name=${encodeURIComponent(nextTrack.name || 'audio.mp3')}${mtimeParam}`);
-                const data = await res.json();
-                if (data.prefetched) {
-                    prefetchedRemoteIds.add(rid);
-                    if (badge) badge.classList.remove('hidden');
-                    renderMusicPlaylist();
-                }
-            } catch (e) {}
-        }
-
-        async function syncCachedRemoteIds() {
-            try {
-                const res = await fetch('/api/cache/status');
-                if (!res.ok) return;
-                const data = await res.json();
-                prefetchedRemoteIds.clear();
-                (data.cached_ids || []).forEach(id => prefetchedRemoteIds.add(String(id)));
-                if (musicSource === 'remote' && musicPlaylist.length > 0) {
-                    renderMusicPlaylist();
-                }
-            } catch (e) {}
-        }
-
-        function setDockVolume(val) {
-            const num = Math.max(0, Math.min(100, parseInt(val, 10) || 0));
-            const audio = document.getElementById('dockAudioElement');
-            audio.volume = num / 100;
-            audio.muted = (num === 0);
-            if (num > 0) {
-                lastNonZeroVolume = num;
-            }
-            document.getElementById('dockVolumeBar').value = num;
-            document.getElementById('dockVolumeLabel').textContent = `${num}%`;
-            document.getElementById('dockMuteBtn').textContent = num === 0 ? '🔇' : (num < 45 ? '🔉' : '🔊');
-            try { localStorage.setItem('fj_player_vol', String(num)); } catch (e) {}
-        }
-
-        function toggleDockMute() {
-            const audio = document.getElementById('dockAudioElement');
-            if (audio.muted || audio.volume === 0) {
-                setDockVolume(lastNonZeroVolume || 85);
-            } else {
-                setDockVolume(0);
-            }
-        }
-
-        function ensureWebAudioEqualizer() {
-            if (eqInitialized) {
-                if (audioCtx && audioCtx.state === 'suspended') {
-                    audioCtx.resume().catch(() => {});
-                }
-                return;
-            }
-            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-            if (!AudioContextClass) return;
-            try {
-                const audioEl = document.getElementById('dockAudioElement');
-                audioCtx = new AudioContextClass();
-                const sourceNode = audioCtx.createMediaElementSource(audioEl);
-                eqFilters = EQ_BANDS_CONFIG.map((cfg, idx) => {
-                    const filter = audioCtx.createBiquadFilter();
-                    filter.type = cfg.type;
-                    filter.frequency.value = cfg.freq;
-                    filter.Q.value = 1.1;
-                    const slider = document.getElementById(`eqBand${idx}`);
-                    filter.gain.value = slider ? parseFloat(slider.value) : 0;
-                    return filter;
-                });
-                sourceNode.connect(eqFilters[0]);
-                for (let i = 0; i < eqFilters.length - 1; i++) {
-                    eqFilters[i].connect(eqFilters[i + 1]);
-                }
-                analyserNode = audioCtx.createAnalyser();
-                analyserNode.fftSize = 128;
-                analyserNode.smoothingTimeConstant = 0.82;
-                eqFilters[eqFilters.length - 1].connect(analyserNode);
-                analyserNode.connect(audioCtx.destination);
-                eqInitialized = true;
-                startVisualizerLoop();
-            } catch (e) {}
-        }
-
-        function toggleDockVisualizer() {
-            visualizerEnabled = !visualizerEnabled;
-            const wrap = document.getElementById('dockVisualizerWrap');
-            const btn = document.getElementById('dockVisToggleBtn');
-            if (visualizerEnabled) {
-                wrap.classList.remove('hidden');
-                btn.className = 'px-2 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-500/60 text-[10px] font-medium text-indigo-300 transition flex items-center gap-1';
-                startVisualizerLoop();
-            } else {
-                wrap.classList.add('hidden');
-                btn.className = 'px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-medium text-slate-400 transition flex items-center gap-1';
-                if (visualizerRafId) {
-                    cancelAnimationFrame(visualizerRafId);
-                    visualizerRafId = null;
-                }
-            }
-            try { localStorage.setItem('fj_player_vis', visualizerEnabled ? '1' : '0'); } catch (e) {}
-        }
-
-        function cycleVisualizerStyle() {
-            const order = ['bars', 'mirror', 'wave'];
-            const labels = { bars: 'Barras', mirror: 'Espejo', wave: 'Onda' };
-            visualizerStyle = order[(order.indexOf(visualizerStyle) + 1) % order.length];
-            const styleBtn = document.getElementById('dockVisStyleBtn');
-            if (styleBtn) styleBtn.textContent = labels[visualizerStyle];
-            try { localStorage.setItem('fj_player_vis_style', visualizerStyle); } catch (e) {}
-        }
-
-        function startVisualizerLoop() {
-            if (visualizerRafId) cancelAnimationFrame(visualizerRafId);
-            const canvas = document.getElementById('dockVisualizerCanvas');
-            if (!canvas) return;
-            const ctx = canvas.getContext('2d');
-
-            function renderFrame() {
-                if (!visualizerEnabled) {
-                    visualizerRafId = null;
-                    return;
-                }
-                visualizerRafId = requestAnimationFrame(renderFrame);
-
-                const rect = canvas.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0 && (canvas.width !== Math.floor(rect.width) || canvas.height !== Math.floor(rect.height))) {
-                    canvas.width = Math.floor(rect.width);
-                    canvas.height = Math.floor(rect.height);
-                }
-                const w = canvas.width;
-                const h = canvas.height;
-                ctx.clearRect(0, 0, w, h);
-
-                if (!analyserNode) {
-                    ctx.strokeStyle = 'rgba(99, 102, 241, 0.25)';
-                    ctx.lineWidth = 1.5;
-                    ctx.beginPath();
-                    ctx.moveTo(0, h / 2);
-                    ctx.lineTo(w, h / 2);
-                    ctx.stroke();
-                    return;
-                }
-
-                const grad = ctx.createLinearGradient(0, h, w, 0);
-                grad.addColorStop(0, '#38bdf8');
-                grad.addColorStop(0.5, '#818cf8');
-                grad.addColorStop(1, '#c084fc');
-
-                if (visualizerStyle === 'wave') {
-                    const timeData = new Uint8Array(analyserNode.fftSize);
-                    analyserNode.getByteTimeDomainData(timeData);
-                    ctx.lineWidth = 2;
-                    ctx.strokeStyle = grad;
-                    ctx.beginPath();
-                    const sliceW = w / timeData.length;
-                    let x = 0;
-                    for (let i = 0; i < timeData.length; i++) {
-                        const v = timeData[i] / 128.0;
-                        const y = (v * h) / 2;
-                        if (i === 0) ctx.moveTo(x, y);
-                        else ctx.lineTo(x, y);
-                        x += sliceW;
-                    }
-                    ctx.lineTo(w, h / 2);
-                    ctx.stroke();
-                    return;
-                }
-
-                const bufferLen = analyserNode.frequencyBinCount;
-                const freqData = new Uint8Array(bufferLen);
-                analyserNode.getByteFrequencyData(freqData);
-                const usableBins = Math.min(44, bufferLen);
-                const gap = 2;
-                const barW = Math.max(2, (w - gap * (usableBins - 1)) / usableBins);
-
-                ctx.fillStyle = grad;
-                for (let i = 0; i < usableBins; i++) {
-                    const val = freqData[i] / 255;
-                    const barH = Math.max(2, val * (h - 4));
-                    const x = i * (barW + gap);
-                    if (visualizerStyle === 'mirror') {
-                        const y = (h - barH) / 2;
-                        ctx.beginPath();
-                        if (ctx.roundRect) ctx.roundRect(x, y, barW, barH, 2);
-                        else ctx.rect(x, y, barW, barH);
-                        ctx.fill();
-                    } else {
-                        const y = h - barH;
-                        ctx.beginPath();
-                        if (ctx.roundRect) ctx.roundRect(x, y, barW, barH, [2, 2, 0, 0]);
-                        else ctx.rect(x, y, barW, barH);
-                        ctx.fill();
-                    }
-                }
-            }
-            renderFrame();
-        }
-
-        function toggleDockEqPanel() {
-            const panel = document.getElementById('dockEqPanel');
-            const btn = document.getElementById('dockEqToggleBtn');
-            const isHidden = panel.classList.toggle('hidden');
-            btn.className = isHidden
-                ? 'px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-medium text-slate-300 transition flex items-center gap-1'
-                : 'px-2.5 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-500/60 text-[10px] font-medium text-indigo-300 transition flex items-center gap-1';
-        }
-
-        function setEqBandGain(bandIdx, dbVal, markCustom = true) {
-            const db = Math.max(-12, Math.min(12, parseFloat(dbVal) || 0));
-            const slider = document.getElementById(`eqBand${bandIdx}`);
-            const label = document.getElementById(`eqVal${bandIdx}`);
-            if (slider) slider.value = db;
-            if (label) label.textContent = `${db > 0 ? '+' : ''}${db}dB`;
-            if (eqFilters[bandIdx]) {
-                eqFilters[bandIdx].gain.value = db;
-            }
-            if (markCustom) {
-                const presetSel = document.getElementById('dockEqPreset');
-                if (presetSel && !document.getElementById(`eqPresetCustomOpt`)) {
-                    const opt = document.createElement('option');
-                    opt.id = 'eqPresetCustomOpt';
-                    opt.value = 'custom';
-                    opt.textContent = 'Personalizado';
-                    presetSel.appendChild(opt);
-                }
-                if (presetSel) presetSel.value = 'custom';
-            }
-            try {
-                const currentGains = [0, 1, 2, 3, 4].map(i => parseFloat(document.getElementById(`eqBand${i}`).value) || 0);
-                localStorage.setItem('fj_player_eq', JSON.stringify(currentGains));
-            } catch (e) {}
-        }
-
-        function applyEqPreset(presetName) {
-            const gains = EQ_PRESETS[presetName];
-            if (!gains) return;
-            gains.forEach((db, idx) => setEqBandGain(idx, db, false));
-            const presetSel = document.getElementById('dockEqPreset');
-            if (presetSel) presetSel.value = presetName;
-        }
-
-        function toggleDockPlayPause() {
-            const audio = document.getElementById('dockAudioElement');
-            if (!audio.src) return;
-            ensureWebAudioEqualizer();
-            if (audio.paused) {
-                audio.play();
-            } else {
-                audio.pause();
-            }
-        }
-
-        function seekDockAudio(val) {
-            const audio = document.getElementById('dockAudioElement');
-            if (audio.duration && isFinite(audio.duration)) {
-                audio.currentTime = (parseFloat(val) / 100) * audio.duration;
-            }
-        }
-
-        function playDockPrev() {
-            if (musicPlayOrder.length === 0) return;
-            const prevOrderPos = (musicOrderPos - 1 + musicPlayOrder.length) % musicPlayOrder.length;
-            playDockAtOrderPos(prevOrderPos);
-        }
-
-        function playDockNext() {
-            if (musicPlayOrder.length === 0) return;
-            const nextOrderPos = (musicOrderPos + 1) % musicPlayOrder.length;
-            playDockAtOrderPos(nextOrderPos);
-        }
-
-        async function openMusicDockPlayer(source, fileMeta, fromPlaylistNav = false) {
-            const name = fileMeta.name || 'audio.mp3';
-            const taskName = document.getElementById('taskSelector').value || '';
-
-            if (!fromPlaylistNav) {
-                musicSource = source;
-                const folderFiles = getCurrentFolderFiles(source);
-                musicPlaylist = folderFiles.filter(f => {
-                    const fExt = (f.name || '').includes('.') ? f.name.split('.').pop().toLowerCase() : '';
-                    return AUDIO_EXTS.includes(fExt);
-                });
-                let origIdx = musicPlaylist.findIndex(f =>
-                    source === 'local' ? f.rel_path === fileMeta.rel_path : String(f.id) === String(fileMeta.id)
-                );
-                if (origIdx === -1) {
-                    musicPlaylist = [fileMeta];
-                    origIdx = 0;
-                }
-                rebuildMusicPlayOrder(origIdx);
-            }
-
-            const mtimeParam = fileMeta.mtime ? `&mtime=${encodeURIComponent(fileMeta.mtime)}` : '';
-            const queryParams = source === 'local'
-                ? (fileMeta.full_path
-                    ? `source=local&full_path=${encodeURIComponent(fileMeta.full_path)}`
-                    : `source=local&task=${encodeURIComponent(taskName)}&rel_path=${encodeURIComponent(fileMeta.rel_path)}`)
-                : `source=remote&remote_id=${encodeURIComponent(fileMeta.id)}&name=${encodeURIComponent(name)}${mtimeParam}`;
-
-            const streamUrl = `/api/file/stream?${queryParams}`;
-            const metaUrl = `/api/file/audio_meta?${queryParams}`;
-
-            // Mostrar widget
-            const widget = document.getElementById('musicDockWidget');
-            widget.classList.remove('hidden');
-            setMusicDockMode(musicDockMode);
-
-            // Resetear UI temporalmente con el nombre de archivo mientras llegan los tags ID3
-            const fallbackTitle = name.replace(/\.[^/.]+$/, '');
-            currentCoverDataUrl = null;
-            currentCoverFilename = `${fallbackTitle.replace(/[^a-zA-Z0-9_-]/g, '_') || 'caratula'}.jpg`;
-            closeCoverLightbox();
-            updateCoverBoxCursor();
-
-            document.getElementById('dockTrackTitle').textContent = fallbackTitle;
-            document.getElementById('dockTrackTitle').title = fallbackTitle;
-            document.getElementById('dockTrackArtist').textContent = 'Leyendo etiquetas ID3...';
-            document.getElementById('dockTrackAlbum').textContent = '';
-            document.getElementById('miniTrackTitle').textContent = fallbackTitle;
-            document.getElementById('miniTrackArtist').textContent = 'Cargando...';
-            document.getElementById('dockTrackCounter').textContent = `(${musicOrderPos + 1}/${musicPlayOrder.length})`;
-            document.getElementById('dockSourceBadge').textContent = source === 'remote' ? '☁️ FileJump' : '💾 Local';
-            const emojiSizeClass = musicDockMode === 'maximized' ? 'text-7xl' : 'text-3xl';
-            document.getElementById('dockCoverBox').innerHTML = `<span id="dockCoverEmoji" class="${emojiSizeClass}">🎵</span>`;
-            document.getElementById('miniCoverWrap').innerHTML = '<span class="text-base">🎵</span>';
-
-            renderMusicPlaylist();
-            syncCachedRemoteIds();
-            // Iniciar precarga en caché de la siguiente pista remota
-            prefetchNextRemoteTrack();
-
-            ensureWebAudioEqualizer();
-            const audio = document.getElementById('dockAudioElement');
-            audio.src = streamUrl;
-            audio.play().catch(() => {});
-
-            // Consultar metadatos ID3 y carátula incrustada
-            try {
-                const res = await fetch(metaUrl);
-                if (res.ok) {
-                    const meta = await res.json();
-                    const title = meta.title || fallbackTitle;
-                    const artist = meta.artist || 'Artista desconocido';
-                    const album = meta.album || '';
-
-                    // Guardar metadatos en el objeto del playlist para mostrarlos en la lista
-                    const currentOrigIdx = musicPlayOrder[musicOrderPos];
-                    if (musicPlaylist[currentOrigIdx]) {
-                        musicPlaylist[currentOrigIdx].tagTitle = title;
-                        musicPlaylist[currentOrigIdx].tagArtist = artist;
-                    }
-                    if (source === 'remote' && fileMeta.id) {
-                        prefetchedRemoteIds.add(String(fileMeta.id));
-                    }
-
-                    document.getElementById('dockTrackTitle').textContent = title;
-                    document.getElementById('dockTrackTitle').title = title;
-                    document.getElementById('dockTrackArtist').textContent = artist;
-                    document.getElementById('dockTrackAlbum').textContent = album;
-                    document.getElementById('miniTrackTitle').textContent = title;
-                    document.getElementById('miniTrackArtist').textContent = artist;
-
-                    if (meta.cover_data_url) {
-                        currentCoverDataUrl = meta.cover_data_url;
-                        const mimeExt = meta.cover_data_url.startsWith('data:image/png') ? 'png' : 'jpg';
-                        currentCoverFilename = `${title.replace(/[^a-zA-Z0-9_-]/g, '_') || 'caratula'}.${mimeExt}`;
-                        document.getElementById('dockCoverBox').innerHTML = `<img src="${meta.cover_data_url}" alt="Carátula" class="w-full h-full object-cover">`;
-                        document.getElementById('miniCoverWrap').innerHTML = `<img src="${meta.cover_data_url}" alt="Cover" class="w-full h-full object-cover">`;
-                        updateCoverBoxCursor();
-                    }
-                    renderMusicPlaylist();
-                }
-            } catch (e) {
-                document.getElementById('dockTrackArtist').textContent = source === 'remote' ? 'Audio en nube' : 'Audio local';
-                document.getElementById('miniTrackArtist').textContent = 'En reproducción';
-            }
-        }
-
-        // Eventos del elemento <audio> flotante y restauración de volumen / EQ
-        (function initDockAudioEvents() {
-            const audio = document.getElementById('dockAudioElement');
-            try {
-                const savedVol = localStorage.getItem('fj_player_vol');
-                setDockVolume(savedVol !== null ? parseInt(savedVol, 10) : 85);
-                const savedEq = JSON.parse(localStorage.getItem('fj_player_eq') || 'null');
-                if (Array.isArray(savedEq) && savedEq.length === 5) {
-                    savedEq.forEach((db, idx) => setEqBandGain(idx, db, true));
-                }
-                const savedVis = localStorage.getItem('fj_player_vis');
-                if (savedVis === '0') {
-                    toggleDockVisualizer();
-                }
-                const savedVisStyle = localStorage.getItem('fj_player_vis_style');
-                if (savedVisStyle && ['bars', 'mirror', 'wave'].includes(savedVisStyle)) {
-                    visualizerStyle = savedVisStyle;
-                    const labels = { bars: 'Barras', mirror: 'Espejo', wave: 'Onda' };
-                    const styleBtn = document.getElementById('dockVisStyleBtn');
-                    if (styleBtn) styleBtn.textContent = labels[visualizerStyle];
-                }
-            } catch (e) {
-                setDockVolume(85);
-            }
-            audio.addEventListener('play', () => {
-                ensureWebAudioEqualizer();
-                if (visualizerEnabled) startVisualizerLoop();
-                document.getElementById('dockPlayPauseBtn').textContent = '⏸';
-                document.getElementById('miniPlayPauseBtn').textContent = '⏸';
-            });
-            audio.addEventListener('pause', () => {
-                document.getElementById('dockPlayPauseBtn').textContent = '▶';
-                document.getElementById('miniPlayPauseBtn').textContent = '▶';
-            });
-            audio.addEventListener('timeupdate', () => {
-                document.getElementById('dockCurrentTime').textContent = formatAudioTime(audio.currentTime);
-                document.getElementById('dockTotalTime').textContent = formatAudioTime(audio.duration);
-                if (audio.duration && isFinite(audio.duration)) {
-                    document.getElementById('dockSeekBar').value = (audio.currentTime / audio.duration) * 100;
-                }
-            });
-            audio.addEventListener('ended', () => {
-                playDockNext();
-            });
-        })();
-
         // =========================================================================
-        // EXPLORADOR LOCAL ESTILO WINDOWS (ÁRBOL LAZY CON + Y CONTENIDO DERECHO)
+        // EXPLORADORES DUALES (ÁRBOL JERÁRQUICO + CONTENIDO + MENÚ CONTEXTUAL)
         // =========================================================================
-        function initLocalExplorer(rootItems, driveRootOverride = '') {
-            localActiveDriveRoot = driveRootOverride || '';
+        function isAudioFilename(name) {
+            const ext = (name || '').split('.').pop().toLowerCase();
+            return AUDIO_EXTS.includes(ext);
+        }
+
+        function getCurrentFolderFiles(source) {
+            if (source === 'local') {
+                const node = localNodes.get(localSelectedPath || '');
+                return (node && Array.isArray(node.children)) ? node.children.filter(i => i.type === 'file') : [];
+            } else {
+                const node = remoteNodes.get(String(remoteSelectedKey || 'ROOT'));
+                return (node && Array.isArray(node.children)) ? node.children.filter(i => i.type === 'file') : [];
+            }
+        }
+
+        function escapeAttr(str) {
+            return String(str || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function initLocalExplorer(rootItems) {
             localNodes.clear();
             localSelectedPath = '';
-            const rootName = localActiveDriveRoot || 'Raíz';
             localNodes.set('', {
-                path: '',
-                name: rootName,
-                expanded: true,
+                rel_path: '',
+                name: 'Raíz Local',
                 loaded: true,
-                loading: false,
-                has_children: rootItems.some(i => i.type === 'folder'),
-                items: rootItems
+                expanded: true,
+                children: rootItems || []
             });
-            rootItems.filter(i => i.type === 'folder').forEach(fld => {
-                localNodes.set(fld.rel_path, {
-                    path: fld.rel_path,
-                    name: fld.name,
-                    expanded: false,
-                    loaded: false,
-                    loading: false,
-                    has_children: fld.has_children !== false,
-                    items: []
-                });
-            });
-            renderLocalTree();
+            renderLocalTreePanel();
             renderLocalContentsPanel();
         }
 
-        async function toggleLocalTreeNode(relPath) {
-            const node = localNodes.get(relPath);
-            if (!node) return;
-            if (node.expanded) {
-                node.expanded = false;
-                renderLocalTree();
-                return;
-            }
-            node.expanded = true;
-            if (!node.loaded) {
-                await fetchLocalNodeChildren(relPath);
-            } else {
-                renderLocalTree();
-            }
-        }
-
-        async function selectLocalFolder(relPath) {
-            localSelectedPath = relPath;
-            let node = localNodes.get(relPath);
-            if (!node) {
-                node = {
-                    path: relPath,
-                    name: relPath.split('/').pop() || (localActiveDriveRoot || 'Raíz'),
-                    expanded: true,
-                    loaded: false,
-                    loading: false,
-                    has_children: true,
-                    items: []
-                };
-                localNodes.set(relPath, node);
-            } else {
-                node.expanded = true;
-            }
-
-            // Asegurar que toda la cadena de carpetas padre también quede desplegada en el árbol
-            if (relPath) {
-                const parts = relPath.split('/');
-                let acc = '';
-                for (let i = 0; i < parts.length - 1; i++) {
-                    acc = acc ? `${acc}/${parts[i]}` : parts[i];
-                    const ancestor = localNodes.get(acc);
-                    if (ancestor) ancestor.expanded = true;
-                }
-            }
-
-            renderLocalTree();
-            if (!node.loaded) {
-                await fetchLocalNodeChildren(relPath);
-            } else {
-                renderLocalContentsPanel();
-            }
-        }
-
-        async function fetchLocalNodeChildren(relPath) {
-            const taskName = document.getElementById('taskSelector').value;
-            const node = localNodes.get(relPath);
-            if (!node || (!taskName && !localActiveDriveRoot)) return;
-            node.loading = true;
-            renderLocalTree();
-            try {
-                const baseParam = localActiveDriveRoot
-                    ? `root_path=${encodeURIComponent(localActiveDriveRoot)}`
-                    : `task=${encodeURIComponent(taskName)}`;
-                const res = await fetch(`/api/local/children?${baseParam}&prefix=${encodeURIComponent(relPath)}`);
-                const data = await res.json();
-                const items = data.items || [];
-                node.items = items;
-                node.loaded = true;
-                node.loading = false;
-                node.has_children = items.some(i => i.type === 'folder');
-                items.filter(i => i.type === 'folder').forEach(fld => {
-                    if (!localNodes.has(fld.rel_path)) {
-                        localNodes.set(fld.rel_path, {
-                            path: fld.rel_path,
-                            name: fld.name,
-                            expanded: false,
-                            loaded: false,
-                            loading: false,
-                            has_children: fld.has_children !== false,
-                            items: []
-                        });
-                    }
-                });
-            } catch (e) {
-                node.loading = false;
-            }
-            renderLocalTree();
-            if (localSelectedPath === relPath) {
-                renderLocalContentsPanel();
-            }
-        }
-
-        function renderLocalTree() {
-            const container = document.getElementById('localFolderTree');
+        function renderLocalTreePanel() {
+            const treeEl = document.getElementById('localFolderTree');
+            if (!treeEl) return;
             const rootNode = localNodes.get('');
             if (!rootNode) {
-                container.innerHTML = '<div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>';
+                treeEl.innerHTML = '<div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>';
                 return;
             }
 
-            function buildHtml(relPath, depth) {
+            function buildNodeHtml(relPath, depth) {
                 const node = localNodes.get(relPath);
                 if (!node) return '';
                 const isSelected = localSelectedPath === relPath;
-                const indentPx = depth * 12;
-                const btnSymbol = node.loading ? '…' : (node.expanded ? '−' : '+');
-                const toggleBtn = node.has_children
-                    ? `<button onclick="event.stopPropagation(); toggleLocalTreeNode('${relPath.replace(/'/g, "\\'")}')" class="w-4 h-4 rounded bg-slate-800 hover:bg-sky-600/40 text-slate-300 border border-slate-700 flex items-center justify-center text-[10px] font-bold shrink-0">${btnSymbol}</button>`
-                    : `<span class="w-4 inline-block shrink-0"></span>`;
+                const subfolders = (node.children || []).filter(c => c.type === 'folder');
+                const padLeft = depth * 12 + 4;
+                const canExpand = relPath === '' || node.has_children || subfolders.length > 0 || !node.loaded;
+                const toggleSymbol = !canExpand ? '·' : (node.expanded ? '−' : '+');
 
                 let html = `
-                    <div onclick="selectLocalFolder('${relPath.replace(/'/g, "\\'")}')"
-                         style="padding-left: ${indentPx}px"
-                         class="flex items-center gap-1.5 py-1 px-1.5 rounded-lg cursor-pointer transition ${isSelected ? 'bg-sky-600/25 text-sky-300 font-semibold border border-sky-500/30' : 'text-slate-300 hover:bg-slate-800/70'}">
-                        ${toggleBtn}
-                        <span class="shrink-0">${relPath === '' ? '🏠' : '📁'}</span>
-                        <span class="truncate">${node.name}</span>
+                    <div oncontextmenu="openExplorerContextMenu(event, 'local', { type: 'folder', rel_path: '${escapeAttr(relPath)}', name: '${escapeAttr(node.name)}', full_path: '${escapeAttr(node.full_path || '')}' })"
+                         class="flex items-center gap-1 py-1 pr-2 rounded-lg cursor-pointer transition ${isSelected ? 'bg-sky-600/25 text-white font-semibold border border-sky-500/30' : 'text-slate-300 hover:bg-slate-800/70'}"
+                         style="padding-left: ${padLeft}px;">
+                        <button type="button" onclick="event.stopPropagation(); toggleLocalTreeNode('${escapeAttr(relPath)}')"
+                                class="w-4 h-4 rounded bg-slate-800/90 hover:bg-slate-700 text-[10px] font-mono text-slate-300 flex items-center justify-center shrink-0">${toggleSymbol}</button>
+                        <div onclick="selectLocalFolder('${escapeAttr(relPath)}')" class="flex items-center gap-1.5 min-w-0 flex-1 truncate">
+                            <span class="shrink-0">${relPath === '' ? '🏠' : '📁'}</span>
+                            <span class="truncate">${escapeAttr(node.name)}</span>
+                        </div>
                     </div>`;
 
-                if (node.expanded && node.loaded) {
-                    const subfolders = (node.items || []).filter(i => i.type === 'folder');
+                if (node.expanded && subfolders.length > 0) {
                     subfolders.forEach(sf => {
-                        html += buildHtml(sf.rel_path, depth + 1);
+                        if (!localNodes.has(sf.rel_path)) {
+                            localNodes.set(sf.rel_path, {
+                                rel_path: sf.rel_path,
+                                name: sf.name,
+                                full_path: sf.full_path,
+                                has_children: sf.has_children,
+                                loaded: false,
+                                expanded: false,
+                                children: []
+                            });
+                        }
+                        html += buildNodeHtml(sf.rel_path, depth + 1);
                     });
                 }
                 return html;
             }
 
-            container.innerHTML = buildHtml('', 0);
+            treeEl.innerHTML = buildNodeHtml('', 0);
+        }
+
+        async function fetchLocalNodeChildren(relPath) {
+            const node = localNodes.get(relPath);
+            if (!node) return;
+            const taskName = document.getElementById('taskSelector').value || '';
+            const query = localActiveDriveRoot
+                ? `root_path=${encodeURIComponent(localActiveDriveRoot)}&prefix=${encodeURIComponent(relPath)}`
+                : `task=${encodeURIComponent(taskName)}&prefix=${encodeURIComponent(relPath)}`;
+            const res = await fetch(`/api/local/children?${query}`);
+            const data = await res.json();
+            node.children = data.items || [];
+            node.loaded = true;
+            node.children.filter(c => c.type === 'folder').forEach(sf => {
+                if (!localNodes.has(sf.rel_path)) {
+                    localNodes.set(sf.rel_path, {
+                        rel_path: sf.rel_path,
+                        name: sf.name,
+                        full_path: sf.full_path,
+                        has_children: sf.has_children,
+                        loaded: false,
+                        expanded: false,
+                        children: []
+                    });
+                }
+            });
+        }
+
+        async function toggleLocalTreeNode(relPath) {
+            const node = localNodes.get(relPath);
+            if (!node) return;
+            if (!node.loaded) {
+                await fetchLocalNodeChildren(relPath);
+            }
+            node.expanded = !node.expanded;
+            renderLocalTreePanel();
+        }
+
+        async function selectLocalFolder(relPath) {
+            localSelectedPath = relPath || '';
+            // Expandir ancestros en el árbol
+            if (localSelectedPath) {
+                const parts = localSelectedPath.split('/');
+                let acc = '';
+                for (let i = 0; i < parts.length; i++) {
+                    acc = acc ? `${acc}/${parts[i]}` : parts[i];
+                    const pNode = localNodes.get(acc);
+                    if (pNode) pNode.expanded = true;
+                }
+            }
+            const rootNode = localNodes.get('');
+            if (rootNode) rootNode.expanded = true;
+
+            const targetNode = localNodes.get(localSelectedPath);
+            if (targetNode) {
+                if (!targetNode.loaded) {
+                    await fetchLocalNodeChildren(localSelectedPath);
+                }
+                targetNode.expanded = true;
+            }
+            renderLocalTreePanel();
+            renderLocalContentsPanel();
         }
 
         function renderLocalContentsPanel() {
             const tbody = document.getElementById('localTableBody');
             const badge = document.getElementById('localCountBadge');
-            const breadcrumbBar = document.getElementById('localBreadcrumbBar');
+            const bcBar = document.getElementById('localBreadcrumbBar');
+            const node = localNodes.get(localSelectedPath || '');
 
-            const parts = localSelectedPath ? localSelectedPath.split('/') : [];
-            const parentPath = parts.length > 0 ? parts.slice(0, -1).join('/') : null;
-            const rootLabel = localActiveDriveRoot || 'Raíz';
-
-            let bcHtml = '';
-            if (parentPath !== null) {
-                bcHtml += `<button onclick="selectLocalFolder('${parentPath.replace(/'/g, "\\'")}')" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium shrink-0">⬅ Subir</button>`;
+            // Breadcrumbs
+            let bcHtml = `<button onclick="selectLocalFolder('')" class="hover:text-sky-400 font-medium flex items-center gap-1 shrink-0"><span>🏠 Raíz</span></button>`;
+            if (localSelectedPath) {
+                const parts = localSelectedPath.split('/');
+                let acc = '';
+                parts.forEach((part, idx) => {
+                    acc = acc ? `${acc}/${part}` : part;
+                    const isLast = idx === parts.length - 1;
+                    bcHtml += `<span class="text-slate-600">/</span><button onclick="selectLocalFolder('${escapeAttr(acc)}')" class="${isLast ? 'text-white font-semibold' : 'hover:text-sky-400'} truncate max-w-[160px]">${escapeAttr(part)}</button>`;
+                });
             }
-            bcHtml += `<button onclick="selectLocalFolder('')" class="hover:text-sky-400 font-medium shrink-0">🏠 ${rootLabel}</button>`;
-            let acc = '';
-            parts.forEach((p, idx) => {
-                acc = acc ? `${acc}/${p}` : p;
-                const isLast = idx === parts.length - 1;
-                bcHtml += `<span class="text-slate-600">/</span><button onclick="selectLocalFolder('${acc.replace(/'/g, "\\'")}')" class="${isLast ? 'text-white font-semibold' : 'hover:text-sky-400'} truncate max-w-[140px]">${p}</button>`;
-            });
-            breadcrumbBar.innerHTML = bcHtml;
+            bcBar.innerHTML = bcHtml;
 
-            const node = localNodes.get(localSelectedPath);
-            const items = node ? (node.items || []) : [];
+            if (!node) {
+                tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500">Sin contenido disponible</td></tr>';
+                badge.textContent = '0 elementos';
+                return;
+            }
+
+            const items = sortExplorerItems(node.children || [], 'local');
             badge.textContent = `${items.length} elementos`;
 
             if (items.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500">Esta carpeta está vacía</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500">Carpeta vacía</td></tr>';
                 return;
             }
 
             tbody.innerHTML = items.map(item => {
                 const isFolder = item.type === 'folder';
-                const safeRel = item.rel_path.replace(/'/g, "\\'");
-                const encodedFull = encodeURIComponent(item.full_path || '');
-                const encodedName = encodeURIComponent(item.name || '');
+                const icon = isFolder ? '📁' : (isAudioFilename(item.name) ? '🎵' : '📄');
+                const metaJson = escapeAttr(JSON.stringify(item));
+                const dblClick = isFolder
+                    ? `selectLocalFolder('${escapeAttr(item.rel_path)}')`
+                    : `openExplorerFile('local', ${metaJson})`;
+
                 return `
-                <tr ${isFolder ? `ondblclick="selectLocalFolder('${safeRel}')"` : `ondblclick="openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}'), mtime: ${item.mtime || 0}})"`}
-                    class="hover:bg-slate-800/50 transition ${isFolder ? 'cursor-pointer' : 'cursor-pointer'}">
-                    <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[240px] xl:max-w-[380px] 2xl:max-w-[520px]">
-                        <div class="flex items-center gap-1.5 truncate">
-                            <span class="shrink-0">${isFolder ? '📁' : '📄'}</span>
-                            <span class="truncate" title="${item.rel_path}">${item.name}</span>
-                        </div>
-                    </td>
-                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
-                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
-                    <td class="py-2 px-2.5 text-right whitespace-nowrap">
-                        <div class="inline-flex items-center gap-1.5">
-                            ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('local', {name: decodeURIComponent('${encodedName}'), rel_path: '${safeRel}', full_path: decodeURIComponent('${encodedFull}'), mtime: ${item.mtime || 0}})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-sky-600/30 text-sky-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
-                            ${getStatusBadge(item.sync_status)}
-                        </div>
-                    </td>
-                </tr>`;
+                    <tr ondblclick="${dblClick}"
+                        oncontextmenu="openExplorerContextMenu(event, 'local', ${metaJson})"
+                        class="hover:bg-slate-800/65 cursor-pointer transition">
+                        <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[240px] truncate" title="${escapeAttr(item.name)}">
+                            <span class="mr-1.5">${icon}</span><span>${escapeAttr(item.name)}</span>
+                        </td>
+                        <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
+                        <td class="py-2 px-2.5 text-slate-400 font-mono text-[11px] whitespace-nowrap">${escapeAttr(item.mtime_str || '-')}</td>
+                        <td class="py-2 px-2.5 text-right whitespace-nowrap">${getStatusBadge(item.sync_status)}</td>
+                    </tr>`;
             }).join('');
         }
 
-        // =========================================================================
-        // EXPLORADOR REMOTO ESTILO WINDOWS (ÁRBOL LAZY CON + Y CONTENIDO DERECHO)
-        // =========================================================================
-        function initRemoteExplorer(rootId, rootItems) {
-            remoteBaseRootId = String(rootId || 'ROOT');
+        function initRemoteExplorer(rootItems, rootId = 'ROOT', rootLabel = '/ (Raíz de FileJump)') {
             remoteNodes.clear();
+            remoteBaseRootId = String(rootId || 'ROOT');
             remoteSelectedKey = remoteBaseRootId;
-
-            const selector = document.getElementById('remoteDirSelector');
-            const selectedOpt = selector.options[selector.selectedIndex];
-            const rootLabel = (remoteBaseRootId === 'ROOT')
-                ? '/ (Raíz de FileJump)'
-                : (selectedOpt && selectedOpt.value === remoteBaseRootId ? selectedOpt.textContent : `Carpeta #${remoteBaseRootId}`);
-
             remoteNodes.set(remoteBaseRootId, {
                 key: remoteBaseRootId,
                 id: remoteBaseRootId,
-                parentKey: null,
+                rel_path: '',
                 name: rootLabel,
-                prefix: '',
-                expanded: true,
                 loaded: true,
-                loading: false,
-                has_children: rootItems.some(i => i.type === 'folder'),
-                items: rootItems
+                expanded: true,
+                children: rootItems || []
             });
-
-            rootItems.filter(i => i.type === 'folder').forEach(fld => {
-                const k = String(fld.id);
-                remoteNodes.set(k, {
-                    key: k,
-                    id: fld.id,
-                    parentKey: remoteBaseRootId,
-                    name: fld.name,
-                    prefix: fld.rel_path,
-                    expanded: false,
-                    loaded: false,
-                    loading: false,
-                    has_children: true,
-                    items: []
-                });
-            });
-
-            renderRemoteTree();
+            renderRemoteTreePanel();
             renderRemoteContentsPanel();
         }
 
-        async function toggleRemoteTreeNode(nodeKey) {
-            const node = remoteNodes.get(String(nodeKey));
-            if (!node) return;
-            if (node.expanded) {
-                node.expanded = false;
-                renderRemoteTree();
+        function renderRemoteTreePanel() {
+            const treeEl = document.getElementById('remoteFolderTree');
+            if (!treeEl) return;
+            const rootNode = remoteNodes.get(remoteBaseRootId);
+            if (!rootNode) {
+                treeEl.innerHTML = '<div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>';
                 return;
             }
-            node.expanded = true;
-            if (!node.loaded) {
-                await fetchRemoteNodeChildren(String(nodeKey));
-            } else {
-                renderRemoteTree();
-            }
-        }
 
-        async function selectRemoteNode(nodeKey) {
-            const key = String(nodeKey);
-            remoteSelectedKey = key;
-            const node = remoteNodes.get(key);
-            if (!node) return;
+            function buildNodeHtml(nodeKey, depth) {
+                const node = remoteNodes.get(String(nodeKey));
+                if (!node) return '';
+                const isSelected = String(remoteSelectedKey) === String(nodeKey);
+                const subfolders = (node.children || []).filter(c => c.type === 'folder');
+                const padLeft = depth * 12 + 4;
+                const toggleSymbol = node.expanded ? '−' : '+';
 
-            // Desplegar automáticamente la carpeta abierta y toda su cadena de ancestros en el árbol
-            node.expanded = true;
-            let pKey = node.parentKey;
-            while (pKey) {
-                const ancestor = remoteNodes.get(String(pKey));
-                if (!ancestor) break;
-                ancestor.expanded = true;
-                pKey = ancestor.parentKey;
+                let html = `
+                    <div oncontextmenu="openExplorerContextMenu(event, 'remote', { type: 'folder', id: '${escapeAttr(node.id)}', rel_path: '${escapeAttr(node.rel_path || '')}', name: '${escapeAttr(node.name)}' })"
+                         class="flex items-center gap-1 py-1 pr-2 rounded-lg cursor-pointer transition ${isSelected ? 'bg-indigo-600/25 text-white font-semibold border border-indigo-500/30' : 'text-slate-300 hover:bg-slate-800/70'}"
+                         style="padding-left: ${padLeft}px;">
+                        <button type="button" onclick="event.stopPropagation(); toggleRemoteTreeNode('${escapeAttr(nodeKey)}')"
+                                class="w-4 h-4 rounded bg-slate-800/90 hover:bg-slate-700 text-[10px] font-mono text-slate-300 flex items-center justify-center shrink-0">${toggleSymbol}</button>
+                        <div onclick="selectRemoteNode('${escapeAttr(nodeKey)}')" class="flex items-center gap-1.5 min-w-0 flex-1 truncate">
+                            <span class="shrink-0">${String(nodeKey) === String(remoteBaseRootId) ? '☁️' : '📁'}</span>
+                            <span class="truncate">${escapeAttr(node.name)}</span>
+                        </div>
+                    </div>`;
+
+                if (node.expanded && subfolders.length > 0) {
+                    subfolders.forEach(sf => {
+                        const childKey = String(sf.id);
+                        if (!remoteNodes.has(childKey)) {
+                            remoteNodes.set(childKey, {
+                                key: childKey,
+                                id: sf.id,
+                                parent_key: String(nodeKey),
+                                rel_path: sf.rel_path,
+                                name: sf.name,
+                                loaded: false,
+                                expanded: false,
+                                children: []
+                            });
+                        }
+                        html += buildNodeHtml(childKey, depth + 1);
+                    });
+                }
+                return html;
             }
 
-            renderRemoteTree();
-            if (!node.loaded) {
-                await fetchRemoteNodeChildren(key);
-            } else {
-                renderRemoteContentsPanel();
-            }
+            treeEl.innerHTML = buildNodeHtml(remoteBaseRootId, 0);
         }
 
         async function fetchRemoteNodeChildren(nodeKey) {
             const node = remoteNodes.get(String(nodeKey));
             if (!node) return;
             const taskName = document.getElementById('taskSelector').value || '';
-            node.loading = true;
-            renderRemoteTree();
-            try {
-                const url = `/api/remote/children?parent_id=${encodeURIComponent(node.id)}&prefix=${encodeURIComponent(node.prefix)}&task=${encodeURIComponent(taskName)}`;
-                const res = await fetch(url);
-                const data = await res.json();
-                const items = data.items || [];
-                node.items = items;
-                node.loaded = true;
-                node.loading = false;
-                node.has_children = items.some(i => i.type === 'folder');
-
-                items.filter(i => i.type === 'folder').forEach(fld => {
-                    const childKey = String(fld.id);
-                    if (!remoteNodes.has(childKey)) {
-                        remoteNodes.set(childKey, {
-                            key: childKey,
-                            id: fld.id,
-                            parentKey: String(nodeKey),
-                            name: fld.name,
-                            prefix: fld.rel_path,
-                            expanded: false,
-                            loaded: false,
-                            loading: false,
-                            has_children: true,
-                            items: []
-                        });
-                    }
-                });
-            } catch (e) {
-                node.loading = false;
-            }
-            renderRemoteTree();
-            if (remoteSelectedKey === String(nodeKey)) {
-                renderRemoteContentsPanel();
-            }
-        }
-
-        function renderRemoteTree() {
-            const container = document.getElementById('remoteFolderTree');
-            const rootNode = remoteNodes.get(remoteBaseRootId);
-            if (!rootNode) {
-                container.innerHTML = '<div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>';
-                return;
-            }
-
-            function buildHtml(nodeKey, depth) {
-                const node = remoteNodes.get(String(nodeKey));
-                if (!node) return '';
-                const isSelected = remoteSelectedKey === String(nodeKey);
-                const indentPx = depth * 12;
-                const btnSymbol = node.loading ? '…' : (node.expanded ? '−' : '+');
-                const toggleBtn = node.has_children
-                    ? `<button onclick="event.stopPropagation(); toggleRemoteTreeNode('${node.key}')" class="w-4 h-4 rounded bg-slate-800 hover:bg-indigo-600/40 text-slate-300 border border-slate-700 flex items-center justify-center text-[10px] font-bold shrink-0">${btnSymbol}</button>`
-                    : `<span class="w-4 inline-block shrink-0"></span>`;
-
-                let html = `
-                    <div onclick="selectRemoteNode('${node.key}')"
-                         style="padding-left: ${indentPx}px"
-                         class="flex items-center gap-1.5 py-1 px-1.5 rounded-lg cursor-pointer transition ${isSelected ? 'bg-indigo-600/25 text-indigo-300 font-semibold border border-indigo-500/30' : 'text-slate-300 hover:bg-slate-800/70'}">
-                        ${toggleBtn}
-                        <span class="shrink-0">${node.key === remoteBaseRootId ? '☁️' : '📁'}</span>
-                        <span class="truncate">${node.name}</span>
-                    </div>`;
-
-                if (node.expanded && node.loaded) {
-                    const subfolders = (node.items || []).filter(i => i.type === 'folder');
-                    subfolders.forEach(sf => {
-                        html += buildHtml(String(sf.id), depth + 1);
+            const res = await fetch(`/api/remote/children?parent_id=${encodeURIComponent(node.id)}&prefix=${encodeURIComponent(node.rel_path || '')}&task=${encodeURIComponent(taskName)}`);
+            const data = await res.json();
+            node.children = data.items || [];
+            node.loaded = true;
+            node.children.filter(c => c.type === 'folder').forEach(sf => {
+                const cKey = String(sf.id);
+                if (!remoteNodes.has(cKey)) {
+                    remoteNodes.set(cKey, {
+                        key: cKey,
+                        id: sf.id,
+                        parent_key: String(nodeKey),
+                        rel_path: sf.rel_path,
+                        name: sf.name,
+                        loaded: false,
+                        expanded: false,
+                        children: []
                     });
                 }
-                return html;
+            });
+        }
+
+        async function toggleRemoteTreeNode(nodeKey) {
+            const node = remoteNodes.get(String(nodeKey));
+            if (!node) return;
+            if (!node.loaded) {
+                await fetchRemoteNodeChildren(nodeKey);
+            }
+            node.expanded = !node.expanded;
+            renderRemoteTreePanel();
+        }
+
+        async function selectRemoteNode(nodeKey) {
+            remoteSelectedKey = String(nodeKey || remoteBaseRootId);
+            const node = remoteNodes.get(remoteSelectedKey);
+            if (!node) return;
+
+            // Expandir cadena de padres
+            let cursor = node;
+            while (cursor) {
+                cursor.expanded = true;
+                cursor = cursor.parent_key ? remoteNodes.get(String(cursor.parent_key)) : null;
             }
 
-            container.innerHTML = buildHtml(remoteBaseRootId, 0);
+            if (!node.loaded) {
+                await fetchRemoteNodeChildren(remoteSelectedKey);
+            }
+            node.expanded = true;
+            renderRemoteTreePanel();
+            renderRemoteContentsPanel();
         }
 
         function renderRemoteContentsPanel() {
             const tbody = document.getElementById('remoteTableBody');
             const badge = document.getElementById('remoteCountBadge');
-            const breadcrumbBar = document.getElementById('remoteBreadcrumbBar');
-            const subtitleEl = document.getElementById('remotePathSubtitle');
+            const bcBar = document.getElementById('remoteBreadcrumbBar');
+            const subLabel = document.getElementById('remotePathSubtitle');
             const dirSelector = document.getElementById('remoteDirSelector');
+            const node = remoteNodes.get(String(remoteSelectedKey));
 
-            const trail = [];
-            let cursor = remoteNodes.get(remoteSelectedKey);
+            // Construir cadena de ancestros para breadcrumbs y subtítulo activo
+            const chain = [];
+            let cursor = node;
             while (cursor) {
-                trail.unshift(cursor);
-                cursor = cursor.parentKey ? remoteNodes.get(cursor.parentKey) : null;
+                chain.unshift(cursor);
+                cursor = cursor.parent_key ? remoteNodes.get(String(cursor.parent_key)) : null;
             }
 
-            const currentNode = remoteNodes.get(remoteSelectedKey);
-            const items = currentNode ? (currentNode.items || []) : [];
+            if (node) {
+                const pathDisplay = chain.map(n => n.name).join(' / ');
+                subLabel.textContent = `ID Remoto: ${node.id} • ${pathDisplay}`;
 
-            // Actualizar activamente el ID Remoto mostrado en el encabezado
-            if (subtitleEl) {
-                const activeId = currentNode ? currentNode.id : 'ROOT';
-                const pathText = trail.length > 0 ? trail.map(n => n.name).join(' / ') : '/ (Raíz de FileJump)';
-                subtitleEl.textContent = `ID Remoto: ${activeId} • ${pathText}`;
+                // Actualizar selector superior activamente con la carpeta actual y sus subcarpetas
+                if (dirSelector) {
+                    const subOpts = (node.children || []).filter(c => c.type === 'folder')
+                        .map(sf => `<option value="${escapeAttr(sf.id)}">↳ 📁 ${escapeAttr(sf.name)} (#${escapeAttr(sf.id)})</option>`)
+                        .join('');
+                    const currentLabel = String(node.id) === 'ROOT' ? '/ (Raíz de FileJump)' : `📂 ${node.name} (#${node.id})`;
+                    dirSelector.innerHTML = `
+                        <option value="${escapeAttr(node.id)}" selected>${escapeAttr(currentLabel)}</option>
+                        ${String(node.id) !== 'ROOT' ? '<option value="ROOT">/ (Raíz de FileJump)</option>' : ''}
+                        <option value="">Auto (Carpeta de Tarea)</option>
+                        ${subOpts}
+                    `;
+                }
             }
 
-            // Actualizar dinámicamente el selector superior con la carpeta actual, ancestros y subcarpetas
-            if (dirSelector && currentNode) {
-                const activeVal = String(currentNode.id);
-                const subfolders = items.filter(i => i.type === 'folder');
-                const addedIds = new Set();
+            bcBar.innerHTML = chain.map((n, idx) => {
+                const isLast = idx === chain.length - 1;
+                const sep = idx > 0 ? '<span class="text-slate-600">/</span>' : '';
+                return `${sep}<button onclick="selectRemoteNode('${escapeAttr(n.key)}')" class="${isLast ? 'text-white font-semibold' : 'hover:text-indigo-400'} flex items-center gap-1 shrink-0 max-w-[180px] truncate">${idx === 0 ? '☁️ ' : ''}${escapeAttr(n.name)}</button>`;
+            }).join('');
 
-                let optsHtml = `
-                    <option value="">Auto (Carpeta de Tarea)</option>
-                    <option value="ROOT">/ (Raíz de FileJump)</option>
-                `;
-                addedIds.add('');
-                addedIds.add('ROOT');
-
-                // Incluir la ruta de carpetas padre y la carpeta actual
-                trail.forEach((n, idx) => {
-                    const idStr = String(n.id);
-                    if (!addedIds.has(idStr)) {
-                        addedIds.add(idStr);
-                        const prefixIcon = idx === trail.length - 1 ? '📂' : '📁';
-                        optsHtml += `<option value="${idStr}">${prefixIcon} ${n.name} (#${idStr})</option>`;
-                    }
-                });
-
-                // Incluir las subcarpetas inmediatas de la carpeta que se está viendo en este momento
-                subfolders.forEach(sf => {
-                    const idStr = String(sf.id);
-                    if (!addedIds.has(idStr)) {
-                        addedIds.add(idStr);
-                        optsHtml += `<option value="${idStr}">↳ 📁 ${sf.name} (#${idStr})</option>`;
-                    }
-                });
-
-                dirSelector.innerHTML = optsHtml;
-                dirSelector.value = activeVal;
+            if (!node) {
+                tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500">Sin contenido remoto disponible</td></tr>';
+                badge.textContent = '0 elementos';
+                return;
             }
 
-            let bcHtml = '';
-            if (currentNode && currentNode.parentKey) {
-                bcHtml += `<button onclick="selectRemoteNode('${currentNode.parentKey}')" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium shrink-0">⬅ Subir</button>`;
-            }
-            trail.forEach((n, idx) => {
-                const isLast = idx === trail.length - 1;
-                if (idx > 0) bcHtml += `<span class="text-slate-600">/</span>`;
-                bcHtml += `<button onclick="selectRemoteNode('${n.key}')" class="${isLast ? 'text-white font-semibold' : 'hover:text-indigo-400'} truncate max-w-[140px]">${idx === 0 ? '☁️ ' : ''}${n.name}</button>`;
-            });
-            breadcrumbBar.innerHTML = bcHtml || `<span class="text-slate-400">☁️ Raíz</span>`;
-
+            const items = sortExplorerItems(node.children || [], 'remote');
             badge.textContent = `${items.length} elementos`;
 
             if (items.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500">Esta carpeta remota está vacía</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500">Carpeta remota vacía</td></tr>';
                 return;
             }
 
             tbody.innerHTML = items.map(item => {
                 const isFolder = item.type === 'folder';
-                const folderKey = String(item.id);
-                const encodedName = encodeURIComponent(item.name || '');
-                const mtimeVal = item.mtime || 0;
+                const icon = isFolder ? '📁' : (isAudioFilename(item.name) ? '🎵' : '☁️');
+                const metaJson = escapeAttr(JSON.stringify(item));
+                const dblClick = isFolder
+                    ? `selectRemoteNode('${escapeAttr(item.id)}')`
+                    : `openExplorerFile('remote', ${metaJson})`;
+
                 return `
-                <tr ${isFolder ? `ondblclick="selectRemoteNode('${folderKey}')"` : `ondblclick="openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}'), mtime: ${mtimeVal}})"`}
-                    class="hover:bg-slate-800/50 transition cursor-pointer">
-                    <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[240px] xl:max-w-[380px] 2xl:max-w-[520px]">
-                        <div class="flex items-center gap-1.5 truncate">
-                            <span class="shrink-0">${isFolder ? '📁' : '☁️'}</span>
-                            <span class="truncate" title="${item.rel_path}">${item.name}</span>
-                        </div>
-                    </td>
-                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
-                    <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${item.mtime_str}</td>
-                    <td class="py-2 px-2.5 text-right whitespace-nowrap">
-                        <div class="inline-flex items-center gap-1.5">
-                            ${!isFolder ? `<button onclick="event.stopPropagation(); openFileViewer('remote', {id: '${item.id}', name: decodeURIComponent('${encodedName}'), mtime: ${mtimeVal}})" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 text-indigo-300 text-[10px]" title="Abrir / Vista previa">👁️</button>` : ''}
-                            <span class="text-[10px] text-slate-500 font-mono">#${item.id}</span>
+                    <tr ondblclick="${dblClick}"
+                        oncontextmenu="openExplorerContextMenu(event, 'remote', ${metaJson})"
+                        class="hover:bg-slate-800/65 cursor-pointer transition">
+                        <td class="py-2 px-2.5 font-medium text-slate-200 max-w-[240px] truncate" title="${escapeAttr(item.name)}">
+                            <span class="mr-1.5">${icon}</span><span>${escapeAttr(item.name)}</span>
+                        </td>
+                        <td class="py-2 px-2.5 text-slate-400 whitespace-nowrap">${isFolder ? '-' : formatBytes(item.size)}</td>
+                        <td class="py-2 px-2.5 text-slate-400 font-mono text-[11px] whitespace-nowrap">${escapeAttr(item.mtime_str || '-')}</td>
+                        <td class="py-2 px-2.5 text-right whitespace-nowrap">
+                            <span class="text-[10px] font-mono text-slate-500 mr-1.5">#${escapeAttr(item.id)}</span>
                             ${getStatusBadge(item.sync_status)}
-                        </div>
-                    </td>
-                </tr>`;
+                        </td>
+                    </tr>`;
             }).join('');
         }
 
         // =========================================================================
-        // VISOR MULTIMEDIA Y PREVISUALIZACIÓN CON CARRUSEL DE ARCHIVOS DE CARPETA
+        // VISOR MULTIMEDIA Y PREVISUALIZACIÓN DE ARCHIVOS
         // =========================================================================
-        function closePreviewModal() {
-            const modal = document.getElementById('previewModal');
-            modal.classList.add('hidden');
-            modal.classList.remove('flex');
-            document.getElementById('previewBody').innerHTML = '';
-        }
-
-        function getCurrentFolderFiles(source) {
-            if (source === 'local') {
-                const node = localNodes.get(localSelectedPath);
-                return node ? (node.items || []).filter(i => i.type === 'file') : [];
-            } else {
-                const node = remoteNodes.get(remoteSelectedKey);
-                return node ? (node.items || []).filter(i => i.type === 'file') : [];
-            }
-        }
-
-        function updatePreviewNavControls() {
-            const prevBtn = document.getElementById('previewPrevBtn');
-            const nextBtn = document.getElementById('previewNextBtn');
-            const counterEl = document.getElementById('previewCounter');
-            const total = currentPreviewList.length;
-
-            if (total > 1 && currentPreviewIndex >= 0) {
-                counterEl.textContent = `(${currentPreviewIndex + 1} de ${total})`;
-                prevBtn.disabled = false;
-                nextBtn.disabled = false;
-            } else {
-                counterEl.textContent = total === 1 ? '(1 de 1)' : '';
-                prevBtn.disabled = true;
-                nextBtn.disabled = true;
-            }
-        }
-
-        function navigatePreview(delta) {
-            if (currentPreviewList.length <= 1 || currentPreviewIndex < 0) return;
-            const nextIdx = (currentPreviewIndex + delta + currentPreviewList.length) % currentPreviewList.length;
-            currentPreviewIndex = nextIdx;
-            openFileViewer(currentPreviewSource, currentPreviewList[nextIdx], true);
-        }
-
-        document.addEventListener('keydown', (e) => {
-            const coverModal = document.getElementById('coverLightboxModal');
-            if (coverModal && !coverModal.classList.contains('hidden')) {
-                if (e.key === 'Escape') {
-                    e.preventDefault();
-                    closeCoverLightbox();
-                }
-                return;
-            }
-            const modal = document.getElementById('previewModal');
-            if (modal.classList.contains('hidden')) return;
-            if (e.key === 'ArrowLeft') {
-                e.preventDefault();
-                navigatePreview(-1);
-            } else if (e.key === 'ArrowRight') {
-                e.preventDefault();
-                navigatePreview(1);
-            } else if (e.key === 'Escape') {
-                e.preventDefault();
-                closePreviewModal();
-            }
-        });
-
-        async function openFileViewer(source, fileMeta, fromCarousel = false) {
-            const name = fileMeta.name || 'archivo';
-            const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
-            const taskName = document.getElementById('taskSelector').value || '';
-
-            if (!fromCarousel) {
-                currentPreviewSource = source;
-                currentPreviewList = getCurrentFolderFiles(source);
-                currentPreviewIndex = currentPreviewList.findIndex(f =>
-                    source === 'local' ? f.rel_path === fileMeta.rel_path : String(f.id) === String(fileMeta.id)
-                );
-            }
-
-            // 3. Audio / MP3 -> Reproductor de música flotante minimizable y maximizable con tags ID3
-            if (AUDIO_EXTS.includes(ext)) {
+        function openExplorerFile(source, fileMeta) {
+            if (!fileMeta) return;
+            if (isAudioFilename(fileMeta.name)) {
                 openMusicDockPlayer(source, fileMeta, false);
                 return;
             }
+            const folderFiles = getCurrentFolderFiles(source);
+            currentPreviewSource = source;
+            currentPreviewList = folderFiles.length > 0 ? folderFiles : [fileMeta];
+            currentPreviewIndex = currentPreviewList.findIndex(f =>
+                source === 'local'
+                    ? (f.full_path && fileMeta.full_path ? f.full_path === fileMeta.full_path : f.rel_path === fileMeta.rel_path)
+                    : String(f.id) === String(fileMeta.id)
+            );
+            if (currentPreviewIndex < 0) currentPreviewIndex = 0;
+            renderPreviewItem(currentPreviewList[currentPreviewIndex]);
+        }
 
-            const mtimeParam = fileMeta.mtime ? `&mtime=${encodeURIComponent(fileMeta.mtime)}` : '';
-            const queryParams = source === 'local'
-                ? (fileMeta.full_path
-                    ? `source=local&full_path=${encodeURIComponent(fileMeta.full_path)}`
-                    : `source=local&task=${encodeURIComponent(taskName)}&rel_path=${encodeURIComponent(fileMeta.rel_path)}`)
-                : `source=remote&remote_id=${encodeURIComponent(fileMeta.id)}&name=${encodeURIComponent(name)}${mtimeParam}`;
+        function navigatePreview(delta) {
+            if (currentPreviewList.length <= 1) return;
+            currentPreviewIndex = (currentPreviewIndex + delta + currentPreviewList.length) % currentPreviewList.length;
+            renderPreviewItem(currentPreviewList[currentPreviewIndex]);
+        }
 
-            const streamUrl = `/api/file/stream?${queryParams}`;
-            const previewUrl = `/api/file/preview?${queryParams}`;
+        async function renderPreviewItem(fileMeta) {
+            if (!fileMeta) return;
+            const ext = (fileMeta.name || '').split('.').pop().toLowerCase();
+            const qParams = buildAudioQueryParams(currentPreviewSource, fileMeta);
+            const streamUrl = `/api/file/stream?${qParams}`;
 
-            // 1. PDF -> Descarga/actualiza en caché persistente (si es remoto) y abre en nueva ventana
             if (ext === 'pdf') {
                 window.open(streamUrl, '_blank', 'noopener');
                 return;
             }
 
             const modal = document.getElementById('previewModal');
-            const titleEl = document.getElementById('previewTitle');
-            const badge = document.getElementById('previewBadge');
             const body = document.getElementById('previewBody');
-            const openTabBtn = document.getElementById('previewOpenTabBtn');
+            document.getElementById('previewTitle').textContent = fileMeta.name || 'Archivo';
+            document.getElementById('previewBadge').textContent = ext.toUpperCase() || 'ARCHIVO';
+            document.getElementById('previewCounter').textContent = currentPreviewList.length > 1 ? `(${currentPreviewIndex + 1}/${currentPreviewList.length})` : '';
+            document.getElementById('previewOpenTabBtn').href = streamUrl;
+            document.getElementById('previewPrevBtn').disabled = currentPreviewList.length <= 1;
+            document.getElementById('previewNextBtn').disabled = currentPreviewList.length <= 1;
 
-            titleEl.textContent = name;
-            openTabBtn.href = streamUrl;
-            updatePreviewNavControls();
             modal.classList.remove('hidden');
             modal.classList.add('flex');
 
-            const nativeVideoExts = ['mp4', 'webm', 'ogg'];
-            const legacyVideoExts = ['avi', 'mkv', 'mov', 'wmv', 'flv'];
-            const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'];
-            const textExts = ['txt', 'log', 'json', 'py', 'md', 'csv', 'xml', 'html', 'htm', 'css', 'js', 'env', 'ini', 'yaml', 'yml', 'sql'];
-            const officeExts = ['docx', 'xlsx', 'pptx', 'odt', 'ods'];
+            const imgExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'];
+            const vidExts = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv'];
 
-            // 2A. Video compatible nativamente con navegador (.mp4, .webm, .ogg)
-            if (nativeVideoExts.includes(ext)) {
-                badge.textContent = 'Reproductor de Video';
-                body.innerHTML = `
-                    <div class="w-full flex flex-col items-center gap-3">
-                        <video id="activeVideoPlayer" controls autoplay class="w-full max-h-[70vh] rounded-xl bg-black shadow-lg">
-                            <source src="${streamUrl}">
-                        </video>
-                    </div>`;
+            if (imgExts.includes(ext)) {
+                body.innerHTML = `<img src="${streamUrl}" alt="${escapeAttr(fileMeta.name)}" class="max-h-[74vh] max-w-full object-contain rounded-xl shadow-lg">`;
                 return;
             }
 
-            // 2B. Video contenedor legado (.avi, .mkv, .mov) -> Intenta transcodificar si hay ffmpeg o abre directo en reproductor externo
-            if (legacyVideoExts.includes(ext)) {
-                badge.textContent = `Video (.${ext.toUpperCase()})`;
-                body.innerHTML = `
-                    <div class="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center space-y-4 shadow-xl">
-                        <div class="w-16 h-16 mx-auto rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-3xl">🎬</div>
-                        <div>
-                            <h4 class="text-sm font-bold text-white">${name}</h4>
-                            <p class="text-xs text-slate-400 mt-1.5 leading-relaxed">
-                                Los navegadores web no reproducen contenedores <span class="text-amber-300 font-semibold">.${ext.toUpperCase()}</span> directamente sin conversión.
-                            </p>
-                        </div>
-                        <div class="flex flex-wrap items-center justify-center gap-2.5 pt-1">
-                            <a href="${streamUrl}" target="_blank" rel="noopener" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white shadow-lg shadow-indigo-600/20 transition">
-                                Abrir en otra pestaña / Reproductor ↗
-                            </a>
-                            <button onclick="tryTranscodeVideo('${streamUrl}')" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 transition">
-                                Intentar convertir aquí (FFmpeg)
-                            </button>
-                        </div>
-                    </div>`;
+            if (vidExts.includes(ext)) {
+                const transcodeParam = ['avi', 'mkv', 'mov'].includes(ext) ? '&transcode=1' : '';
+                body.innerHTML = `<video src="${streamUrl}${transcodeParam}" controls autoplay class="max-h-[74vh] w-full rounded-xl bg-black"></video>`;
                 return;
             }
 
-            // 4. Imágenes
-            if (imageExts.includes(ext)) {
-                badge.textContent = 'Imagen';
-                body.innerHTML = `<img src="${streamUrl}" alt="${name}" class="max-w-full max-h-[72vh] rounded-xl object-contain shadow-lg">`;
-                return;
-            }
-
-            // 5. Texto y Ofimática
-            if (textExts.includes(ext) || officeExts.includes(ext)) {
-                badge.textContent = officeExts.includes(ext) ? 'Vista Previa Ofimática' : 'Vista Previa de Texto';
-                body.innerHTML = '<div class="text-xs text-slate-400 animate-pulse">Cargando vista previa del archivo...</div>';
-                try {
-                    const res = await fetch(previewUrl);
-                    const data = await res.json();
-                    if (data.error) {
-                        body.innerHTML = `<div class="text-xs text-rose-400">${data.error}</div>`;
-                        return;
-                    }
-                    if (data.kind === 'text') {
-                        const escaped = (data.content || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                        body.innerHTML = `<pre class="w-full h-[68vh] overflow-auto bg-slate-950 p-4 rounded-xl border border-slate-800 font-mono text-xs text-slate-200 whitespace-pre-wrap">${escaped}</pre>`;
-                    } else if (data.kind === 'office') {
-                        body.innerHTML = `<div class="w-full h-[68vh] overflow-auto bg-slate-950 p-5 rounded-xl border border-slate-800 text-slate-200">${data.html}</div>`;
-                    } else {
-                        body.innerHTML = `<div class="text-xs text-slate-400">No hay vista previa disponible. Usa "Abrir en Nueva Pestaña".</div>`;
-                    }
-                } catch (e) {
-                    body.innerHTML = '<div class="text-xs text-rose-400">Error cargando la vista previa.</div>';
+            body.innerHTML = '<div class="text-xs text-slate-400 animate-pulse">Generando vista previa...</div>';
+            try {
+                const res = await fetch(`/api/file/preview?${qParams}`);
+                const data = await res.json();
+                if (data.kind === 'text') {
+                    body.innerHTML = `<pre class="w-full max-h-[72vh] overflow-auto bg-slate-900 border border-slate-800 rounded-xl p-4 text-xs font-mono text-slate-200 whitespace-pre-wrap">${escapeAttr(data.content)}</pre>`;
+                } else if (data.kind === 'office') {
+                    body.innerHTML = `<div class="w-full max-h-[72vh] overflow-auto bg-slate-900 border border-slate-800 rounded-xl p-5 text-xs text-slate-200">${data.html}</div>`;
+                } else {
+                    body.innerHTML = `<div class="text-center space-y-3"><p class="text-xs text-slate-400">Vista previa directa no disponible para <strong>.${escapeAttr(ext)}</strong>.</p><a href="${streamUrl}" target="_blank" class="inline-block px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Descargar / Abrir archivo</a></div>`;
                 }
-                return;
+            } catch (e) {
+                body.innerHTML = '<div class="text-xs text-rose-400">Error cargando vista previa del archivo.</div>';
+            }
+        }
+
+        function closePreviewModal() {
+            const modal = document.getElementById('previewModal');
+            document.getElementById('previewBody').innerHTML = '';
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        // =========================================================================
+        // MENÚ CONTEXTUAL (ABRIR, PLAYLIST, SUBIR/DESCARGAR, RENOMBRAR, ELIMINAR)
+        // =========================================================================
+        function closeExplorerContextMenu() {
+            const menu = document.getElementById('explorerContextMenu');
+            if (menu) menu.classList.add('hidden');
+        }
+
+        document.addEventListener('click', closeExplorerContextMenu);
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeExplorerContextMenu();
+                closePreviewModal();
+                closeRenameModal();
+                closePropertiesModal();
+            }
+        });
+
+        function openExplorerContextMenu(event, source, itemMeta) {
+            event.preventDefault();
+            event.stopPropagation();
+            activeContextTarget = { source, item: itemMeta };
+
+            const menu = document.getElementById('explorerContextMenu');
+            const isFolder = itemMeta.type === 'folder';
+            const canQueueAudio = isFolder || isAudioFilename(itemMeta.name);
+            const itemsHtml = [];
+
+            itemsHtml.push(`<button onclick="ctxActionOpen()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 flex items-center gap-2.5"><span>📂</span><span>Abrir</span></button>`);
+
+            if (canQueueAudio) {
+                itemsHtml.push(`<button onclick="ctxActionAddToPlaylist()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 text-indigo-300 flex items-center gap-2.5"><span>🎵</span><span>Agregar a la lista de reproducción</span></button>`);
             }
 
-            // 6. Otros formatos -> Abrir en pestaña nueva
-            badge.textContent = 'Archivo';
-            body.innerHTML = `
-                <div class="text-center space-y-3">
-                    <p class="text-xs text-slate-300">Este tipo de archivo (<span class="font-mono text-indigo-300">.${ext || 'bin'}</span>) se abrirá o descargará en una nueva ventana.</p>
-                    <a href="${streamUrl}" target="_blank" rel="noopener" class="inline-block px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Abrir / Descargar Archivo ↗</a>
-                </div>`;
+            if (source === 'remote' && String(itemMeta.id) !== 'ROOT') {
+                itemsHtml.push(`<button onclick="ctxActionDownloadToLocal()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 text-sky-300 flex items-center gap-2.5"><span>⬇️</span><span>Descargar a carpeta local abierta</span></button>`);
+            }
+
+            if (source === 'local' && (itemMeta.rel_path !== '' || itemMeta.full_path)) {
+                itemsHtml.push(`<button onclick="ctxActionUploadToRemote()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 text-emerald-300 flex items-center gap-2.5"><span>⬆️</span><span>Cargar a carpeta remota abierta</span></button>`);
+            }
+
+            if ((source === 'local' && (itemMeta.rel_path !== '' || itemMeta.full_path)) || (source === 'remote' && String(itemMeta.id) !== 'ROOT')) {
+                itemsHtml.push(`<div class="my-1 border-t border-slate-800"></div>`);
+                itemsHtml.push(`<button onclick="ctxActionRename()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 flex items-center gap-2.5"><span>✏️</span><span>Cambiar de nombre</span></button>`);
+                itemsHtml.push(`<button onclick="ctxActionDelete()" class="w-full px-3.5 py-2 text-left hover:bg-rose-950/60 text-rose-400 flex items-center gap-2.5"><span>🗑️</span><span>Eliminar</span></button>`);
+            }
+
+            itemsHtml.push(`<div class="my-1 border-t border-slate-800"></div>`);
+            itemsHtml.push(`<button onclick="ctxActionProperties()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 text-slate-300 flex items-center gap-2.5"><span>ℹ️</span><span>Propiedades</span></button>`);
+
+            menu.innerHTML = itemsHtml.join('');
+            menu.classList.remove('hidden');
+
+            const x = Math.min(event.clientX, window.innerWidth - 250);
+            const y = Math.min(event.clientY, window.innerHeight - 280);
+            menu.style.left = `${Math.max(8, x)}px`;
+            menu.style.top = `${Math.max(8, y)}px`;
         }
 
-        function tryTranscodeVideo(streamUrl) {
-            const body = document.getElementById('previewBody');
-            const transcodeUrl = `${streamUrl}&transcode=1`;
-            body.innerHTML = `
-                <div class="w-full flex flex-col items-center gap-3">
-                    <div class="text-xs text-slate-400">Convirtiendo video para vista previa web (requiere FFmpeg instalado)...</div>
-                    <video controls autoplay onerror="this.parentElement.innerHTML='<p class=\\'text-xs text-amber-400\\'>FFmpeg no está instalado en el sistema. Usa el botón superior <b>Abrir en Nueva Pestaña ↗</b> para verlo en tu reproductor local.</p>'" class="w-full max-h-[68vh] rounded-xl bg-black shadow-lg">
-                        <source src="${transcodeUrl}" type="video/mp4">
-                    </video>
-                </div>`;
+        function ctxActionOpen() {
+            if (!activeContextTarget) return;
+            const { source, item } = activeContextTarget;
+            closeExplorerContextMenu();
+            if (item.type === 'folder') {
+                if (source === 'local') selectLocalFolder(item.rel_path || '');
+                else selectRemoteNode(String(item.id || remoteBaseRootId));
+            } else {
+                openExplorerFile(source, item);
+            }
         }
 
-        async function loadInitialConfig() {
-            const res = await fetch('/api/settings');
-            const data = await res.json();
-            currentConfig = data.config;
+        async function ctxActionAddToPlaylist() {
+            if (!activeContextTarget) return;
+            const { source, item } = activeContextTarget;
+            closeExplorerContextMenu();
 
-            const selector = document.getElementById('taskSelector');
-            const prevVal = selector.value;
-            selector.innerHTML = '<option value="">-- Selecciona una tarea --</option>';
-            (currentConfig.tasks || []).forEach(t => {
-                const opt = document.createElement('option');
-                opt.value = t.name;
-                opt.textContent = `${t.name} (${t.path})`;
-                selector.appendChild(opt);
+            const taskName = document.getElementById('taskSelector').value || '';
+            const payload = {
+                source,
+                type: item.type,
+                id: item.id,
+                full_path: item.full_path || '',
+                root_path: localActiveDriveRoot || '',
+                task: taskName,
+                rel_path: item.rel_path || ''
+            };
+
+            try {
+                const res = await fetch('/api/explorer/audio_collect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                const tracks = data.tracks || [];
+                if (tracks.length === 0) {
+                    showNotice('Sin archivos de audio', 'No se encontraron pistas de audio compatibles en la selección.');
+                    return;
+                }
+
+                const wasEmpty = musicPlaylist.length === 0 || musicSource !== source;
+                if (wasEmpty) {
+                    musicSource = source;
+                    musicPlaylist = tracks;
+                    rebuildMusicPlayOrder(0);
+                    setMusicDockMode(musicDockMode === 'minimized' ? 'normal' : (musicDockMode || 'normal'));
+                    await playDockTrackAtOrderPos(0);
+                } else {
+                    const startLen = musicPlaylist.length;
+                    tracks.forEach(t => {
+                        musicPlaylist.push(t);
+                        musicPlayOrder.push(musicPlaylist.length - 1);
+                    });
+                    document.getElementById('dockTrackCounter').textContent = `(${musicOrderPos + 1}/${musicPlayOrder.length})`;
+                    renderMusicPlaylist();
+                    prefetchNextRemoteTrack();
+                    showNotice('Lista actualizada', `Se agregaron ${tracks.length} pista(s) a la cola de reproducción.`);
+                }
+            } catch (e) {
+                showNotice('Error', 'No se pudieron recopilar los archivos multimedia de audio.');
+            }
+        }
+
+        async function ctxActionDownloadToLocal() {
+            if (!activeContextTarget) return;
+            const { item } = activeContextTarget;
+            closeExplorerContextMenu();
+
+            const taskName = document.getElementById('taskSelector').value || '';
+            const currentLocalNode = localNodes.get(localSelectedPath || '');
+            const payload = {
+                type: item.type,
+                id: item.id,
+                name: item.name,
+                mtime: item.mtime || 0,
+                dest_full_path: (currentLocalNode && currentLocalNode.full_path) || '',
+                dest_root_path: localActiveDriveRoot || '',
+                dest_task: taskName,
+                dest_rel_path: localSelectedPath || ''
+            };
+
+            try {
+                const res = await fetch('/api/explorer/download_to_local', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) {
+                    await fetchLocalNodeChildren(localSelectedPath || '');
+                    renderLocalTreePanel();
+                    renderLocalContentsPanel();
+                    showNotice('Descarga completada', `Se descargaron ${data.downloaded_files} archivo(s) hacia la carpeta local abierta.`);
+                } else {
+                    showNotice('Error de Descarga', data.error || 'No se pudo completar la descarga.');
+                }
+            } catch (e) {
+                showNotice('Error de Descarga', 'Fallo de comunicación al descargar desde FileJump.');
+            }
+        }
+
+        async function ctxActionUploadToRemote() {
+            if (!activeContextTarget) return;
+            const { item } = activeContextTarget;
+            closeExplorerContextMenu();
+
+            const taskName = document.getElementById('taskSelector').value || '';
+            const payload = {
+                full_path: item.full_path || '',
+                root_path: localActiveDriveRoot || '',
+                task: taskName,
+                rel_path: item.rel_path || '',
+                dest_remote_id: remoteSelectedKey || 'ROOT'
+            };
+
+            try {
+                const res = await fetch('/api/explorer/upload_to_remote', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) {
+                    await fetchRemoteNodeChildren(remoteSelectedKey || 'ROOT');
+                    renderRemoteTreePanel();
+                    renderRemoteContentsPanel();
+                    fetchUserStorageInfo();
+                    showNotice('Carga completada', `Se subieron ${data.uploaded_files} archivo(s) a FileJump.`);
+                } else {
+                    showNotice('Error de Carga', data.error || `Fallo al subir '${item.name}'`);
+                }
+            } catch (e) {
+                showNotice('Error de Carga', `Fallo al subir '${item.name}'`);
+            }
+        }
+
+        function ctxActionRename() {
+            if (!activeContextTarget) return;
+            renamePendingTarget = activeContextTarget;
+            closeExplorerContextMenu();
+            const modal = document.getElementById('renameItemModal');
+            const input = document.getElementById('renameNewNameInput');
+            input.value = renamePendingTarget.item.name || '';
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            setTimeout(() => { input.focus(); input.select(); }, 50);
+        }
+
+        function closeRenameModal() {
+            document.getElementById('renameItemModal').classList.add('hidden');
+            document.getElementById('renameItemModal').classList.remove('flex');
+        }
+
+        async function submitRenameModal() {
+            if (!renamePendingTarget) return;
+            const newName = document.getElementById('renameNewNameInput').value.trim();
+            if (!newName) return;
+            const { source, item } = renamePendingTarget;
+            closeRenameModal();
+
+            const taskName = document.getElementById('taskSelector').value || '';
+            const res = await fetch('/api/explorer/rename', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    source,
+                    type: item.type,
+                    id: item.id,
+                    full_path: item.full_path || '',
+                    root_path: localActiveDriveRoot || '',
+                    task: taskName,
+                    rel_path: item.rel_path || '',
+                    new_name: newName
+                })
             });
-
-            if (prevVal) selector.value = prevVal;
-            else if (currentConfig.tasks.length > 0) {
-                selector.value = currentConfig.tasks[0].name;
-                inspectSelectedTask();
+            const data = await res.json();
+            if (data.success) {
+                if (source === 'local') {
+                    await fetchLocalNodeChildren(localSelectedPath || '');
+                    renderLocalTreePanel();
+                    renderLocalContentsPanel();
+                } else {
+                    await fetchRemoteNodeChildren(remoteSelectedKey || 'ROOT');
+                    renderRemoteTreePanel();
+                    renderRemoteContentsPanel();
+                }
+            } else {
+                showNotice('Error al renombrar', data.error || 'No se pudo cambiar el nombre.');
             }
+        }
+
+        function ctxActionDelete() {
+            if (!activeContextTarget) return;
+            const target = activeContextTarget;
+            closeExplorerContextMenu();
+            showNotice(
+                'Confirmar Eliminación',
+                `¿Deseas eliminar definitivamente '${target.item.name}'? Esta acción no se puede deshacer.`,
+                async () => {
+                    const taskName = document.getElementById('taskSelector').value || '';
+                    const res = await fetch('/api/explorer/delete', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            source: target.source,
+                            type: target.item.type,
+                            id: target.item.id,
+                            full_path: target.item.full_path || '',
+                            root_path: localActiveDriveRoot || '',
+                            task: taskName,
+                            rel_path: target.item.rel_path || ''
+                        })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        if (target.source === 'local') {
+                            await fetchLocalNodeChildren(localSelectedPath || '');
+                            renderLocalTreePanel();
+                            renderLocalContentsPanel();
+                        } else {
+                            await fetchRemoteNodeChildren(remoteSelectedKey || 'ROOT');
+                            renderRemoteTreePanel();
+                            renderRemoteContentsPanel();
+                            fetchUserStorageInfo();
+                        }
+                    } else {
+                        showNotice('Error al eliminar', data.error || 'No se pudo eliminar el elemento.');
+                    }
+                }
+            );
+        }
+
+        async function ctxActionProperties() {
+            if (!activeContextTarget) return;
+            const { source, item } = activeContextTarget;
+            closeExplorerContextMenu();
+
+            const modal = document.getElementById('propertiesItemModal');
+            const body = document.getElementById('propertiesModalBody');
+            body.innerHTML = '<div class="text-slate-400 animate-pulse">Calculando propiedades...</div>';
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+
+            const taskName = document.getElementById('taskSelector').value || '';
+            try {
+                const res = await fetch('/api/explorer/properties', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        source,
+                        type: item.type,
+                        id: item.id,
+                        name: item.name,
+                        size: item.size || 0,
+                        mtime: item.mtime || 0,
+                        full_path: item.full_path || '',
+                        root_path: localActiveDriveRoot || '',
+                        task: taskName,
+                        rel_path: item.rel_path || ''
+                    })
+                });
+                const p = await res.json();
+                body.innerHTML = `
+                    <div class="flex justify-between gap-3"><span class="text-slate-400">Nombre:</span><span class="text-white font-semibold text-right break-all">${escapeAttr(p.name)}</span></div>
+                    <div class="flex justify-between gap-3"><span class="text-slate-400">Tipo:</span><span class="text-slate-200">${escapeAttr(p.type)}</span></div>
+                    <div class="flex justify-between gap-3"><span class="text-slate-400">Ubicación:</span><span class="text-slate-300 font-mono text-[11px] text-right break-all">${escapeAttr(p.location)}</span></div>
+                    <div class="flex justify-between gap-3"><span class="text-slate-400">Tamaño total:</span><span class="text-sky-300 font-mono">${formatBytes(p.size)}</span></div>
+                    <div class="flex justify-between gap-3"><span class="text-slate-400">Contenido:</span><span class="text-slate-200">${p.file_count} archivo(s), ${p.folder_count} carpeta(s)</span></div>
+                    <div class="flex justify-between gap-3"><span class="text-slate-400">Modificado:</span><span class="text-slate-200 font-mono">${escapeAttr(p.modified)}</span></div>
+                `;
+            } catch (e) {
+                body.innerHTML = '<div class="text-rose-400">No se pudieron obtener las propiedades.</div>';
+            }
+        }
+
+        function closePropertiesModal() {
+            document.getElementById('propertiesItemModal').classList.add('hidden');
+            document.getElementById('propertiesItemModal').classList.remove('flex');
+        }
+
+        // =========================================================================
+        // INSPECCIÓN DE TAREAS, SINCRONIZACIÓN Y CONFIGURACIÓN (.ENV + CACHÉ)
+        // =========================================================================
+        async function loadInitialConfig() {
+            try {
+                const res = await fetch('/api/settings');
+                const data = await res.json();
+                currentConfig = data.config || { tasks: [] };
+                const sel = document.getElementById('taskSelector');
+                const prev = sel.value;
+                sel.innerHTML = '<option value="">-- Selecciona o crea una tarea --</option>';
+                (currentConfig.tasks || []).forEach(t => {
+                    const opt = document.createElement('option');
+                    opt.value = t.name;
+                    opt.textContent = `${t.name} (${t.path})`;
+                    sel.appendChild(opt);
+                });
+                if (prev && Array.from(sel.options).some(o => o.value === prev)) {
+                    sel.value = prev;
+                }
+            } catch (e) {}
         }
 
         async function inspectSelectedTask(overrideRemoteId = '') {
             const taskName = document.getElementById('taskSelector').value;
-            const remoteSelector = document.getElementById('remoteDirSelector');
-            const effectiveRemoteOverride = overrideRemoteId || remoteSelector.value;
+            const remoteSelectorVal = overrideRemoteId || document.getElementById('remoteDirSelector').value || 'ROOT';
 
-            const localBody = document.getElementById('localTableBody');
-            const remoteBody = document.getElementById('remoteTableBody');
-
-            // Si no hay tarea local seleccionada, pero sí un directorio remoto elegido, explorar directo FileJump
             if (!taskName) {
-                if (!effectiveRemoteOverride) return;
-                remoteBody.innerHTML = '<tr><td colspan="4" class="py-10 text-center text-slate-400">Consultando nivel raíz en FileJump...</td></tr>';
-                try {
-                    const res = await fetch(`/api/remote/browse?remote_id=${encodeURIComponent(effectiveRemoteOverride)}`);
-                    const data = await res.json();
-                    if (data.error) {
-                        showNotice('Error', data.error);
-                        return;
-                    }
-                    document.getElementById('remotePathSubtitle').textContent = `ID Remoto: ${data.remote_root_id}`;
-                    initRemoteExplorer(data.remote_root_id, data.remote_items || []);
-                } catch (e) {
-                    showNotice('Error de Red', 'No se pudo consultar FileJump.');
+                document.getElementById('lastSyncLabel').textContent = '';
+                if (remoteSelectorVal) {
+                    try {
+                        const res = await fetch(`/api/remote/browse?remote_id=${encodeURIComponent(remoteSelectorVal)}`);
+                        const data = await res.json();
+                        const label = remoteSelectorVal === 'ROOT' ? '/ (Raíz de FileJump)' : `Carpeta #${remoteSelectorVal}`;
+                        initRemoteExplorer(data.remote_items || [], remoteSelectorVal, label);
+                    } catch (e) {}
                 }
                 return;
             }
 
-            localBody.innerHTML = '<tr><td colspan="4" class="py-10 text-center text-slate-400">Cargando carpeta local...</td></tr>';
-            remoteBody.innerHTML = '<tr><td colspan="4" class="py-10 text-center text-slate-400">Consultando carpeta en FileJump...</td></tr>';
-
             try {
-                const query = effectiveRemoteOverride ? `?remote_id=${encodeURIComponent(effectiveRemoteOverride)}` : '';
-                const res = await fetch(`/api/inspect/${encodeURIComponent(taskName)}${query}`);
+                const q = remoteSelectorVal ? `?remote_id=${encodeURIComponent(remoteSelectorVal)}` : '';
+                const res = await fetch(`/api/inspect/${encodeURIComponent(taskName)}${q}`);
                 const data = await res.json();
                 if (data.error) {
-                    showNotice('Error', data.error);
+                    showNotice('Aviso', data.error);
                     return;
                 }
 
-                document.getElementById('localPathSubtitle').textContent = data.task.path;
-                document.getElementById('remotePathSubtitle').textContent = `ID Remoto: ${data.remote_root_id || 'Aún no creada'}`;
-                document.getElementById('lastSyncLabel').textContent = data.last_sync ? `Última sync: ${new Date(data.last_sync).toLocaleString()}` : 'Nunca sincronizado';
+                document.getElementById('lastSyncLabel').textContent = data.last_sync
+                    ? `Última sync: ${new Date(data.last_sync).toLocaleString()}`
+                    : 'Sin sincronizaciones previas';
 
-                // Sincronizar el selector remoto con el ID detectado si existe en la lista
-                if (data.remote_root_id && Array.from(remoteSelector.options).some(o => String(o.value) === String(data.remote_root_id))) {
-                    remoteSelector.value = String(data.remote_root_id);
-                }
-
-                if (!data.local_exists) {
-                    localNodes.clear();
-                    document.getElementById('localFolderTree').innerHTML = '<div class="px-2 py-4 text-rose-400 text-[11px]">Ruta no encontrada</div>';
-                    localBody.innerHTML = '<tr><td colspan="4" class="py-10 text-center text-rose-400">La carpeta local no existe en el disco</td></tr>';
-                } else {
+                if (!localActiveDriveRoot) {
+                    document.getElementById('localPathSubtitle').textContent = data.task.path;
                     initLocalExplorer(data.local_items || []);
                 }
 
-                initRemoteExplorer(data.remote_root_id || 'ROOT', data.remote_items || []);
+                const rId = data.remote_root_id || remoteSelectorVal || 'ROOT';
+                const rLabel = String(rId) === 'ROOT' ? '/ (Raíz de FileJump)' : `${data.task.name} (#${rId})`;
+                initRemoteExplorer(data.remote_items || [], rId, rLabel);
             } catch (e) {
-                showNotice('Error de Red', 'No se pudo completar la inspección.');
+                showNotice('Error', 'No se pudo inspeccionar la tarea seleccionada.');
             }
         }
 
         async function triggerSync(force = false) {
             const taskName = document.getElementById('taskSelector').value;
             if (!taskName) {
-                showNotice('Selecciona una Tarea', 'Por favor selecciona primero una carpeta/tarea para sincronizar.');
+                showNotice('Selecciona una tarea', 'Elige primero una tarea activa antes de sincronizar.');
                 return;
             }
-
             const btn = document.getElementById('syncBtn');
             btn.disabled = true;
-            btn.classList.add('opacity-50');
-
+            btn.classList.add('opacity-60');
             try {
                 const res = await fetch(`/api/sync/${encodeURIComponent(taskName)}`, {
                     method: 'POST',
@@ -4002,103 +4658,75 @@ HTML_TEMPLATE = r"""
                     body: JSON.stringify({ force })
                 });
                 const data = await res.json();
-                await refreshStatusAndLogs();
-
                 if (data.requires_confirmation) {
-                    showNotice('Umbral de Seguridad Superado', data.message, () => triggerSync(true));
-                } else if (data.error) {
-                    showNotice('Error de Sincronización', data.error);
-                } else {
-                    await fetchUserStorageInfo();
+                    showNotice('Confirmación de Seguridad', data.message, () => triggerSync(true));
+                } else if (data.success) {
                     await inspectSelectedTask();
+                    fetchUserStorageInfo();
+                    showNotice('Sincronización Completa', `Se subieron ${data.uploaded} de ${data.total} archivo(s) pendientes.`);
+                } else {
+                    showNotice('Error de Sincronización', data.error || 'Ocurrió un problema durante la sincronización.');
                 }
             } catch (e) {
-                showNotice('Error', 'Fallo comunicándose con el servidor local.');
+                showNotice('Error de Red', 'No se pudo comunicar con el servidor local.');
             } finally {
                 btn.disabled = false;
-                btn.classList.remove('opacity-50');
+                btn.classList.remove('opacity-60');
             }
         }
 
-        async function openSettingsModal() {
-            const res = await fetch('/api/settings');
-            const data = await res.json();
-            currentConfig = data.config;
-
-            document.getElementById('envApiKey').value = '';
-            document.getElementById('envBaseUrl').value = data.env.FILEJUMP_BASE_URL;
-            document.getElementById('envUploadUrl').value = data.env.FILEJUMP_UPLOAD_URL;
-            document.getElementById('cfgWorkers').value = currentConfig.max_workers || 4;
-            document.getElementById('cfgThreshold').value = currentConfig.min_impact_percentage || 40;
-            document.getElementById('cfgHighSpeed').checked = currentConfig.use_high_speed_upload !== false;
-
-            const container = document.getElementById('tasksListContainer');
-            container.innerHTML = '';
-            (currentConfig.tasks || []).forEach(t => addTaskRow(t.name, t.path));
-
-            refreshCacheUsageSummary();
-
-            document.getElementById('settingsModal').classList.remove('hidden');
-            document.getElementById('settingsModal').classList.add('flex');
-        }
-
-        async function refreshCacheUsageSummary() {
-            const summaryEl = document.getElementById('cacheUsageSummary');
-            if (!summaryEl) return;
+        async function refreshCacheUsageDisplay() {
+            const label = document.getElementById('cacheUsageSummary');
+            if (!label) return;
             try {
                 const res = await fetch('/api/cache/clear');
                 const data = await res.json();
-                summaryEl.textContent = `${data.file_count || 0} archivo(s) almacenados (${formatBytes(data.total_bytes || 0)}) • Eliminación permanente sin papelera.`;
+                label.textContent = `${data.file_count || 0} archivo(s) en caché • ${formatBytes(data.total_bytes || 0)} ocupados en disco`;
             } catch (e) {
-                summaryEl.textContent = 'No se pudo calcular el tamaño de la caché.';
+                label.textContent = 'No se pudo calcular el tamaño de la caché.';
             }
         }
 
         function confirmAndClearLocalCache() {
-            const titleEl = document.getElementById('noticeTitle');
-            const msgEl = document.getElementById('noticeMessage');
-            const actions = document.getElementById('noticeActions');
-
-            titleEl.textContent = 'Eliminar Caché Local Definitivamente';
-            msgEl.textContent = 'Se eliminarán permanentemente todos los archivos descargados en temp_cache sin pasar por la Papelera de Reciclaje. ¿Deseas continuar?';
-            actions.innerHTML = '';
-
-            const cancelBtn = document.createElement('button');
-            cancelBtn.className = 'px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300';
-            cancelBtn.textContent = 'Cancelar';
-            cancelBtn.onclick = () => {
-                document.getElementById('noticeModal').classList.add('hidden');
-                document.getElementById('noticeModal').classList.remove('flex');
-            };
-            actions.appendChild(cancelBtn);
-
-            const delBtn = document.createElement('button');
-            delBtn.className = 'px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-white';
-            delBtn.textContent = 'Sí, Eliminar Definitivamente';
-            delBtn.onclick = async () => {
-                cancelBtn.click();
-                const btn = document.getElementById('clearCacheBtn');
-                if (btn) btn.disabled = true;
-                try {
+            showNotice(
+                'Eliminar Caché Definitivamente',
+                'Se eliminarán permanentemente todos los archivos almacenados en temp_cache sin pasar por la Papelera de Reciclaje. ¿Continuar?',
+                async () => {
                     const res = await fetch('/api/cache/clear', { method: 'POST' });
                     const data = await res.json();
-                    prefetchedRemoteIds.clear();
-                    if (musicSource === 'remote' && musicPlaylist.length > 0) {
-                        renderMusicPlaylist();
+                    if (data.success) {
+                        prefetchedRemoteIds.clear();
+                        if (musicSource === 'remote' && musicPlaylist.length > 0) {
+                            renderMusicPlaylist();
+                        }
+                        await refreshCacheUsageDisplay();
+                        showNotice('Caché Eliminada', `Se borraron definitivamente ${data.deleted_count} archivo(s) (${formatBytes(data.freed_bytes)} liberados).`);
                     }
-                    await refreshCacheUsageSummary();
-                    await refreshStatusAndLogs();
-                    showNotice('Caché Eliminada', `Se eliminaron definitivamente ${data.deleted_count || 0} archivo(s) (${formatBytes(data.freed_bytes || 0)} liberados) sin pasar por la papelera.`);
-                } catch (e) {
-                    showNotice('Error', 'No se pudo limpiar la caché local.');
-                } finally {
-                    if (btn) btn.disabled = false;
                 }
-            };
-            actions.appendChild(delBtn);
+            );
+        }
 
-            document.getElementById('noticeModal').classList.remove('hidden');
-            document.getElementById('noticeModal').classList.add('flex');
+        async function openSettingsModal() {
+            const modal = document.getElementById('settingsModal');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            refreshCacheUsageDisplay();
+
+            try {
+                const res = await fetch('/api/settings');
+                const data = await res.json();
+                currentConfig = data.config || { tasks: [] };
+                document.getElementById('envApiKey').value = '';
+                document.getElementById('envBaseUrl').value = data.env.FILEJUMP_BASE_URL || 'https://filejump.com/api';
+                document.getElementById('envUploadUrl').value = data.env.FILEJUMP_UPLOAD_URL || 'https://uploads.filejump.com/api/upload';
+                document.getElementById('cfgWorkers').value = currentConfig.max_workers || 4;
+                document.getElementById('cfgThreshold').value = currentConfig.min_impact_percentage || 40;
+                document.getElementById('cfgHighSpeed').checked = currentConfig.use_high_speed_upload !== false;
+
+                const container = document.getElementById('tasksListContainer');
+                container.innerHTML = '';
+                (currentConfig.tasks || []).forEach(t => addTaskRow(t.name, t.path, t.min_impact_percentage));
+            } catch (e) {}
         }
 
         function closeSettingsModal() {
@@ -4106,24 +4734,28 @@ HTML_TEMPLATE = r"""
             document.getElementById('settingsModal').classList.remove('flex');
         }
 
-        function addTaskRow(name = '', path = '') {
+        function addTaskRow(name = '', path = '', threshold = 40) {
             const container = document.getElementById('tasksListContainer');
             const row = document.createElement('div');
-            row.className = 'grid grid-cols-1 sm:grid-cols-12 gap-2 items-center bg-slate-950 p-2.5 rounded-xl border border-slate-800 task-row';
+            row.className = 'task-row grid grid-cols-1 sm:grid-cols-12 gap-2 bg-slate-950 p-2.5 rounded-xl border border-slate-800 items-center';
             row.innerHTML = `
-                <input type="text" placeholder="Nombre Tarea (ej. Respaldo)" value="${name}" class="sm:col-span-4 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white task-name">
-                <input type="text" placeholder="Ruta Local (ej. C:/MisDocumentos)" value="${path}" class="sm:col-span-7 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white task-path">
-                <button onclick="this.parentElement.remove()" class="sm:col-span-1 text-rose-400 hover:text-rose-300 text-center font-bold text-sm" title="Eliminar">&times;</button>
+                <input type="text" placeholder="Nombre tarea" value="${escapeAttr(name)}" class="task-name sm:col-span-3 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white">
+                <input type="text" placeholder="Ruta local (ej. C:\\MisArchivos)" value="${escapeAttr(path)}" class="task-path sm:col-span-6 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200">
+                <input type="number" min="1" max="100" value="${threshold}" title="Umbral %" class="task-threshold sm:col-span-2 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white">
+                <button type="button" onclick="this.parentElement.remove()" class="sm:col-span-1 text-rose-400 hover:text-rose-300 text-sm font-bold text-center" title="Quitar">✕</button>
             `;
             container.appendChild(row);
         }
 
         async function saveSettings() {
             const tasks = [];
-            document.querySelectorAll('.task-row').forEach(row => {
+            document.querySelectorAll('#tasksListContainer .task-row').forEach(row => {
                 const name = row.querySelector('.task-name').value.trim();
                 const path = row.querySelector('.task-path').value.trim();
-                if (name && path) tasks.push({ name, path });
+                const min_impact_percentage = Number(row.querySelector('.task-threshold').value || 40);
+                if (name && path) {
+                    tasks.push({ name, path, min_impact_percentage });
+                }
             });
 
             const payload = {
@@ -4133,8 +4765,8 @@ HTML_TEMPLATE = r"""
                     FILEJUMP_UPLOAD_URL: document.getElementById('envUploadUrl').value.trim()
                 },
                 config: {
-                    max_workers: parseInt(document.getElementById('cfgWorkers').value) || 4,
-                    min_impact_percentage: parseInt(document.getElementById('cfgThreshold').value) || 40,
+                    max_workers: Number(document.getElementById('cfgWorkers').value || 4),
+                    min_impact_percentage: Number(document.getElementById('cfgThreshold').value || 40),
                     use_high_speed_upload: document.getElementById('cfgHighSpeed').checked,
                     tasks
                 }
@@ -4146,11 +4778,10 @@ HTML_TEMPLATE = r"""
                 body: JSON.stringify(payload)
             });
 
-            prefetchedRemoteIds.clear();
             closeSettingsModal();
-            wasConnected = false; // Forzar recarga de directorios remotos si cambió el token
-            await refreshStatusAndLogs();
             await loadInitialConfig();
+            wasConnected = false;
+            refreshStatusAndLogs();
         }
 
         // Inicialización
@@ -4165,5 +4796,9 @@ HTML_TEMPLATE = r"""
 """
 
 if __name__ == "__main__":
-    log_event("info", "Iniciando FileJump Sync Studio en http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    host = "127.0.0.1"
+    port = 5000
+    url = f"http://{host}:{port}"
+    log_event("info", f"Iniciando FileJump Sync Studio en {url}")
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    app.run(host=host, port=port, debug=False)
