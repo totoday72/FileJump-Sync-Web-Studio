@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="es" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FileJump Sync Studio</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen lg:h-screen lg:overflow-hidden flex flex-col">
+
+    <!-- Barra Superior -->
+    <header class="bg-slate-900 border-b border-slate-800 px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0 z-30">
+        <div class="flex items-center gap-3 shrink-0">
+            <div class="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                </svg>
+            </div>
+            <div>
+                <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">FileJump Sync Studio</h1>
+                <p class="text-xs text-slate-400">Comparador & Sincronizador Web Dual</p>
+            </div>
+        </div>
+
+        <!-- Información de Usuario y Barra de Almacenamiento FileJump -->
+        <div id="userStorageWidget" class="hidden flex-1 max-w-2xl mx-2 bg-slate-950/90 border border-slate-800/90 rounded-xl px-3.5 py-2 flex flex-col justify-center gap-1.5 shadow-inner">
+            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div class="flex items-center gap-2 min-w-0">
+                    <div id="headerUserAvatarWrap" class="w-6 h-6 rounded-full bg-indigo-600/25 border border-indigo-500/40 text-indigo-300 flex items-center justify-center text-[11px] overflow-hidden shrink-0">👤</div>
+                    <div class="min-w-0 flex items-center gap-1.5">
+                        <span id="headerUserName" class="font-semibold text-white truncate">Usuario</span>
+                        <span id="headerUserEmail" class="hidden sm:inline text-[11px] text-slate-400 truncate"></span>
+                    </div>
+                    <button onclick="openAccountQuotaModal()" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 border border-slate-700 text-[10px] text-slate-300 hover:text-indigo-200 transition shrink-0" title="Ver perfil de cuenta FileJump">✏️</button>
+                </div>
+                <div class="flex items-center gap-2 sm:gap-3 text-[11px] font-mono shrink-0">
+                    <span class="text-sky-300" title="Espacio ocupado">Ocupado: <strong id="headerStorageUsed">0 B</strong></span>
+                    <span class="text-slate-600">|</span>
+                    <span class="text-emerald-300" title="Espacio disponible">Libre: <strong id="headerStorageFree">-</strong></span>
+                    <span class="text-slate-600">|</span>
+                    <span class="text-slate-300" title="Capacidad total">Total: <strong id="headerStorageTotal">-</strong></span>
+                </div>
+            </div>
+            <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden flex items-center">
+                <div id="headerStorageBar" class="h-full bg-gradient-to-r from-sky-500 via-indigo-500 to-purple-500 rounded-full transition-all duration-500" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <div class="flex items-center gap-3 shrink-0">
+            <!-- Estado de Conexión API -->
+            <div id="apiStatusBadge" class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-800 border border-slate-700 text-slate-300">
+                <span id="apiStatusDot" class="w-2 h-2 rounded-full bg-amber-400"></span>
+                <span id="apiStatusText">Verificando API...</span>
+            </div>
+
+            <button onclick="openSettingsModal()" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs sm:text-sm font-medium flex items-center gap-2 transition">
+                <svg class="w-4 h-4 text-slate-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                </svg>
+                <span>Configuración & .env</span>
+            </button>
+
+            <button onclick="shutdownApplication()" class="px-3.5 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600 border border-rose-500/40 text-xs sm:text-sm font-semibold text-rose-200 hover:text-white flex items-center gap-1.5 transition" title="Cerrar explorador, servidor Python y consola">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                </svg>
+                <span>Cerrar</span>
+            </button>
+        </div>
+    </header>
+
+    <!-- Barra de Control de Tareas -->
+    <section class="w-full px-3 sm:px-5 pt-3 pb-2 shrink-0">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl px-4 py-3 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm">
+            <div class="flex flex-col sm:flex-row sm:items-center gap-3 flex-1">
+                <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Tarea Activa:</label>
+                <select id="taskSelector" onchange="inspectSelectedTask()" class="bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 min-w-[220px]">
+                    <option value="">-- Selecciona o crea una tarea --</option>
+                </select>
+                <span id="lastSyncLabel" class="text-xs text-slate-400"></span>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2.5">
+                <button onclick="inspectSelectedTask()" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs sm:text-sm font-medium text-slate-200 transition flex items-center gap-1.5">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                    Comparar Ahora
+                </button>
+                <button id="syncBtn" onclick="triggerSync(false)" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs sm:text-sm font-semibold text-white shadow-lg shadow-indigo-600/20 transition flex items-center gap-1.5">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+                    Sincronizar a FileJump
+                </button>
+            </div>
+        </div>
+
+        <!-- Leyenda de Estados -->
+        <div class="flex flex-wrap items-center gap-4 mt-2 px-1 text-xs text-slate-400">
+            <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500"></span> Sincronizado</span>
+            <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-sky-500"></span> Nuevo (Pendiente subir)</span>
+            <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-amber-500"></span> Modificado (Tamaño/Fecha distinta)</span>
+            <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-purple-500"></span> Solo en FileJump</span>
+        </div>
+    </section>
+
+    <!-- DOBLE VENTANA DE COMPARACIÓN (100% ANCHO Y ALTO RESPONSIVO) -->
+    <main class="w-full px-3 sm:px-5 py-1.5 flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+        <!-- VENTANA 1: EXPLORADOR LOCAL ESTILO WINDOWS -->
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col overflow-hidden shadow-md h-[460px] lg:h-full min-h-0">
+            <div class="px-3.5 py-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+                <div class="flex items-center gap-2 min-w-0 flex-1">
+                    <span class="p-1.5 rounded-lg bg-slate-800 text-sky-400 shrink-0">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
+                    </span>
+                    <div class="min-w-0 flex-1">
+                        <div class="flex items-center gap-2">
+                            <h2 class="text-sm font-semibold text-white shrink-0">Equipo Local</h2>
+                            <select id="localDriveSelector" onchange="onLocalDriveChange()" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-0.5 text-[11px] text-sky-300 focus:outline-none focus:border-sky-500 max-w-[180px] truncate">
+                                <option value="">Auto (Carpeta de Tarea)</option>
+                            </select>
+                            <button onclick="fetchLocalDrives(true)" class="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition shrink-0" title="Actualizar unidades locales">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                            </button>
+                        </div>
+                        <p id="localPathSubtitle" class="text-[11px] text-slate-400 truncate">Sin ruta seleccionada</p>
+                    </div>
+                </div>
+                <span id="localCountBadge" class="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 font-medium shrink-0">0 elementos</span>
+            </div>
+
+            <!-- Barra de Navegación Rápida Local (Breadcrumbs) -->
+            <div id="localBreadcrumbBar" class="px-3 py-1.5 bg-slate-950/90 border-b border-slate-800/80 flex items-center gap-1.5 text-[11px] text-slate-400 overflow-x-auto shrink-0">
+                <button onclick="selectLocalFolder('')" class="hover:text-sky-400 font-medium flex items-center gap-1 shrink-0">
+                    <span>🏠 Raíz</span>
+                </button>
+            </div>
+
+            <!-- Cuerpo Dividido estilo Explorador de Windows: Árbol de Carpetas (Izq) + Contenido (Der) -->
+            <div class="flex flex-1 min-h-0 overflow-hidden">
+                <!-- Panel Izquierdo: Árbol Jerárquico de Carpetas (Lazy Load con +) -->
+                <div class="w-44 sm:w-52 xl:w-64 bg-slate-950/60 border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
+                    <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500 px-2 py-1">Carpetas</div>
+                    <div id="localFolderTree" class="space-y-0.5 text-xs">
+                        <div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>
+                    </div>
+                </div>
+
+                <!-- Panel Derecho: Archivos y Subcarpetas de la Carpeta Seleccionada -->
+                <div class="flex-1 overflow-auto min-w-0">
+                    <table class="w-full text-left border-collapse text-xs select-none">
+                        <thead class="bg-slate-950/70 text-slate-400 sticky top-0 z-10">
+                            <tr>
+                                <th onclick="toggleExplorerSort('local', 'name')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Nombre</span><span id="sortIcon_local_name" class="text-sky-400 font-bold text-[11px]">↑</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('local', 'size')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Tamaño</span><span id="sortIcon_local_size" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('local', 'mtime')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Modificado</span><span id="sortIcon_local_mtime" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('local', 'status')" class="py-2 px-2.5 font-medium text-right cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center justify-end gap-1.5"><span>Estado</span><span id="sortIcon_local_status" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                            </tr>
+                        </thead>
+                        <tbody id="localTableBody" class="divide-y divide-slate-800/60">
+                            <tr><td colspan="4" class="py-12 text-center text-slate-500">Selecciona una tarea para inspeccionar archivos locales</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- VENTANA 2: EXPLORADOR REMOTO (FILEJUMP) ESTILO WINDOWS -->
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col overflow-hidden shadow-md h-[460px] lg:h-full min-h-0">
+            <div class="px-3.5 py-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+                <div class="flex items-center gap-2 min-w-0 flex-1">
+                    <span class="p-1.5 rounded-lg bg-indigo-950 text-indigo-400 shrink-0">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"/></svg>
+                    </span>
+                    <div class="min-w-0 flex-1">
+                        <div class="flex items-center gap-2">
+                            <h2 class="text-sm font-semibold text-white shrink-0">Nube FileJump</h2>
+                            <select id="remoteDirSelector" onchange="onRemoteDirectoryChange()" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-0.5 text-[11px] text-indigo-300 focus:outline-none focus:border-indigo-500 max-w-[180px] truncate">
+                                <option value="ROOT" selected>/ (Raíz de FileJump)</option>
+                                <option value="">Auto (Carpeta de Tarea)</option>
+                            </select>
+                            <button onclick="fetchRemoteDirectories(true)" class="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition shrink-0" title="Actualizar directorios remotos">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                            </button>
+                        </div>
+                        <p id="remotePathSubtitle" class="text-[11px] text-slate-400 truncate">ID Carpeta Raíz: -</p>
+                    </div>
+                </div>
+                <span id="remoteCountBadge" class="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 font-medium shrink-0">0 elementos</span>
+            </div>
+
+            <!-- Barra de Navegación Rápida Remota (Breadcrumbs) -->
+            <div id="remoteBreadcrumbBar" class="px-3 py-1.5 bg-slate-950/90 border-b border-slate-800/80 flex items-center gap-1.5 text-[11px] text-slate-400 overflow-x-auto shrink-0">
+                <button onclick="selectRemoteNode('ROOT')" class="hover:text-indigo-400 font-medium flex items-center gap-1 shrink-0">
+                    <span>☁️ Raíz</span>
+                </button>
+            </div>
+
+            <!-- Cuerpo Dividido estilo Explorador de Windows: Árbol Jerárquico Remoto (Izq) + Contenido (Der) -->
+            <div class="flex flex-1 min-h-0 overflow-hidden">
+                <!-- Panel Izquierdo: Árbol Jerárquico Remoto (Lazy Load con +) -->
+                <div class="w-44 sm:w-52 xl:w-64 bg-slate-950/60 border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
+                    <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500 px-2 py-1">Carpetas Nube</div>
+                    <div id="remoteFolderTree" class="space-y-0.5 text-xs">
+                        <div class="px-2 py-4 text-slate-500 text-[11px]">Sin carpetas</div>
+                    </div>
+                </div>
+
+                <!-- Panel Derecho: Archivos y Subcarpetas de la Carpeta Seleccionada -->
+                <div class="flex-1 overflow-auto min-w-0">
+                    <table class="w-full text-left border-collapse text-xs select-none">
+                        <thead class="bg-slate-950/70 text-slate-400 sticky top-0 z-10">
+                            <tr>
+                                <th onclick="toggleExplorerSort('remote', 'name')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Nombre</span><span id="sortIcon_remote_name" class="text-indigo-400 font-bold text-[11px]">↑</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('remote', 'size')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Tamaño</span><span id="sortIcon_remote_size" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('remote', 'mtime')" class="py-2 px-2.5 font-medium cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center gap-1.5"><span>Actualizado</span><span id="sortIcon_remote_mtime" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                                <th onclick="toggleExplorerSort('remote', 'status')" class="py-2 px-2.5 font-medium text-right cursor-pointer hover:text-white hover:bg-slate-800/60 transition">
+                                    <div class="inline-flex items-center justify-end gap-1.5"><span>ID / Estado</span><span id="sortIcon_remote_status" class="text-slate-500 text-[11px]">⇅</span></div>
+                                </th>
+                            </tr>
+                        </thead>
+                        <tbody id="remoteTableBody" class="divide-y divide-slate-800/60">
+                            <tr><td colspan="4" class="py-12 text-center text-slate-500">Selecciona una tarea para consultar FileJump</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- CONSOLA DE ACTIVIDAD EN TIEMPO REAL -->
+    <section class="w-full px-3 sm:px-5 pt-2 pb-3 shrink-0">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3">
+            <div class="flex items-center justify-between mb-1.5">
+                <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Registro de Actividad en Vivo</h3>
+                <span class="text-[11px] text-slate-500">Caché Persistente Inteligente Activa</span>
+            </div>
+            <div id="logConsole" class="bg-slate-950 rounded-xl p-2.5 h-24 overflow-y-auto font-mono text-xs space-y-1 text-slate-300 border border-slate-800/80">
+                <div class="text-slate-500">Esperando acciones...</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- MODAL DE CONFIGURACIÓN (.env + TAREAS) -->
+    <div id="settingsModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full max-h-[90vh] flex flex-col shadow-2xl">
+            <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
+                <h2 class="text-base font-bold text-white">Configuración del Sistema y Credenciales (.env)</h2>
+                <button onclick="closeSettingsModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+
+            <div class="p-6 overflow-y-auto space-y-6 text-sm">
+                <!-- Sección Credenciales .env -->
+                <div class="space-y-3 bg-slate-950/60 p-4 rounded-xl border border-slate-800">
+                    <h3 class="text-xs font-semibold uppercase tracking-wider text-indigo-400">Seguridad API (.env)</h3>
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">Bearer Token de FileJump (si se cambia, se limpia la caché automáticamente)</label>
+                        <input type="password" id="envApiKey" placeholder="Dejar vacío para mantener el token actual..." class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:border-indigo-500 focus:outline-none">
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-xs text-slate-400 mb-1">REST API Base URL</label>
+                            <input type="text" id="envBaseUrl" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200">
+                        </div>
+                        <div>
+                            <label class="block text-xs text-slate-400 mb-1">High-Speed Upload URL</label>
+                            <input type="text" id="envUploadUrl" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Parámetros Globales -->
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">Hilos Simultáneos</label>
+                        <input type="number" id="cfgWorkers" min="1" max="15" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">Umbral Impacto (%)</label>
+                        <input type="number" id="cfgThreshold" min="1" max="100" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+                    </div>
+                    <div class="flex items-center pt-5">
+                        <label class="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
+                            <input type="checkbox" id="cfgHighSpeed" class="rounded bg-slate-950 border border-slate-700 text-indigo-600">
+                            <span>Subida Directa Alta Velocidad</span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Gestión de Caché Local Persistente -->
+                <div class="bg-slate-950/60 p-4 rounded-xl border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div class="space-y-0.5">
+                        <h3 class="text-xs font-semibold uppercase tracking-wider text-rose-400">Almacenamiento Caché Local (temp_cache)</h3>
+                        <p id="cacheUsageSummary" class="text-xs text-slate-400">Calculando espacio ocupado en disco...</p>
+                    </div>
+                    <button type="button" onclick="confirmAndClearLocalCache()" id="clearCacheBtn" class="px-3.5 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/35 border border-rose-500/40 text-xs font-semibold text-rose-300 transition flex items-center gap-1.5 shrink-0">
+                        <span>🗑️</span>
+                        <span>Eliminar Caché Definitivamente</span>
+                    </button>
+                </div>
+
+                <!-- Gestión de Carpetas / Tareas -->
+                <div class="space-y-3">
+                    <div class="flex items-center justify-between">
+                        <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Carpetas a Sincronizar</h3>
+                        <button onclick="addTaskRow()" class="text-xs px-2.5 py-1 rounded-lg bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600/30 border border-indigo-500/30">+ Añadir Carpeta</button>
+                    </div>
+                    <div id="tasksListContainer" class="space-y-2.5"></div>
+                </div>
+            </div>
+
+            <div class="px-6 py-4 border-t border-slate-800 flex justify-end gap-3">
+                <button onclick="closeSettingsModal()" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300">Cancelar</button>
+                <button onclick="saveSettings()" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar Cambios</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL DE NOMBRE DE USUARIO Y RESUMEN DE ALMACENAMIENTO (SOLO LECTURA) -->
+    <div id="accountQuotaModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div class="flex items-center justify-between">
+                <h3 class="text-base font-bold text-white">Perfil de Cuenta FileJump</h3>
+                <button onclick="closeAccountQuotaModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="space-y-3 text-xs">
+                <div class="flex items-center gap-3 bg-slate-950/80 border border-slate-800 rounded-xl p-3">
+                    <div id="modalUserAvatarWrap" class="w-11 h-11 rounded-full bg-indigo-600/25 border border-indigo-500/40 text-indigo-300 flex items-center justify-center text-lg overflow-hidden shrink-0">👤</div>
+                    <div class="min-w-0 flex-1">
+                        <div id="readonlyModalAccountName" class="text-sm font-bold text-white truncate">Usuario</div>
+                        <div id="readonlyModalAccountEmail" class="text-[11px] text-slate-400 truncate">-</div>
+                        <span id="readonlyModalAccountPlan" class="inline-block mt-1 text-[10px] px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/25">Cuenta Activa</span>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-slate-400 mb-1">Alias Local Visible en la App (Opcional)</label>
+                    <input type="text" id="quotaUserNameInput" placeholder="Dejar vacío para usar el nombre de la cuenta..." class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white focus:border-indigo-500 focus:outline-none">
+                </div>
+                <div class="bg-slate-950/80 border border-slate-800 rounded-xl p-3 space-y-1.5">
+                    <div class="flex items-center justify-between">
+                        <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Almacenamiento en Nube</span>
+                        <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">Solo Lectura (API)</span>
+                    </div>
+                    <div class="grid grid-cols-3 gap-2 pt-1 text-center font-mono">
+                        <div class="bg-slate-900/90 rounded-lg p-2 border border-slate-800">
+                            <div class="text-[10px] text-slate-400">Ocupado</div>
+                            <div id="readonlyModalUsed" class="text-sky-300 font-semibold mt-0.5">-</div>
+                        </div>
+                        <div class="bg-slate-900/90 rounded-lg p-2 border border-slate-800">
+                            <div class="text-[10px] text-slate-400">Libre</div>
+                            <div id="readonlyModalFree" class="text-emerald-300 font-semibold mt-0.5">-</div>
+                        </div>
+                        <div class="bg-slate-900/90 rounded-lg p-2 border border-slate-800">
+                            <div class="text-[10px] text-slate-400">Total</div>
+                            <div id="readonlyModalTotal" class="text-slate-200 font-semibold mt-0.5">-</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="flex justify-end gap-2.5 pt-2">
+                <button onclick="closeAccountQuotaModal()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Cancelar</button>
+                <button onclick="saveAccountQuota()" class="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar Alias</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL DE NOTIFICACIÓN / CONFIRMACIÓN (Sin usar alert/confirm nativos) -->
+    <div id="noticeModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <h3 id="noticeTitle" class="text-base font-bold text-white">Aviso</h3>
+            <p id="noticeMessage" class="text-xs text-slate-300 leading-relaxed"></p>
+            <div id="noticeActions" class="flex justify-end gap-2.5 pt-2"></div>
+        </div>
+    </div>
+
+    <!-- MODAL DE VISTA PREVIA Y REPRODUCTOR MULTIMEDIA -->
+    <div id="previewModal" class="fixed inset-0 bg-black/85 hidden items-center justify-center p-4 z-50">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-4xl w-full max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="px-4 sm:px-5 py-3.5 border-b border-slate-800 flex items-center justify-between gap-3 bg-slate-900">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span id="previewBadge" class="px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase bg-indigo-600/25 text-indigo-300 border border-indigo-500/30 shrink-0">Vista Previa</span>
+                    <h3 id="previewTitle" class="text-sm font-bold text-white truncate">Archivo</h3>
+                    <span id="previewCounter" class="text-[11px] text-slate-400 shrink-0"></span>
+                </div>
+                <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                    <button id="previewPrevBtn" onclick="navigatePreview(-1)" class="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-35 disabled:pointer-events-none text-xs text-slate-200 transition flex items-center gap-1" title="Archivo anterior (Flecha Izquierda)">
+                        <span>◀</span><span class="hidden sm:inline">Anterior</span>
+                    </button>
+                    <button id="previewNextBtn" onclick="navigatePreview(1)" class="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-35 disabled:pointer-events-none text-xs text-slate-200 transition flex items-center gap-1" title="Archivo siguiente (Flecha Derecha)">
+                        <span class="hidden sm:inline">Siguiente</span><span>▶</span>
+                    </button>
+                    <a id="previewOpenTabBtn" href="#" target="_blank" rel="noopener" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 transition">Abrir en Nueva Pestaña ↗</a>
+                    <button onclick="closePreviewModal()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-lg leading-none">&times;</button>
+                </div>
+            </div>
+            <div id="previewBody" class="relative p-5 overflow-y-auto flex-1 bg-slate-950/80 flex items-center justify-center min-h-[320px]">
+                <!-- Contenido dinámico del visor -->
+            </div>
+        </div>
+    </div>
+
+    <!-- REPRODUCTOR DE MÚSICA FLOTANTE MINIMIZABLE Y MAXIMIZABLE (CERO BLUR PARA <3% GPU) -->
+    <div id="musicDockWidget" class="fixed bottom-4 right-4 z-50 hidden">
+        <!-- Vista Minimizada (Burbuja Compacta con Controles Rápidos) -->
+        <div id="musicDockMinimized" onclick="setMusicDockMode('normal')" class="hidden cursor-pointer bg-slate-900 hover:bg-slate-800 border border-indigo-500/40 rounded-full pl-2 pr-3 py-2 shadow-2xl flex items-center gap-2.5">
+            <div id="miniCoverWrap" class="w-9 h-9 rounded-full bg-indigo-600/30 border border-indigo-500/40 overflow-hidden flex items-center justify-center shrink-0">
+                <span class="text-base">🎵</span>
+            </div>
+            <div class="min-w-0 max-w-[130px] sm:max-w-[160px]">
+                <div id="miniTrackTitle" class="text-xs font-bold text-white truncate">Reproduciendo...</div>
+                <div id="miniTrackArtist" class="text-[10px] text-indigo-300 truncate">Clic para expandir</div>
+            </div>
+            <div class="flex items-center gap-1 shrink-0">
+                <button onclick="event.stopPropagation(); playDockPrev()" class="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center text-xs transition" title="Anterior">⏮</button>
+                <button onclick="event.stopPropagation(); toggleDockPlayPause()" id="miniPlayPauseBtn" class="w-8 h-8 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-xs transition" title="Play / Pausa">⏸</button>
+                <button onclick="event.stopPropagation(); playDockNext()" class="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center text-xs transition" title="Siguiente">⏭</button>
+                <button onclick="event.stopPropagation(); toggleCurrentTrackFavorite()" id="miniFavoriteBtn" class="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-rose-300 flex items-center justify-center text-xs transition" title="Marcar / Desmarcar canción favorita">🤍</button>
+            </div>
+        </div>
+
+        <!-- Vista Normal / Maximizada (Fondo Opaco de Alto Rendimiento sin backdrop-filter) -->
+        <div id="musicDockExpanded" class="w-80 sm:w-[410px] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
+            <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between shrink-0">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 shrink-0"></span>
+                    <span class="text-[11px] font-semibold uppercase tracking-wider text-indigo-300 truncate">Reproductor Musical</span>
+                    <span id="dockTrackCounter" class="text-[10px] text-slate-400 shrink-0"></span>
+                    <span id="dockPrefetchBadge" class="hidden text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shrink-0" title="Siguiente pista remota precargada en caché">⚡ Siguiente lista</span>
+                </div>
+                <div class="flex items-center gap-1 shrink-0">
+                    <button onclick="setMusicDockMode('minimized')" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-sm" title="Minimizar a burbuja">—</button>
+                    <button id="dockMaxRestoreBtn" onclick="toggleMusicDockMaximize()" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-xs" title="Maximizar reproductor">⛶</button>
+                    <button onclick="closeMusicDock()" class="w-6 h-6 rounded-lg hover:bg-rose-600/80 text-slate-400 hover:text-white flex items-center justify-center text-sm" title="Cerrar reproductor">&times;</button>
+                </div>
+            </div>
+
+            <!-- Contenedor Principal (En modo normal es vertical; en modo maximizado se divide en 2 columnas) -->
+            <div id="musicDockMainGrid" class="flex flex-col flex-1 min-h-0 overflow-hidden">
+                <!-- Columna Izquierda / Superior: Carátula + Info + Controles -->
+                <div id="musicDockPlayerCol" class="p-4 space-y-3.5 flex flex-col justify-between shrink-0">
+                    <!-- Carátula ID3 + Metadatos + Botón Ubicar Canción Actual -->
+                    <div id="dockMediaHeader" class="flex items-start justify-between gap-3">
+                        <div class="flex items-center gap-3.5 min-w-0 flex-1">
+                            <div id="dockCoverBox" onclick="openCoverLightbox()" class="w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner">
+                                <span id="dockCoverEmoji" class="text-3xl">🎵</span>
+                            </div>
+                            <div id="dockMetaTextWrap" class="min-w-0 flex-1">
+                                <div id="dockTrackTitle" class="text-sm font-bold text-white truncate" title="">Título de canción</div>
+                                <div id="dockTrackArtist" class="text-xs text-indigo-300 truncate mt-0.5">Artista desconocido</div>
+                                <div id="dockTrackAlbum" class="text-[11px] text-slate-400 truncate mt-0.5"></div>
+                            </div>
+                        </div>
+                        <button type="button" id="dockNormalLocateBtn" onclick="locateCurrentTrackInPlaylist()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-indigo-600/30 border border-slate-700 hover:border-indigo-500/50 text-indigo-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Ubicar canción en reproducción en la lista">
+                            🎯
+                        </button>
+                    </div>
+
+                    <!-- Barra de Progreso Interactiva -->
+                    <div class="space-y-1">
+                        <input type="range" id="dockSeekBar" min="0" max="100" value="0" oninput="seekDockAudio(this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                        <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                            <span id="dockCurrentTime">0:00</span>
+                            <span id="dockTotalTime">0:00</span>
+                        </div>
+                    </div>
+                    <!-- Visualizador Rítmico SVG con Gradiente Dinámico al Ritmo (< 4% GPU) -->
+                    <div id="dockVisualizerWrap" class="bg-slate-950 border border-slate-800 rounded-xl p-2 relative overflow-hidden h-14 flex items-center">
+                        <svg id="dockSvgVisualizer" viewBox="0 0 320 44" preserveAspectRatio="none" shape-rendering="optimizeSpeed" class="w-full h-10 block"></svg>
+                        <button onclick="cycleVisualizerStyle()" id="dockVisStyleBtn" class="absolute top-1.5 right-2 px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[9px] text-emerald-300 font-mono transition z-10" title="Cambiar estilo visual">SVG Barras</button>
+                    </div>
+                    <!-- Botones de Control: Aleatorio, Anterior, Play/Pausa, Siguiente, Favorito -->
+                    <div class="flex items-center justify-between gap-1.5 pt-1">
+                        <button id="dockShuffleBtn" onclick="toggleDockShuffle()" class="px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-400 transition flex items-center gap-1" title="Modo Aleatorio (reordena y precarga la siguiente)">
+                            <span>🔀</span><span class="text-[10px] font-medium hidden sm:inline">Aleatorio</span>
+                        </button>
+
+                        <div class="flex items-center gap-2">
+                            <button onclick="playDockPrev()" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center text-sm transition" title="Anterior">⏮</button>
+                            <button id="dockPlayPauseBtn" onclick="toggleDockPlayPause()" class="w-11 h-11 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/30 flex items-center justify-center text-base transition" title="Play / Pausa">⏸</button>
+                            <button onclick="playDockNext()" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center text-sm transition" title="Siguiente">⏭</button>
+                            <button id="dockFavoriteBtn" onclick="toggleCurrentTrackFavorite()" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-rose-300 flex items-center justify-center text-base transition" title="Marcar / Desmarcar canción favorita (guardado en FileJump)">🤍</button>
+                        </div>
+
+                        <div class="flex items-center gap-1.5">
+                            <button id="dockVisToggleBtn" onclick="toggleDockVisualizer()" class="px-2 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-500/60 text-[10px] font-medium text-indigo-300 transition flex items-center gap-1" title="Activar / Desactivar visualización rítmica">
+                                <span>📊</span><span>Vis</span>
+                            </button>
+                            <button id="dockEqToggleBtn" onclick="toggleDockEqPanel()" class="px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-medium text-slate-300 transition flex items-center gap-1" title="Ecualizador de 5 bandas">
+                                <span>🎛️</span><span>EQ</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Control de Volumen y Origen -->
+                    <div class="flex items-center justify-between gap-2.5 pt-1 border-t border-slate-800/70">
+                        <div class="flex items-center gap-2 flex-1 min-w-0">
+                            <button id="dockMuteBtn" onclick="toggleDockMute()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center text-xs shrink-0 transition" title="Silenciar / Activar sonido">🔊</button>
+                            <input type="range" id="dockVolumeBar" min="0" max="100" value="85" oninput="setDockVolume(this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-400" title="Volumen">
+                            <span id="dockVolumeLabel" class="text-[10px] font-mono text-slate-400 w-8 text-right shrink-0">85%</span>
+                        </div>
+                        <span id="dockSourceBadge" class="text-[10px] px-2 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-400 shrink-0">Local</span>
+                    </div>
+
+                    <!-- Panel Ecualizador Gráfico de 5 Bandas (Web Audio API) -->
+                    <div id="dockEqPanel" class="hidden bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-2.5">
+                        <div class="flex items-center justify-between gap-2">
+                            <span class="text-[10px] font-semibold uppercase tracking-wider text-indigo-300">Ecualizador 5 Bandas</span>
+                            <div class="flex items-center gap-1.5">
+                                <select id="dockEqPreset" onchange="applyEqPreset(this.value)" class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 text-[10px] text-slate-200 focus:outline-none focus:border-indigo-500">
+                                    <option value="flat">Plano (0 dB)</option>
+                                    <option value="bass">Bass Boost</option>
+                                    <option value="electronic">Electrónica / Club</option>
+                                    <option value="pop">Pop</option>
+                                    <option value="rock">Rock</option>
+                                    <option value="vocal">Vocal / Acústico</option>
+                                </select>
+                                <button onclick="applyEqPreset('flat')" class="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-300" title="Restablecer bandas">Reset</button>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-5 gap-2 pt-1 text-center">
+                            <div class="flex flex-col items-center gap-1">
+                                <span id="eqVal0" class="text-[9px] font-mono text-indigo-300">0dB</span>
+                                <input type="range" id="eqBand0" min="-12" max="12" step="1" value="0" oninput="setEqBandGain(0, this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                                <span class="text-[9px] text-slate-400 font-mono">60Hz</span>
+                            </div>
+                            <div class="flex flex-col items-center gap-1">
+                                <span id="eqVal1" class="text-[9px] font-mono text-indigo-300">0dB</span>
+                                <input type="range" id="eqBand1" min="-12" max="12" step="1" value="0" oninput="setEqBandGain(1, this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                                <span class="text-[9px] text-slate-400 font-mono">230Hz</span>
+                            </div>
+                            <div class="flex flex-col items-center gap-1">
+                                <span id="eqVal2" class="text-[9px] font-mono text-indigo-300">0dB</span>
+                                <input type="range" id="eqBand2" min="-12" max="12" step="1" value="0" oninput="setEqBandGain(2, this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                                <span class="text-[9px] text-slate-400 font-mono">910Hz</span>
+                            </div>
+                            <div class="flex flex-col items-center gap-1">
+                                <span id="eqVal3" class="text-[9px] font-mono text-indigo-300">0dB</span>
+                                <input type="range" id="eqBand3" min="-12" max="12" step="1" value="0" oninput="setEqBandGain(3, this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                                <span class="text-[9px] text-slate-400 font-mono">3.6kHz</span>
+                            </div>
+                            <div class="flex flex-col items-center gap-1">
+                                <span id="eqVal4" class="text-[9px] font-mono text-indigo-300">0dB</span>
+                                <input type="range" id="eqBand4" min="-12" max="12" step="1" value="0" oninput="setEqBandGain(4, this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                                <span class="text-[9px] text-slate-400 font-mono">14kHz</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Columna Derecha / Inferior: Playlist de Canciones -->
+                <div id="musicDockPlaylistCol" class="border-t border-slate-800 bg-slate-950 flex flex-col min-h-0">
+                    <div class="px-3.5 py-2 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+                        <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Lista de Reproducción (Playlist)</span>
+                        <span id="dockPlaylistOrderTag" class="text-[10px] text-slate-500">Orden normal</span>
+                    </div>
+                    <!-- Buscador Rápido + Localizador de Pista Actual dentro de la Playlist (visible al maximizar) -->
+                    <div id="dockPlaylistSearchWrap" class="hidden px-3 py-2 border-b border-slate-800 bg-slate-900 shrink-0">
+                        <div class="flex items-center gap-2">
+                            <div class="relative flex items-center flex-1 min-w-0">
+                                <span class="absolute left-2.5 text-slate-400 text-xs pointer-events-none">🔍</span>
+                                <input type="text" id="dockPlaylistSearchInput" oninput="filterMusicPlaylist(this.value)" placeholder="Buscar canción o artista en la playlist..." class="w-full bg-slate-950 border border-slate-700 focus:border-indigo-500 rounded-xl pl-8 pr-7 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none">
+                                <button type="button" id="dockPlaylistSearchClearBtn" onclick="clearMusicPlaylistSearch()" class="hidden absolute right-2 text-slate-400 hover:text-white text-xs px-1" title="Limpiar búsqueda">✕</button>
+                            </div>
+                            <button type="button" onclick="locateCurrentTrackInPlaylist()" class="px-2.5 py-1.5 rounded-xl bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 hover:text-white text-xs font-medium transition flex items-center gap-1.5 shrink-0" title="Ubicar canción en reproducción actual">
+                                <span>🎯</span><span class="hidden sm:inline">Ubicar</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div id="dockPlaylistItems" class="max-h-44 overflow-y-auto divide-y divide-slate-800/40 text-xs">
+                        <!-- Elementos del playlist -->
+                    </div>
+                </div>
+            </div>
+            <audio id="dockAudioElement" class="hidden"></audio>
+        </div>
+    </div>
+
+    <!-- VENTANA FLOTANTE DE PROGRESO DE TRANSFERENCIA (CARGA / DESCARGA) -->
+    <div id="transferDockWidget" class="fixed bottom-4 left-4 z-50 hidden">
+        <!-- Vista Minimizada (Solo barra compacta) -->
+        <div id="transferDockMinimized" onclick="setTransferDockMode('normal')" class="hidden cursor-pointer bg-slate-900 hover:bg-slate-800 border border-sky-500/40 rounded-2xl px-3.5 py-2.5 shadow-2xl w-72 sm:w-80 space-y-1.5">
+            <div class="flex items-center justify-between gap-2 text-xs">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span id="transferMiniIcon" class="text-sm shrink-0">⬆️</span>
+                    <span id="transferMiniTitle" class="font-semibold text-white truncate">Transfiriendo...</span>
+                </div>
+                <div class="flex items-center gap-2 shrink-0 font-mono text-[11px]">
+                    <span id="transferMiniSpeed" class="text-emerald-300">0.00 MB/s</span>
+                    <span id="transferMiniPct" class="font-bold text-sky-300">0%</span>
+                </div>
+            </div>
+            <div class="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                <div id="transferMiniBar" class="h-full bg-gradient-to-r from-sky-500 to-emerald-400 rounded-full transition-all duration-150" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <!-- Vista Normal / Maximizada (Progreso + Detalle de Archivos) -->
+        <div id="transferDockExpanded" class="w-80 sm:w-[440px] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
+            <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between shrink-0">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span id="transferStatusDot" class="w-2 h-2 rounded-full bg-sky-400 shrink-0"></span>
+                    <span id="transferHeaderBadge" class="text-[11px] font-semibold uppercase tracking-wider text-sky-300 truncate">Transferencia en Curso</span>
+                </div>
+                <div class="flex items-center gap-1 shrink-0">
+                    <button onclick="setTransferDockMode('minimized')" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-sm" title="Minimizar a barra">—</button>
+                    <button id="transferMaxRestoreBtn" onclick="toggleTransferDockMaximize()" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-xs" title="Maximizar detalle">⛶</button>
+                    <button onclick="closeTransferDock()" class="w-6 h-6 rounded-lg hover:bg-rose-600/80 text-slate-400 hover:text-white flex items-center justify-center text-sm" title="Cerrar ventana">&times;</button>
+                </div>
+            </div>
+
+            <div class="p-4 space-y-3 shrink-0">
+                <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                        <div id="transferTitleText" class="text-sm font-bold text-white truncate">Preparando...</div>
+                        <div id="transferCurrentFileText" class="text-xs text-slate-400 truncate mt-0.5">Analizando archivos...</div>
+                    </div>
+                    <div class="text-right shrink-0">
+                        <div class="flex items-center justify-end gap-2">
+                            <span id="transferSpeedBadge" class="px-2 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-[11px] font-mono font-semibold text-emerald-300">0.00 MB/s</span>
+                            <span id="transferPctText" class="text-base font-bold font-mono text-sky-300">0%</span>
+                        </div>
+                        <div id="transferCountText" class="text-[10px] font-mono text-slate-400 mt-0.5">0 / 0 archivo(s)</div>
+                    </div>
+                </div>
+
+                <!-- Barra de Progreso Principal -->
+                <div class="space-y-1">
+                    <div class="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
+                        <div id="transferMainBar" class="h-full bg-gradient-to-r from-sky-500 via-indigo-500 to-emerald-400 rounded-full transition-all duration-150" style="width: 0%"></div>
+                    </div>
+                    <div class="flex justify-between text-[10px] text-slate-300 font-mono">
+                        <span id="transferBytesText">0.00 MB / 0.00 MB</span>
+                        <span id="transferStateLabel">En progreso...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Lista Detallada de Archivos (Visible en Normal y Ampliada en Maximizado) -->
+            <div id="transferDetailContainer" class="border-t border-slate-800 bg-slate-950/75 flex flex-col min-h-0">
+                <div class="px-3.5 py-2 border-b border-slate-800/80 flex items-center justify-between shrink-0">
+                    <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Detalle de Archivos</span>
+                    <span id="transferDetailCountTag" class="text-[10px] text-slate-500">0 elementos</span>
+                </div>
+                <div id="transferItemsList" class="max-h-36 overflow-y-auto divide-y divide-slate-800/40 text-xs">
+                    <!-- Archivos procesados -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- VENTANA FLOTANTE DE ESCANEO DE AUDIO PARA PLAYLIST (CERRABLE CON ACTUALIZACIÓN ACTIVA) -->
+    <div id="audioScanDockWidget" class="fixed bottom-4 left-4 z-50 hidden w-80 sm:w-96 bg-slate-900 border border-indigo-500/40 rounded-2xl shadow-2xl overflow-hidden">
+        <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+                <span id="audioScanDot" class="w-2 h-2 rounded-full bg-indigo-400 shrink-0"></span>
+                <span class="text-[11px] font-semibold uppercase tracking-wider text-indigo-300 truncate">Escaneando Música</span>
+            </div>
+            <button onclick="closeAudioScanDock()" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-sm transition" title="Cerrar ventana (continúa en segundo plano)">&times;</button>
+        </div>
+        <div class="p-4 space-y-3">
+            <div class="flex items-center justify-between gap-3">
+                <div class="min-w-0 flex-1">
+                    <div id="audioScanTitle" class="text-xs font-bold text-white truncate">Escaneando carpeta...</div>
+                    <div id="audioScanCurrentFolder" class="text-[11px] text-slate-400 truncate mt-0.5">Explorando subcarpetas...</div>
+                </div>
+                <div class="text-right shrink-0 bg-indigo-600/20 border border-indigo-500/30 rounded-xl px-2.5 py-1">
+                    <div id="audioScanCount" class="text-base font-bold font-mono text-indigo-300 leading-tight">0</div>
+                    <div class="text-[9px] uppercase tracking-wider text-slate-400">pistas</div>
+                </div>
+            </div>
+            <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div id="audioScanBar" class="h-full bg-gradient-to-r from-indigo-500 via-sky-400 to-emerald-400 rounded-full transition-all duration-200" style="width: 15%"></div>
+            </div>
+            <div class="flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                <span id="audioScanFoldersLabel">0 carpeta(s) revisada(s)</span>
+                <span id="audioScanStatusLabel" class="text-indigo-300">Agregando a playlist...</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL DE CARÁTULA GIGANTE (DELANTE DEL REPRODUCTOR MAXIMIZADO) -->
+    <div id="coverLightboxModal" onclick="if(event.target===this) closeCoverLightbox()" class="fixed inset-0 bg-black/95 hidden items-center justify-center p-4 z-[60]">
+        <div class="relative bg-slate-900 border border-slate-700 rounded-2xl p-3 sm:p-4 max-w-3xl w-full flex flex-col items-center gap-3 shadow-2xl">
+            <div class="w-full flex items-center justify-end gap-2">
+                <a id="coverDownloadBtn" href="#" download="caratula.jpg" class="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white shadow-lg shadow-indigo-600/20 transition flex items-center gap-1.5">
+                    <span>⬇</span><span>Descargar Carátula</span>
+                </a>
+                <button onclick="closeCoverLightbox()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-rose-600/80 text-slate-300 hover:text-white flex items-center justify-center text-lg leading-none transition" title="Cerrar">&times;</button>
+            </div>
+            <div class="w-full flex items-center justify-center overflow-hidden rounded-xl bg-slate-950 border border-slate-800">
+                <img id="coverLightboxImg" src="" alt="Carátula MP3" class="max-h-[78vh] w-auto object-contain">
+            </div>
+        </div>
+    </div>
+
+    <!-- MENÚ CONTEXTUAL PARA EXPLORADORES LOCAL Y REMOTO -->
+    <div id="explorerContextMenu" class="fixed hidden z-[70] min-w-[235px] bg-slate-900 border border-slate-700 rounded-xl shadow-2xl py-1.5 text-xs text-slate-200 select-none">
+        <!-- Opciones dinámicas -->
+    </div>
+
+    <!-- MODAL DE CAMBIO DE NOMBRE -->
+    <div id="renameItemModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-[65]">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div class="flex items-center justify-between">
+                <h3 class="text-base font-bold text-white">Cambiar de Nombre</h3>
+                <button onclick="closeRenameModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1.5">Nuevo nombre:</label>
+                <input type="text" id="renameNewNameInput" onkeydown="if(event.key==='Enter') submitRenameModal()" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div class="flex justify-end gap-2.5 pt-1">
+                <button onclick="closeRenameModal()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Cancelar</button>
+                <button onclick="submitRenameModal()" class="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL DE PROPIEDADES -->
+    <div id="propertiesItemModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-[65]">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div class="flex items-center justify-between">
+                <h3 class="text-base font-bold text-white flex items-center gap-2"><span>ℹ️</span><span>Propiedades</span></h3>
+                <button onclick="closePropertiesModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div id="propertiesModalBody" class="space-y-2.5 text-xs bg-slate-950/80 border border-slate-800 rounded-xl p-4">
+                <div class="text-slate-400 animate-pulse">Calculando propiedades...</div>
+            </div>
+            <div class="flex justify-end">
+                <button onclick="closePropertiesModal()" class="px-4 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200">Cerrar</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/state.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/player.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/explorer.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
