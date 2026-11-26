@@ -12,6 +12,9 @@ import mimetypes
 import subprocess
 import threading
 import webbrowser
+import signal
+import ctypes
+import uuid
 import xml.etree.ElementTree as ET
 import datetime
 from datetime import timezone
@@ -99,6 +102,7 @@ app = Flask(__name__)
 
 # Estado global en memoria para logs en tiempo real hacia la UI
 activity_logs = []
+transfer_jobs = {}
 
 def log_event(level, message):
     """Registra eventos con marca de tiempo para mostrarlos en la interfaz web."""
@@ -453,23 +457,22 @@ class FileJumpClient:
                 return None
         except Exception as e:
             log_event("error", f"Excepción creando carpeta '{name}': {e}")
-            return None
+        return None
 
-    def upload_file(self, local_path, folder_id=None, use_high_speed=True):
+    def upload_file(self, local_path, folder_id=None, use_high_speed=True, progress_callback=None):
         """
         Sube un archivo utilizando el endpoint REST autenticado POST /api/files/upload
-        con soporte para alta velocidad y respaldo automático.
+        con lectura por bloques (streaming multipart) para reportar bytes enviados,
+        porcentaje y velocidad en tiempo real.
         """
         rest_upload_url = f"{self.base_url}/files/upload"
         rest_alias_url = f"{self.base_url}/files"
 
-        # Priorizar el endpoint REST principal autenticado con Bearer Token
         if use_high_speed and self.upload_url:
             candidate_urls = [rest_upload_url, self.upload_url, rest_alias_url]
         else:
             candidate_urls = [rest_upload_url, rest_alias_url]
 
-        # Eliminar duplicados manteniendo el orden
         ordered_urls = []
         for u in candidate_urls:
             if u and u not in ordered_urls:
@@ -480,12 +483,12 @@ class FileJumpClient:
         mime_type = mime_type or "application/octet-stream"
 
         st = os.stat(local_path)
+        file_size = st.st_size
         mtime_sec = int(st.st_mtime)
         mtime_ms = int(st.st_mtime * 1000)
         mtime_iso = datetime.datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        mtime_sql = datetime.datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-        data = {
+        fields = {
             "last_modified": str(mtime_ms),
             "lastModified": str(mtime_ms),
             "mtime": str(mtime_sec),
@@ -494,12 +497,66 @@ class FileJumpClient:
         }
         if folder_id not in (None, "", "ROOT", 0, "0"):
             fid_str = str(folder_id)
-            data["folder_id"] = fid_str
-            data["parent_id"] = fid_str
+            fields["folder_id"] = fid_str
+            fields["parent_id"] = fid_str
+
+        boundary = f"----FileJumpBoundary{uuid.uuid4().hex}"
+        preamble_parts = []
+        for k, v in fields.items():
+            preamble_parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+                f"{v}\r\n".encode("utf-8")
+            )
+        safe_fname = file_name.replace('"', '\\"')
+        preamble_parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{safe_fname}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8")
+        )
+        preamble_bytes = b"".join(preamble_parts)
+        closing_bytes = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        total_body_len = len(preamble_bytes) + file_size + len(closing_bytes)
+
+        class _StreamingMultipartBody:
+            def __init__(self, f_obj):
+                self._f = f_obj
+                self._pre = preamble_bytes
+                self._pre_pos = 0
+                self._end = closing_bytes
+                self._end_pos = 0
+                self._file_sent = 0
+                self._last_cb = 0.0
+
+            def __len__(self):
+                return total_body_len
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    size = 65536
+                if self._pre_pos < len(self._pre):
+                    chunk = self._pre[self._pre_pos:self._pre_pos + size]
+                    self._pre_pos += len(chunk)
+                    return chunk
+                file_chunk = self._f.read(size)
+                if file_chunk:
+                    self._file_sent += len(file_chunk)
+                    now = time.time()
+                    if progress_callback and (now - self._last_cb >= 0.12 or self._file_sent >= file_size):
+                        self._last_cb = now
+                        progress_callback(self._file_sent, file_size)
+                    return file_chunk
+                if self._end_pos < len(self._end):
+                    chunk = self._end[self._end_pos:self._end_pos + size]
+                    self._end_pos += len(chunk)
+                    return chunk
+                return b""
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(total_body_len),
             "X-File-Last-Modified": str(mtime_ms),
             "X-File-Mtime": mtime_iso
         }
@@ -508,16 +565,19 @@ class FileJumpClient:
 
         for target_url in ordered_urls:
             try:
+                if progress_callback:
+                    progress_callback(0, file_size)
                 with open(local_path, "rb") as f:
-                    files = {"file": (file_name, f, mime_type)}
+                    stream_body = _StreamingMultipartBody(f)
                     resp = requests.post(
                         target_url,
                         headers=headers,
-                        files=files,
-                        data=data,
-                        timeout=300
+                        data=stream_body,
+                        timeout=600
                     )
                 if resp.status_code in (200, 201):
+                    if progress_callback:
+                        progress_callback(file_size, file_size)
                     try:
                         res_json = resp.json()
                     except Exception:
@@ -622,15 +682,15 @@ class FileJumpClient:
         )
         for ep in endpoints:
             try:
-                resp = requests.put(ep, headers=self._headers(), json={"name": new_name}, timeout=15)
+                resp = requests.put(ep, headers=self._headers(), json={"name": new_name}, timeout=12)
                 if resp.status_code in (200, 201, 204):
                     return True
             except Exception:
                 pass
         return False
 
-    def download_file_direct(self, file_id, dest_path, remote_mtime=0.0):
-        """Descarga un archivo remoto directamente a una ruta local y preserva su fecha de modificación."""
+    def download_file_direct(self, file_id, dest_path, remote_mtime=0.0, progress_callback=None):
+        """Descarga un archivo remoto directamente a una ruta local reportando bytes por bloque y preservando mtime."""
         dest = Path(dest_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         headers = {"Authorization": f"Bearer {self.api_key}"}
@@ -640,12 +700,24 @@ class FileJumpClient:
         ]
         for url in candidate_urls:
             try:
-                with requests.get(url, headers=headers, stream=True, timeout=180) as resp:
+                with requests.get(url, headers=headers, stream=True, timeout=300) as resp:
                     if resp.status_code == 200:
+                        total_len = int(resp.headers.get("Content-Length") or 0)
+                        downloaded = 0
+                        last_cb = 0.0
+                        if progress_callback:
+                            progress_callback(0, total_len)
                         with open(dest, "wb") as out_f:
                             for chunk in resp.iter_content(chunk_size=65536):
                                 if chunk:
                                     out_f.write(chunk)
+                                    downloaded += len(chunk)
+                                    now = time.time()
+                                    if progress_callback and (now - last_cb >= 0.12):
+                                        last_cb = now
+                                        progress_callback(downloaded, total_len)
+                        if progress_callback:
+                            progress_callback(downloaded, max(total_len, downloaded))
                         if remote_mtime and remote_mtime > 0:
                             try:
                                 os.utime(dest, (remote_mtime, remote_mtime))
@@ -1615,9 +1687,86 @@ def _resolve_target_file():
         return cached, None
 
 
+def _video_needs_audio_transcode(file_path):
+    """Detecta si un video contiene múltiples pistas de audio o códecs no soportados por navegadores (AC3, EAC3, DTS)."""
+    ext = file_path.suffix.lower()
+    if ext in {".avi", ".mkv", ".mov", ".wmv", ".flv"}:
+        return True
+    ffprobe_bin = shutil.which("ffprobe")
+    if ffprobe_bin:
+        try:
+            out = subprocess.check_output(
+                [ffprobe_bin, "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)],
+                stderr=subprocess.DEVNULL,
+                timeout=8
+            ).decode("utf-8", errors="ignore").strip().lower()
+            codecs = [line.strip() for line in out.splitlines() if line.strip()]
+            # Si hay más de 1 pista de audio o alguna usa AC3/DTS, el navegador suele silenciar el audio
+            if len(codecs) > 1:
+                return True
+            for c in codecs:
+                if c not in {"aac", "mp3", "opus", "vorbis", "flac", "pcm_s16le", "pcm_s24le"}:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _get_video_audio_tracks(file_path):
+    """Obtiene la lista de pistas de audio (índice, códec, idioma, título) de un archivo de video."""
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin:
+        return []
+    try:
+        out = subprocess.check_output(
+            [
+                ffprobe_bin, "-v", "error", "-select_streams", "a",
+                "-show_entries", "stream=index,codec_name,channels:stream_tags=language,title",
+                "-of", "json", str(file_path)
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=8
+        ).decode("utf-8", errors="ignore")
+        parsed = json.loads(out)
+        streams = parsed.get("streams", [])
+        tracks = []
+        for idx, s in enumerate(streams):
+            tags = s.get("tags") or {}
+            lang = tags.get("language") or tags.get("LANGUAGE") or ""
+            title = tags.get("title") or tags.get("TITLE") or ""
+            codec = s.get("codec_name") or "audio"
+            channels = s.get("channels") or 2
+            label_parts = [f"Pista {idx + 1}"]
+            if title:
+                label_parts.append(title)
+            if lang:
+                label_parts.append(f"[{lang}]")
+            label_parts.append(f"({codec}, {channels}ch)")
+            tracks.append({
+                "audio_index": idx,
+                "codec": codec,
+                "language": lang,
+                "title": title,
+                "label": " ".join(label_parts)
+            })
+        return tracks
+    except Exception:
+        return []
+
+
+@app.route("/api/video/tracks", methods=["GET"])
+def api_video_tracks():
+    """Devuelve las pistas de audio disponibles dentro de un archivo de video."""
+    file_path, err = _resolve_target_file()
+    if err:
+        return jsonify({"tracks": []})
+    tracks = _get_video_audio_tracks(file_path)
+    return jsonify({"tracks": tracks})
+
+
 @app.route("/api/file/stream", methods=["GET"])
 def api_file_stream():
-    """Sirve el archivo en línea (PDF en nueva ventana, audio, video o imágenes)."""
+    """Sirve el archivo en línea (PDF en nueva ventana, audio, video con pista única AAC o imágenes)."""
     file_path, err = _resolve_target_file()
     if err:
         return jsonify({"error": err}), 404
@@ -1625,17 +1774,41 @@ def api_file_stream():
     if ext == ".pdf":
         return send_file(file_path, mimetype="application/pdf", as_attachment=False, download_name=file_path.name, conditional=True)
 
-    # Si es un video no nativo (.avi, .mkv, etc.) y se solicita transcodificar con ffmpeg si está disponible
-    if request.args.get("transcode") == "1" and ext in {".avi", ".mkv", ".mov", ".wmv", ".flv"}:
+    video_exts = {".mp4", ".webm", ".ogg", ".mov", ".avi", ".mkv", ".wmv", ".flv"}
+    force_transcode = request.args.get("transcode") == "1"
+    audio_track_param = request.args.get("audio_track", "").strip()
+    has_explicit_track = audio_track_param.isdigit()
+    audio_idx = int(audio_track_param) if has_explicit_track else 0
+
+    # Si es video con múltiples pistas, pista seleccionada o códec AC3/DTS, remuxear aislando 1 sola pista en AAC
+    if ext in video_exts and (force_transcode or has_explicit_track or _video_needs_audio_transcode(file_path)):
         ffmpeg_bin = shutil.which("ffmpeg")
         if ffmpeg_bin:
-            mp4_cached = TEMP_CACHE_DIR / f"{file_path.stem}_web.mp4"
+            path_hash = hashlib.md5(f"{file_path}_{file_path.stat().st_mtime}_a{audio_idx}".encode("utf-8")).hexdigest()[:12]
+            mp4_cached = TEMP_CACHE_DIR / f"{file_path.stem}_{path_hash}_web.mp4"
             if not mp4_cached.exists() or mp4_cached.stat().st_size == 0:
                 try:
-                    subprocess.run(
-                        [ffmpeg_bin, "-y", "-i", str(file_path), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-movflags", "+faststart", str(mp4_cached)],
+                    # Mapear explícitamente 1 pista de video (0:v:0) y 1 pista de audio (0:a:<audio_idx>) convertida a AAC estéreo
+                    res = subprocess.run(
+                        [
+                            ffmpeg_bin, "-y", "-i", str(file_path),
+                            "-map", "0:v:0", "-map", f"0:a:{audio_idx}?",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                            "-movflags", "+faststart", str(mp4_cached)
+                        ],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180
                     )
+                    if res.returncode != 0 or not mp4_cached.exists() or mp4_cached.stat().st_size == 0:
+                        subprocess.run(
+                            [
+                                ffmpeg_bin, "-y", "-i", str(file_path),
+                                "-map", "0:v:0", "-map", f"0:a:{audio_idx}?",
+                                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                                "-movflags", "+faststart", str(mp4_cached)
+                            ],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300
+                        )
                 except Exception:
                     pass
             if mp4_cached.exists() and mp4_cached.stat().st_size > 0:
@@ -2167,6 +2340,413 @@ def api_explorer_download_to_local():
     return jsonify({"success": True, "downloaded_files": downloaded_files})
 
 
+def _update_transfer_job(job_id, **kwargs):
+    """Actualiza el estado en tiempo real de una transferencia en curso."""
+    job = transfer_jobs.get(job_id)
+    if job:
+        job.update(kwargs)
+
+
+def _format_speed_label(bytes_per_sec):
+    """Formatea la velocidad instantánea o promedio en KB/s o MB/s."""
+    if not bytes_per_sec or bytes_per_sec <= 0:
+        return "0.00 MB/s"
+    mb_s = bytes_per_sec / (1024.0 * 1024.0)
+    if mb_s >= 1.0:
+        return f"{mb_s:.2f} MB/s"
+    kb_s = bytes_per_sec / 1024.0
+    return f"{kb_s:.1f} KB/s"
+
+
+def _make_speed_tracker(job_id, base_bytes_before_file, overall_total_bytes, items_list=None, item_idx=None):
+    """Crea un callback de progreso en tiempo real por archivo con cálculo de velocidad suavizada y porcentaje."""
+    state = {
+        "last_time": time.time(),
+        "last_bytes": 0,
+        "ema_bps": 0.0
+    }
+
+    def _on_progress(file_sent, file_total):
+        now = time.time()
+        dt = now - state["last_time"]
+        if dt >= 0.10 and file_sent >= state["last_bytes"]:
+            inst_bps = (file_sent - state["last_bytes"]) / dt
+            state["ema_bps"] = inst_bps if state["ema_bps"] <= 0 else (0.65 * state["ema_bps"] + 0.35 * inst_bps)
+            state["last_time"] = now
+            state["last_bytes"] = file_sent
+
+        total_done = base_bytes_before_file + file_sent
+        eff_total = max(overall_total_bytes, total_done, 1)
+        pct = min(99, int(round((total_done / eff_total) * 100)))
+        file_pct = min(100, int(round((file_sent / max(file_total, 1)) * 100))) if file_total > 0 else 0
+
+        if items_list is not None and item_idx is not None and 0 <= item_idx < len(items_list):
+            items_list[item_idx]["sent"] = file_sent
+            items_list[item_idx]["file_pct"] = file_pct
+
+        _update_transfer_job(
+            job_id,
+            bytes_done=total_done,
+            bytes_total=max(overall_total_bytes, total_done),
+            percent=pct,
+            speed_bps=state["ema_bps"],
+            speed_text=_format_speed_label(state["ema_bps"]),
+            file_percent=file_pct,
+            items=list(items_list) if items_list is not None else transfer_jobs.get(job_id, {}).get("items", [])
+        )
+
+    return _on_progress
+
+
+@app.route("/api/transfer/status/<job_id>", methods=["GET"])
+def api_transfer_status(job_id):
+    """Devuelve el progreso en tiempo real de una transferencia (carga o descarga)."""
+    job = transfer_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Trabajo de transferencia no encontrado"}), 404
+    return jsonify(job)
+
+
+@app.route("/api/explorer/transfer_start", methods=["POST"])
+def api_explorer_transfer_start():
+    """Inicia una carga o descarga en segundo plano con seguimiento de progreso y velocidad en tiempo real."""
+    data = request.json or {}
+    direction = data.get("direction", "upload")
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY"}), 400
+
+    job_id = uuid.uuid4().hex[:12]
+
+    if direction == "download":
+        dest_dir = _resolve_local_explorer_target({
+            "full_path": data.get("dest_full_path"),
+            "root_path": data.get("dest_root_path"),
+            "task": data.get("dest_task"),
+            "rel_path": data.get("dest_rel_path")
+        })
+        if not dest_dir or not dest_dir.exists() or not dest_dir.is_dir():
+            return jsonify({"error": "Selecciona primero una carpeta válida en el explorador local destino"}), 400
+
+        item_type = data.get("type", "file")
+        item_name = data.get("name", "archivo")
+
+        transfer_jobs[job_id] = {
+            "id": job_id,
+            "direction": "download",
+            "title": f"Descargando: {item_name}",
+            "status": "running",
+            "current_file": "Analizando estructura remota...",
+            "processed_files": 0,
+            "total_files": 1 if item_type == "file" else 0,
+            "bytes_done": 0,
+            "bytes_total": int(data.get("size") or 0),
+            "percent": 0,
+            "file_percent": 0,
+            "speed_bps": 0.0,
+            "speed_text": "0.00 MB/s",
+            "items": [],
+            "error": None
+        }
+
+        def _run_download():
+            try:
+                item_id = data.get("id")
+                remote_mtime = float(data.get("mtime") or 0)
+                log_event("info", f"Iniciando descarga de '{item_name}' hacia '{dest_dir}'...")
+
+                if item_type == "file":
+                    if remote_mtime <= 0:
+                        remote_mtime = client.get_remote_file_mtime(item_id)
+                    f_size = int(data.get("size") or 0)
+                    single_items = [{"name": item_name, "size": f_size, "sent": 0, "file_pct": 0, "status": "active"}]
+                    _update_transfer_job(
+                        job_id,
+                        total_files=1,
+                        bytes_total=f_size,
+                        current_file=item_name,
+                        items=list(single_items)
+                    )
+                    log_event("info", f"⬇ Descargando archivo: {item_name}")
+                    target_file = dest_dir / item_name
+                    cb = _make_speed_tracker(job_id, 0, f_size, single_items, 0)
+                    if client.download_file_direct(item_id, target_file, remote_mtime=remote_mtime, progress_callback=cb):
+                        actual_size = target_file.stat().st_size if target_file.exists() else f_size
+                        _update_transfer_job(
+                            job_id,
+                            status="completed",
+                            processed_files=1,
+                            bytes_done=actual_size,
+                            bytes_total=max(f_size, actual_size),
+                            percent=100,
+                            file_percent=100,
+                            speed_text="Completado",
+                            current_file="Descarga completada",
+                            items=[{"name": item_name, "size": actual_size, "sent": actual_size, "file_pct": 100, "status": "done"}]
+                        )
+                        log_event("success", f"✔ Descargado '{item_name}' -> '{target_file}'")
+                    else:
+                        _update_transfer_job(
+                            job_id,
+                            status="error",
+                            error=f"No se pudo descargar '{item_name}'",
+                            items=[{"name": item_name, "size": f_size, "sent": 0, "file_pct": 0, "status": "error"}]
+                        )
+                        log_event("error", f"✖ Error descargando '{item_name}'")
+                else:
+                    tid = int(item_id) if str(item_id).isdigit() else item_id
+                    base_local_folder = dest_dir / item_name
+                    base_local_folder.mkdir(parents=True, exist_ok=True)
+                    tree_items = scan_remote_tree(client, tid, current_prefix="", depth=0, max_depth=12)
+
+                    files_to_dl = [e for e in tree_items if e["type"] == "file"]
+                    folders_to_mk = [e for e in tree_items if e["type"] == "folder"]
+                    total_bytes = sum(int(f.get("size") or 0) for f in files_to_dl)
+                    items_list = [{"name": f["rel_path"], "size": int(f.get("size") or 0), "sent": 0, "file_pct": 0, "status": "pending"} for f in files_to_dl]
+
+                    _update_transfer_job(
+                        job_id,
+                        total_files=len(files_to_dl),
+                        bytes_total=total_bytes,
+                        items=items_list,
+                        current_file="Creando subcarpetas locales..."
+                    )
+
+                    for fld in folders_to_mk:
+                        (base_local_folder / Path(fld["rel_path"])).mkdir(parents=True, exist_ok=True)
+
+                    if len(files_to_dl) == 0:
+                        _update_transfer_job(job_id, status="completed", percent=100, current_file="Carpeta vacía descargada")
+                        log_event("success", f"✔ Carpeta vacía '{item_name}' creada en '{dest_dir}'.")
+                        return
+
+                    done_count = 0
+                    done_bytes = 0
+                    for idx, f_entry in enumerate(files_to_dl):
+                        items_list[idx]["status"] = "active"
+                        _update_transfer_job(job_id, current_file=f_entry["rel_path"], file_percent=0, items=list(items_list))
+                        log_event("info", f"⬇ Descargando ({idx + 1}/{len(files_to_dl)}): {f_entry['rel_path']}")
+
+                        local_target = base_local_folder / Path(f_entry["rel_path"])
+                        rmtime = float(f_entry.get("mtime") or 0)
+                        cb = _make_speed_tracker(job_id, done_bytes, total_bytes, items_list, idx)
+                        ok = client.download_file_direct(f_entry["id"], local_target, remote_mtime=rmtime, progress_callback=cb)
+                        f_sz = int(f_entry.get("size") or 0)
+                        if ok:
+                            done_count += 1
+                            done_bytes += f_sz
+                            items_list[idx]["status"] = "done"
+                            items_list[idx]["sent"] = f_sz
+                            items_list[idx]["file_pct"] = 100
+                            log_event("success", f"✔ Descargado: {f_entry['rel_path']}")
+                        else:
+                            items_list[idx]["status"] = "error"
+                            log_event("error", f"✖ Fallo al descargar: {f_entry['rel_path']}")
+
+                        pct = int(round((done_bytes / total_bytes) * 100)) if total_bytes > 0 else int(round(((idx + 1) / len(files_to_dl)) * 100))
+                        _update_transfer_job(
+                            job_id,
+                            processed_files=done_count,
+                            bytes_done=done_bytes,
+                            percent=min(99 if idx + 1 < len(files_to_dl) else 100, pct),
+                            items=list(items_list)
+                        )
+
+                    if remote_mtime > 0:
+                        try:
+                            os.utime(base_local_folder, (remote_mtime, remote_mtime))
+                        except Exception:
+                            pass
+
+                    _update_transfer_job(
+                        job_id,
+                        status="completed",
+                        percent=100,
+                        speed_text="Completado",
+                        current_file="Descarga completada"
+                    )
+                    log_event("success", f"✔ Carpeta '{item_name}' descargada ({done_count}/{len(files_to_dl)} archivo(s)).")
+            except Exception as exc:
+                _update_transfer_job(job_id, status="error", error=str(exc))
+                log_event("error", f"Error crítico en descarga: {exc}")
+
+        threading.Thread(target=_run_download, daemon=True).start()
+        return jsonify({"job_id": job_id})
+
+    # === DIRECCIÓN: UPLOAD (CARGA A FILEJUMP) ===
+    src_target = _resolve_local_explorer_target(data)
+    if not src_target or not src_target.exists():
+        return jsonify({"error": "Archivo o carpeta local no encontrado"}), 404
+
+    dest_remote_id = data.get("dest_remote_id", "ROOT")
+    target_parent_id = None if dest_remote_id in (None, "", "ROOT", 0, "0") else (int(dest_remote_id) if str(dest_remote_id).isdigit() else dest_remote_id)
+    cfg = load_config()
+    use_hs = cfg.get("use_high_speed_upload", True)
+
+    transfer_jobs[job_id] = {
+        "id": job_id,
+        "direction": "upload",
+        "title": f"Subiendo: {src_target.name}",
+        "status": "running",
+        "current_file": "Preparando archivos locales...",
+        "processed_files": 0,
+        "total_files": 1 if src_target.is_file() else 0,
+        "bytes_done": 0,
+        "bytes_total": src_target.stat().st_size if src_target.is_file() else 0,
+        "percent": 0,
+        "file_percent": 0,
+        "speed_bps": 0.0,
+        "speed_text": "0.00 MB/s",
+        "items": [],
+        "error": None
+    }
+
+    def _run_upload():
+        def _upload_single(local_fp, remote_parent, progress_cb=None):
+            st = local_fp.stat()
+            mtime_iso = datetime.datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+            res = client.upload_file(str(local_fp), folder_id=remote_parent, use_high_speed=use_hs, progress_callback=progress_cb)
+            if res is not None:
+                new_id = res.get("id") if isinstance(res, dict) else None
+                if new_id:
+                    try:
+                        requests.put(
+                            f"{client.base_url}/files/{new_id}",
+                            headers=client._headers(),
+                            json={"updated_at": mtime_iso, "last_modified": int(st.st_mtime * 1000)},
+                            timeout=10
+                        )
+                    except Exception:
+                        pass
+                return True
+            return False
+
+        try:
+            log_event("info", f"Iniciando carga de '{src_target.name}' hacia FileJump (carpeta #{dest_remote_id})...")
+            if src_target.is_file():
+                f_size = src_target.stat().st_size
+                single_items = [{"name": src_target.name, "size": f_size, "sent": 0, "file_pct": 0, "status": "active"}]
+                _update_transfer_job(
+                    job_id,
+                    total_files=1,
+                    bytes_total=f_size,
+                    current_file=src_target.name,
+                    items=list(single_items)
+                )
+                log_event("info", f"⬆ Subiendo archivo: {src_target.name}")
+                cb = _make_speed_tracker(job_id, 0, f_size, single_items, 0)
+                if _upload_single(src_target, target_parent_id, progress_cb=cb):
+                    _update_transfer_job(
+                        job_id,
+                        status="completed",
+                        processed_files=1,
+                        bytes_done=f_size,
+                        percent=100,
+                        file_percent=100,
+                        speed_text="Completado",
+                        current_file="Carga completada",
+                        items=[{"name": src_target.name, "size": f_size, "sent": f_size, "file_pct": 100, "status": "done"}]
+                    )
+                    log_event("success", f"✔ Archivo '{src_target.name}' subido a FileJump.")
+                else:
+                    detail = getattr(client, "last_upload_error", "Error desconocido de la API")
+                    _update_transfer_job(
+                        job_id,
+                        status="error",
+                        error=f"Fallo al subir '{src_target.name}': {detail}",
+                        items=[{"name": src_target.name, "size": f_size, "sent": 0, "file_pct": 0, "status": "error"}]
+                    )
+                    log_event("error", f"✖ Fallo al subir '{src_target.name}': {detail}")
+            else:
+                src_mtime = src_target.stat().st_mtime
+                root_remote_folder_id = client.create_folder(src_target.name, parent_id=target_parent_id)
+                if not root_remote_folder_id:
+                    _update_transfer_job(job_id, status="error", error=f"No se pudo crear la carpeta remota '{src_target.name}'")
+                    return
+                client._sync_remote_timestamp("folder", root_remote_folder_id, src_mtime)
+
+                files_plan = []
+                folders_plan = []
+                for root, dirs, files in os.walk(src_target):
+                    rel_root = Path(root).relative_to(src_target).as_posix()
+                    if rel_root == ".":
+                        rel_root = ""
+                    for d in sorted(dirs):
+                        rel_d = f"{rel_root}/{d}".lstrip("/")
+                        folders_plan.append((rel_root, d, rel_d, Path(root) / d))
+                    for fn in sorted(files):
+                        fp = Path(root) / fn
+                        rel_f = f"{rel_root}/{fn}".lstrip("/")
+                        files_plan.append((rel_root, rel_f, fp, fp.stat().st_size))
+
+                total_bytes = sum(x[3] for x in files_plan)
+                items_list = [{"name": x[1], "size": x[3], "sent": 0, "file_pct": 0, "status": "pending"} for x in files_plan]
+                _update_transfer_job(
+                    job_id,
+                    total_files=len(files_plan),
+                    bytes_total=total_bytes,
+                    items=items_list,
+                    current_file="Creando estructura de carpetas en FileJump..."
+                )
+
+                folder_map = {"": root_remote_folder_id}
+                for rel_parent, d_name, rel_d, sub_dir_path in folders_plan:
+                    curr_parent_id = folder_map.get(rel_parent, root_remote_folder_id)
+                    new_fid = client.create_folder(d_name, parent_id=curr_parent_id)
+                    if new_fid:
+                        folder_map[rel_d] = new_fid
+                        client._sync_remote_timestamp("folder", new_fid, sub_dir_path.stat().st_mtime)
+
+                if len(files_plan) == 0:
+                    _update_transfer_job(job_id, status="completed", percent=100, current_file="Carpeta vacía subida")
+                    log_event("success", f"✔ Carpeta vacía '{src_target.name}' creada en FileJump.")
+                    return
+
+                done_count = 0
+                done_bytes = 0
+                for idx, (rel_parent, rel_f, fp, f_sz) in enumerate(files_plan):
+                    items_list[idx]["status"] = "active"
+                    _update_transfer_job(job_id, current_file=rel_f, file_percent=0, items=list(items_list))
+                    log_event("info", f"⬆ Subiendo ({idx + 1}/{len(files_plan)}): {rel_f}")
+
+                    curr_parent_id = folder_map.get(rel_parent, root_remote_folder_id)
+                    cb = _make_speed_tracker(job_id, done_bytes, total_bytes, items_list, idx)
+                    if _upload_single(fp, curr_parent_id, progress_cb=cb):
+                        done_count += 1
+                        done_bytes += f_sz
+                        items_list[idx]["status"] = "done"
+                        items_list[idx]["sent"] = f_sz
+                        items_list[idx]["file_pct"] = 100
+                        log_event("success", f"✔ Subido: {rel_f}")
+                    else:
+                        items_list[idx]["status"] = "error"
+                        log_event("error", f"✖ Fallo al subir: {rel_f}")
+
+                    pct = int(round((done_bytes / total_bytes) * 100)) if total_bytes > 0 else int(round(((idx + 1) / len(files_plan)) * 100))
+                    _update_transfer_job(
+                        job_id,
+                        processed_files=done_count,
+                        bytes_done=done_bytes,
+                        percent=min(99 if idx + 1 < len(files_plan) else 100, pct),
+                        items=list(items_list)
+                    )
+
+                _update_transfer_job(
+                    job_id,
+                    status="completed",
+                    percent=100,
+                    speed_text="Completado",
+                    current_file="Carga completada"
+                )
+                log_event("success", f"✔ Carpeta '{src_target.name}' subida a FileJump ({done_count}/{len(files_plan)} archivo(s)).")
+        except Exception as exc:
+            _update_transfer_job(job_id, status="error", error=str(exc))
+            log_event("error", f"Error crítico en carga: {exc}")
+
+    threading.Thread(target=_run_upload, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/api/explorer/upload_to_remote", methods=["POST"])
 def api_explorer_upload_to_remote():
     """Sube un archivo o carpeta completa desde local hacia la carpeta remota destino copiando su mtime."""
@@ -2246,6 +2826,35 @@ def api_explorer_upload_to_remote():
     return jsonify({"success": True, "uploaded_files": uploaded_files})
 
 
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    """Finaliza el servidor Python y cierra la ventana de consola (CMD/Terminal) asociada."""
+    log_event("warning", "Solicitud de cierre recibida. Cerrando servidor y consola...")
+
+    def _terminate_app():
+        time.sleep(0.35)
+        try:
+            if os.name == "nt":
+                # En Windows, cierra la ventana de consola asociada al proceso si existe y finaliza el proceso
+                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if hwnd:
+                    ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+                subprocess.Popen(
+                    f"taskkill /F /T /PID {os.getpid()}",
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=_terminate_app, daemon=True).start()
+    return jsonify({"success": True, "message": "Cerrando aplicación..."})
+
+
 # ==============================================================================
 # INTERFAZ WEB (HTML + TAILWIND CSS + VANILLA JS)
 # ==============================================================================
@@ -2316,6 +2925,13 @@ HTML_TEMPLATE = r"""
                     <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
                 </svg>
                 <span>Configuración & .env</span>
+            </button>
+
+            <button onclick="shutdownApplication()" class="px-3.5 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600 border border-rose-500/40 text-xs sm:text-sm font-semibold text-rose-200 hover:text-white flex items-center gap-1.5 transition" title="Cerrar explorador, servidor Python y consola">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                </svg>
+                <span>Cerrar</span>
             </button>
         </div>
     </header>
@@ -2795,9 +3411,17 @@ HTML_TEMPLATE = r"""
 
                 <!-- Columna Derecha / Inferior: Playlist de Canciones -->
                 <div id="musicDockPlaylistCol" class="border-t border-slate-800 bg-slate-950/75 flex flex-col min-h-0">
-                    <div class="px-3.5 py-2 border-b border-slate-800/80 flex items-center justify-between shrink-0">
+                    <div class="px-3.5 py-2 border-b border-slate-800/80 flex items-center justify-between gap-2 shrink-0">
                         <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Lista de Reproducción (Playlist)</span>
                         <span id="dockPlaylistOrderTag" class="text-[10px] text-slate-500">Orden normal</span>
+                    </div>
+                    <!-- Buscador Rápido dentro de la Playlist (visible al maximizar) -->
+                    <div id="dockPlaylistSearchWrap" class="hidden px-3 py-2 border-b border-slate-800/70 bg-slate-900/60 shrink-0">
+                        <div class="relative flex items-center">
+                            <span class="absolute left-2.5 text-slate-400 text-xs pointer-events-none">🔍</span>
+                            <input type="text" id="dockPlaylistSearchInput" oninput="filterMusicPlaylist(this.value)" placeholder="Buscar canción o artista en la playlist..." class="w-full bg-slate-950 border border-slate-700/90 focus:border-indigo-500 rounded-xl pl-8 pr-7 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none">
+                            <button type="button" id="dockPlaylistSearchClearBtn" onclick="clearMusicPlaylistSearch()" class="hidden absolute right-2 text-slate-400 hover:text-white text-xs px-1" title="Limpiar búsqueda">✕</button>
+                        </div>
                     </div>
                     <div id="dockPlaylistItems" class="max-h-44 overflow-y-auto divide-y divide-slate-800/40 text-xs">
                         <!-- Elementos del playlist -->
@@ -2805,6 +3429,79 @@ HTML_TEMPLATE = r"""
                 </div>
             </div>
             <audio id="dockAudioElement" class="hidden"></audio>
+        </div>
+    </div>
+
+    <!-- VENTANA FLOTANTE DE PROGRESO DE TRANSFERENCIA (CARGA / DESCARGA) -->
+    <div id="transferDockWidget" class="fixed bottom-4 left-4 z-50 hidden transition-all duration-200">
+        <!-- Vista Minimizada (Solo barra compacta) -->
+        <div id="transferDockMinimized" onclick="setTransferDockMode('normal')" class="hidden cursor-pointer bg-slate-900/95 hover:bg-slate-800 border border-sky-500/40 rounded-2xl px-3.5 py-2.5 shadow-2xl w-72 sm:w-80 space-y-1.5 backdrop-blur">
+            <div class="flex items-center justify-between gap-2 text-xs">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span id="transferMiniIcon" class="text-sm shrink-0">⬆️</span>
+                    <span id="transferMiniTitle" class="font-semibold text-white truncate">Transfiriendo...</span>
+                </div>
+                <div class="flex items-center gap-2 shrink-0 font-mono text-[11px]">
+                    <span id="transferMiniSpeed" class="text-emerald-300">0.00 MB/s</span>
+                    <span id="transferMiniPct" class="font-bold text-sky-300">0%</span>
+                </div>
+            </div>
+            <div class="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                <div id="transferMiniBar" class="h-full bg-gradient-to-r from-sky-500 to-emerald-400 rounded-full transition-all duration-150" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <!-- Vista Normal / Maximizada (Progreso + Detalle de Archivos) -->
+        <div id="transferDockExpanded" class="w-80 sm:w-[440px] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
+            <div class="px-3.5 py-2.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between shrink-0">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span id="transferStatusDot" class="w-2 h-2 rounded-full bg-sky-400 animate-pulse shrink-0"></span>
+                    <span id="transferHeaderBadge" class="text-[11px] font-semibold uppercase tracking-wider text-sky-300 truncate">Transferencia en Curso</span>
+                </div>
+                <div class="flex items-center gap-1 shrink-0">
+                    <button onclick="setTransferDockMode('minimized')" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-sm" title="Minimizar a barra">—</button>
+                    <button id="transferMaxRestoreBtn" onclick="toggleTransferDockMaximize()" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-xs" title="Maximizar detalle">⛶</button>
+                    <button onclick="closeTransferDock()" class="w-6 h-6 rounded-lg hover:bg-rose-600/80 text-slate-400 hover:text-white flex items-center justify-center text-sm" title="Cerrar ventana">&times;</button>
+                </div>
+            </div>
+
+            <div class="p-4 space-y-3 shrink-0">
+                <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                        <div id="transferTitleText" class="text-sm font-bold text-white truncate">Preparando...</div>
+                        <div id="transferCurrentFileText" class="text-xs text-slate-400 truncate mt-0.5">Analizando archivos...</div>
+                    </div>
+                    <div class="text-right shrink-0">
+                        <div class="flex items-center justify-end gap-2">
+                            <span id="transferSpeedBadge" class="px-2 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-[11px] font-mono font-semibold text-emerald-300">0.00 MB/s</span>
+                            <span id="transferPctText" class="text-base font-bold font-mono text-sky-300">0%</span>
+                        </div>
+                        <div id="transferCountText" class="text-[10px] font-mono text-slate-400 mt-0.5">0 / 0 archivo(s)</div>
+                    </div>
+                </div>
+
+                <!-- Barra de Progreso Principal -->
+                <div class="space-y-1">
+                    <div class="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
+                        <div id="transferMainBar" class="h-full bg-gradient-to-r from-sky-500 via-indigo-500 to-emerald-400 rounded-full transition-all duration-150" style="width: 0%"></div>
+                    </div>
+                    <div class="flex justify-between text-[10px] text-slate-300 font-mono">
+                        <span id="transferBytesText">0.00 MB / 0.00 MB</span>
+                        <span id="transferStateLabel">En progreso...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Lista Detallada de Archivos (Visible en Normal y Ampliada en Maximizado) -->
+            <div id="transferDetailContainer" class="border-t border-slate-800 bg-slate-950/75 flex flex-col min-h-0">
+                <div class="px-3.5 py-2 border-b border-slate-800/80 flex items-center justify-between shrink-0">
+                    <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Detalle de Archivos</span>
+                    <span id="transferDetailCountTag" class="text-[10px] text-slate-500">0 elementos</span>
+                </div>
+                <div id="transferItemsList" class="max-h-36 overflow-y-auto divide-y divide-slate-800/40 text-xs">
+                    <!-- Archivos procesados -->
+                </div>
+            </div>
         </div>
     </div>
 
@@ -2878,6 +3575,7 @@ HTML_TEMPLATE = r"""
         let musicSource = 'local';
         let musicShuffle = false;
         let musicDockMode = 'normal'; // 'minimized' | 'normal' | 'maximized'
+        let musicPlaylistSearchQuery = '';
         let currentCoverDataUrl = null;
         let currentCoverFilename = 'caratula.jpg';
         const prefetchedRemoteIds = new Set();
@@ -2916,6 +3614,10 @@ HTML_TEMPLATE = r"""
         let remoteSelectedKey = 'ROOT';
         let activeContextTarget = null;
         let renamePendingTarget = null;
+
+        // Estado de la Ventana Flotante de Transferencias (Carga / Descarga)
+        let transferDockMode = 'normal'; // 'minimized' | 'normal' | 'maximized'
+        let activeTransferPollTimer = null;
 
         // Estado de Ordenamiento por Explorador ('name' | 'size' | 'mtime' | 'status')
         const explorerSortState = {
@@ -3257,6 +3959,7 @@ HTML_TEMPLATE = r"""
             const playerCol = document.getElementById('musicDockPlayerCol');
             const playlistCol = document.getElementById('musicDockPlaylistCol');
             const playlistItems = document.getElementById('dockPlaylistItems');
+            const searchWrap = document.getElementById('dockPlaylistSearchWrap');
             const coverBox = document.getElementById('dockCoverBox');
             const maxBtn = document.getElementById('dockMaxRestoreBtn');
 
@@ -3273,12 +3976,13 @@ HTML_TEMPLATE = r"""
             expEl.classList.remove('hidden');
 
             if (mode === 'maximized') {
-                widget.className = 'fixed inset-4 sm:inset-8 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm rounded-2xl transition-all duration-200';
-                expEl.className = 'w-full h-full max-w-5xl max-h-[88vh] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                widget.className = 'fixed inset-0 w-screen h-screen p-3 sm:p-6 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md transition-all duration-200';
+                expEl.className = 'w-full h-full max-w-5xl max-h-[90vh] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
                 mainGrid.className = 'grid grid-cols-1 md:grid-cols-12 flex-1 min-h-0 overflow-hidden';
                 playerCol.className = 'md:col-span-6 p-5 sm:p-6 space-y-4 flex flex-col justify-between overflow-y-auto';
                 playlistCol.className = 'md:col-span-6 border-t md:border-t-0 md:border-l border-slate-800 bg-slate-950/75 flex flex-col min-h-0';
                 playlistItems.className = 'flex-1 overflow-y-auto divide-y divide-slate-800/40 text-xs';
+                if (searchWrap) searchWrap.classList.remove('hidden');
                 coverBox.className = 'w-28 h-28 sm:w-36 sm:h-36 rounded-2xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-xl cursor-zoom-in transition-all';
                 if (maxBtn) { maxBtn.textContent = '🗗'; maxBtn.title = 'Restaurar tamaño'; }
             } else {
@@ -3288,6 +3992,7 @@ HTML_TEMPLATE = r"""
                 playerCol.className = 'p-4 space-y-3.5 flex flex-col justify-between shrink-0';
                 playlistCol.className = 'border-t border-slate-800 bg-slate-950/75 flex flex-col min-h-0';
                 playlistItems.className = 'max-h-44 overflow-y-auto divide-y divide-slate-800/40 text-xs';
+                if (searchWrap) searchWrap.classList.add('hidden');
                 coverBox.className = 'w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner cursor-zoom-in transition-all';
                 if (maxBtn) { maxBtn.textContent = '⛶'; maxBtn.title = 'Maximizar reproductor'; }
             }
@@ -3526,12 +4231,16 @@ HTML_TEMPLATE = r"""
                     const title = meta.title || fallbackTitle;
                     const artist = meta.artist || 'Artista desconocido';
                     const album = meta.album || '';
+                    track.id3_title = title;
+                    track.id3_artist = artist;
+                    track.id3_album = album;
                     document.getElementById('dockTrackTitle').textContent = title;
                     document.getElementById('dockTrackTitle').title = title;
                     document.getElementById('dockTrackArtist').textContent = artist;
                     document.getElementById('dockTrackAlbum').textContent = album;
                     document.getElementById('miniTrackTitle').textContent = title;
                     document.getElementById('miniTrackArtist').textContent = artist;
+                    renderMusicPlaylist();
 
                     if (meta.cover_data_url) {
                         currentCoverDataUrl = meta.cover_data_url;
@@ -3543,32 +4252,19 @@ HTML_TEMPLATE = r"""
 
             prefetchNextRemoteTrack();
         }
-
-        function prefetchNextRemoteTrack() {
-            const badge = document.getElementById('dockPrefetchBadge');
-            if (badge) badge.classList.add('hidden');
-            if (musicSource !== 'remote' || musicPlayOrder.length <= 1) return;
-
-            const nextOrderPos = (musicOrderPos + 1) % musicPlayOrder.length;
-            const nextTrack = musicPlaylist[musicPlayOrder[nextOrderPos]];
-            if (!nextTrack || !nextTrack.id) return;
-
-            if (prefetchedRemoteIds.has(String(nextTrack.id))) {
-                if (badge) badge.classList.remove('hidden');
-                return;
+        function filterMusicPlaylist(query) {
+            musicPlaylistSearchQuery = (query || '').trim().toLowerCase();
+            const clearBtn = document.getElementById('dockPlaylistSearchClearBtn');
+            if (clearBtn) {
+                clearBtn.classList.toggle('hidden', musicPlaylistSearchQuery.length === 0);
             }
+            renderMusicPlaylist();
+        }
 
-            const qParams = buildAudioQueryParams('remote', nextTrack);
-            fetch(`/api/file/prefetch?${qParams}`)
-                .then(r => r.json())
-                .then(data => {
-                    if (data && data.prefetched) {
-                        prefetchedRemoteIds.add(String(nextTrack.id));
-                        if (badge) badge.classList.remove('hidden');
-                        renderMusicPlaylist();
-                    }
-                })
-                .catch(() => {});
+        function clearMusicPlaylistSearch() {
+            const input = document.getElementById('dockPlaylistSearchInput');
+            if (input) input.value = '';
+            filterMusicPlaylist('');
         }
 
         function renderMusicPlaylist() {
@@ -3585,16 +4281,37 @@ HTML_TEMPLATE = r"""
                 return;
             }
 
-            container.innerHTML = musicPlayOrder.map((realIdx, pos) => {
+            const q = musicPlaylistSearchQuery;
+            const visibleEntries = [];
+            musicPlayOrder.forEach((realIdx, pos) => {
                 const tr = musicPlaylist[realIdx];
+                if (!tr) return;
+                if (q) {
+                    const haystack = `${tr.name || ''} ${tr.id3_title || ''} ${tr.id3_artist || ''} ${tr.id3_album || ''}`.toLowerCase();
+                    if (!haystack.includes(q)) return;
+                }
+                visibleEntries.push({ tr, pos });
+            });
+
+            if (visibleEntries.length === 0) {
+                container.innerHTML = `<div class="px-3.5 py-6 text-center text-slate-500">No se encontraron canciones o artistas para "<span class="text-slate-300">${escapeAttr(musicPlaylistSearchQuery)}</span>"</div>`;
+                return;
+            }
+
+            container.innerHTML = visibleEntries.map(({ tr, pos }) => {
                 const isCurrent = pos === musicOrderPos;
                 const isCached = musicSource === 'remote' && tr.id && prefetchedRemoteIds.has(String(tr.id));
+                const displayTitle = tr.id3_title || tr.name;
+                const displaySub = tr.id3_artist && tr.id3_artist !== 'Artista desconocido' ? `${tr.id3_artist} • ${tr.name}` : tr.name;
                 return `
                     <div onclick="playDockTrackAtOrderPos(${pos})"
                          class="px-3.5 py-2 flex items-center justify-between gap-2 cursor-pointer transition ${isCurrent ? 'bg-indigo-600/25 text-white font-semibold' : 'text-slate-300 hover:bg-slate-800/70'}">
                         <div class="flex items-center gap-2 min-w-0">
                             <span class="text-[10px] font-mono ${isCurrent ? 'text-indigo-300' : 'text-slate-500'} w-5 shrink-0">${isCurrent ? '▶' : (pos + 1)}</span>
-                            <span class="truncate" title="${tr.name}">${tr.name}</span>
+                            <div class="min-w-0">
+                                <div class="truncate" title="${escapeAttr(displayTitle)}">${escapeAttr(displayTitle)}</div>
+                                ${tr.id3_title ? `<div class="text-[10px] text-slate-400 truncate font-normal">${escapeAttr(displaySub)}</div>` : ''}
+                            </div>
                         </div>
                         <div class="flex items-center gap-1.5 shrink-0">
                             ${isCached ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">⚡ Caché</span>' : ''}
@@ -4148,18 +4865,15 @@ HTML_TEMPLATE = r"""
             }).join('');
         }
 
-        // =========================================================================
-        // VISOR MULTIMEDIA Y PREVISUALIZACIÓN DE ARCHIVOS
-        // =========================================================================
         function openExplorerFile(source, fileMeta) {
-            if (!fileMeta) return;
+            currentPreviewSource = source;
+            const folderFiles = getCurrentFolderFiles(source);
+            const nonAudioFiles = folderFiles.filter(f => !isAudioFilename(f.name));
             if (isAudioFilename(fileMeta.name)) {
                 openMusicDockPlayer(source, fileMeta, false);
                 return;
             }
-            const folderFiles = getCurrentFolderFiles(source);
-            currentPreviewSource = source;
-            currentPreviewList = folderFiles.length > 0 ? folderFiles : [fileMeta];
+            currentPreviewList = nonAudioFiles.length > 0 ? nonAudioFiles : [fileMeta];
             currentPreviewIndex = currentPreviewList.findIndex(f =>
                 source === 'local'
                     ? (f.full_path && fileMeta.full_path ? f.full_path === fileMeta.full_path : f.rel_path === fileMeta.rel_path)
@@ -4173,6 +4887,53 @@ HTML_TEMPLATE = r"""
             if (currentPreviewList.length <= 1) return;
             currentPreviewIndex = (currentPreviewIndex + delta + currentPreviewList.length) % currentPreviewList.length;
             renderPreviewItem(currentPreviewList[currentPreviewIndex]);
+        }
+
+        function prefetchNextRemoteTrack() {
+            if (musicSource !== 'remote' || musicPlayOrder.length <= 1) return;
+            const nextPos = (musicOrderPos + 1) % musicPlayOrder.length;
+            const nextTrack = musicPlaylist[musicPlayOrder[nextPos]];
+            if (!nextTrack || !nextTrack.id || prefetchedRemoteIds.has(String(nextTrack.id))) return;
+
+            const badge = document.getElementById('dockPrefetchBadge');
+            const mtimeParam = nextTrack.mtime ? `&mtime=${encodeURIComponent(nextTrack.mtime)}` : '';
+            fetch(`/api/file/prefetch?source=remote&remote_id=${encodeURIComponent(nextTrack.id)}&name=${encodeURIComponent(nextTrack.name || 'audio')}${mtimeParam}`)
+                .then(r => r.json())
+                .then(res => {
+                    if (res && res.prefetched) {
+                        prefetchedRemoteIds.add(String(nextTrack.id));
+                        if (badge) badge.classList.remove('hidden');
+                        renderMusicPlaylist();
+                    }
+                })
+                .catch(() => {});
+        }
+
+        function forceVideoAudioTranscode(streamUrl, fileName, audioTrackIdx = 0) {
+            const body = document.getElementById('previewBody');
+            if (!body) return;
+            const sep = streamUrl.includes('?') ? '&' : '?';
+            const targetUrl = `${streamUrl}${sep}transcode=1&audio_track=${encodeURIComponent(audioTrackIdx)}`;
+            const existingControls = document.getElementById('videoAudioControlsBar');
+            const controlsHtml = existingControls ? existingControls.outerHTML : '';
+
+            body.innerHTML = `
+                <div class="w-full flex flex-col items-center gap-3">
+                    <div class="text-xs text-sky-300 animate-pulse">Extrayendo pista de audio #${Number(audioTrackIdx) + 1} y convirtiendo a AAC estéreo...</div>
+                    <video id="activePreviewVideo" src="${targetUrl}" controls autoplay playsinline class="max-h-[68vh] w-full rounded-xl bg-black"></video>
+                    ${controlsHtml}
+                </div>`;
+            const vid = document.getElementById('activePreviewVideo');
+            if (vid) {
+                vid.muted = false;
+                vid.volume = 0.85;
+            }
+            const sel = document.getElementById('videoAudioTrackSelect');
+            if (sel) sel.value = String(audioTrackIdx);
+        }
+
+        function onSelectVideoAudioTrack(streamUrl, fileName, trackIdx) {
+            forceVideoAudioTranscode(streamUrl, fileName, Number(trackIdx || 0));
         }
 
         async function renderPreviewItem(fileMeta) {
@@ -4207,8 +4968,43 @@ HTML_TEMPLATE = r"""
             }
 
             if (vidExts.includes(ext)) {
-                const transcodeParam = ['avi', 'mkv', 'mov'].includes(ext) ? '&transcode=1' : '';
-                body.innerHTML = `<video src="${streamUrl}${transcodeParam}" controls autoplay class="max-h-[74vh] w-full rounded-xl bg-black"></video>`;
+                const transcodeParam = ['avi', 'mkv', 'mov'].includes(ext) ? '&transcode=1&audio_track=0' : '';
+                body.innerHTML = `
+                    <div class="w-full flex flex-col items-center gap-2.5">
+                        <video id="activePreviewVideo" src="${streamUrl}${transcodeParam}" controls autoplay playsinline class="max-h-[68vh] w-full rounded-xl bg-black"></video>
+                        <div id="videoAudioControlsBar" class="w-full flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-400">
+                            <div class="flex items-center gap-2">
+                                <span id="videoTrackStatusLabel">Pista de audio:</span>
+                                <select id="videoAudioTrackSelect" onchange="onSelectVideoAudioTrack('${escapeAttr(streamUrl)}', '${escapeAttr(fileMeta.name)}', this.value)" class="hidden bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"></select>
+                            </div>
+                            <button type="button" onclick="forceVideoAudioTranscode('${escapeAttr(streamUrl)}', '${escapeAttr(fileMeta.name)}', Number(document.getElementById('videoAudioTrackSelect')?.value || 0))" class="px-2.5 py-1 rounded-lg bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 font-medium transition">
+                                🔊 Extraer Pista a AAC Compatible
+                            </button>
+                        </div>
+                    </div>`;
+                const vid = document.getElementById('activePreviewVideo');
+                if (vid) {
+                    vid.muted = false;
+                    vid.volume = 0.85;
+                    vid.play().catch(() => {});
+                }
+                // Consultar pistas de audio disponibles en el contenedor (ej. [spa] y [jpn])
+                fetch(`/api/video/tracks?${qParams}`)
+                    .then(r => r.json())
+                    .then(data => {
+                        const tracks = data.tracks || [];
+                        const sel = document.getElementById('videoAudioTrackSelect');
+                        const lbl = document.getElementById('videoTrackStatusLabel');
+                        if (!sel || !lbl) return;
+                        if (tracks.length > 0) {
+                            sel.innerHTML = tracks.map(t => `<option value="${t.audio_index}">${escapeAttr(t.label)}</option>`).join('');
+                            sel.classList.remove('hidden');
+                            lbl.textContent = tracks.length > 1 ? `Pista (${tracks.length} disponibles):` : 'Pista de audio:';
+                        } else {
+                            lbl.textContent = 'Si el video tiene doble pista o AC3:';
+                        }
+                    })
+                    .catch(() => {});
                 return;
             }
 
@@ -4230,6 +5026,12 @@ HTML_TEMPLATE = r"""
 
         function closePreviewModal() {
             const modal = document.getElementById('previewModal');
+            const vid = document.getElementById('activePreviewVideo');
+            if (vid) {
+                vid.pause();
+                vid.removeAttribute('src');
+                vid.load();
+            }
             document.getElementById('previewBody').innerHTML = '';
             modal.classList.add('hidden');
             modal.classList.remove('flex');
@@ -4359,6 +5161,180 @@ HTML_TEMPLATE = r"""
             }
         }
 
+        function setTransferDockMode(mode) {
+            transferDockMode = mode;
+            const widget = document.getElementById('transferDockWidget');
+            const minEl = document.getElementById('transferDockMinimized');
+            const expEl = document.getElementById('transferDockExpanded');
+            const itemsList = document.getElementById('transferItemsList');
+            const maxBtn = document.getElementById('transferMaxRestoreBtn');
+
+            widget.classList.remove('hidden');
+
+            if (mode === 'minimized') {
+                widget.className = 'fixed bottom-4 left-4 z-50 transition-all duration-200';
+                minEl.classList.remove('hidden');
+                expEl.classList.add('hidden');
+                return;
+            }
+
+            minEl.classList.add('hidden');
+            expEl.classList.remove('hidden');
+
+            if (mode === 'maximized') {
+                widget.className = 'fixed inset-0 w-screen h-screen p-3 sm:p-6 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md transition-all duration-200';
+                expEl.className = 'w-full h-full max-w-3xl max-h-[85vh] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                itemsList.className = 'flex-1 overflow-y-auto divide-y divide-slate-800/40 text-xs';
+                if (maxBtn) { maxBtn.textContent = '🗗'; maxBtn.title = 'Restaurar tamaño'; }
+            } else {
+                widget.className = 'fixed bottom-4 left-4 z-50 transition-all duration-200';
+                expEl.className = 'w-80 sm:w-[440px] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                itemsList.className = 'max-h-36 overflow-y-auto divide-y divide-slate-800/40 text-xs';
+                if (maxBtn) { maxBtn.textContent = '⛶'; maxBtn.title = 'Maximizar detalle'; }
+            }
+        }
+
+        function toggleTransferDockMaximize() {
+            setTransferDockMode(transferDockMode === 'maximized' ? 'normal' : 'maximized');
+        }
+
+        function closeTransferDock() {
+            if (activeTransferPollTimer) {
+                clearInterval(activeTransferPollTimer);
+                activeTransferPollTimer = null;
+            }
+            document.getElementById('transferDockWidget').classList.add('hidden');
+        }
+
+        function formatMB(bytes) {
+            const num = Number(bytes || 0);
+            return `${(num / (1024 * 1024)).toFixed(2)} MB`;
+        }
+
+        function renderTransferJobUI(job) {
+            const isUpload = job.direction === 'upload';
+            const pct = Math.max(0, Math.min(100, Number(job.percent || 0)));
+            const speedStr = job.speed_text || '0.00 MB/s';
+
+            // Minimizado
+            document.getElementById('transferMiniIcon').textContent = isUpload ? '⬆️' : '⬇️';
+            document.getElementById('transferMiniTitle').textContent = job.title || 'Transfiriendo...';
+            document.getElementById('transferMiniSpeed').textContent = job.status === 'running' ? speedStr : '';
+            document.getElementById('transferMiniPct').textContent = `${pct}%`;
+            document.getElementById('transferMiniBar').style.width = `${pct}%`;
+
+            // Expandido / Maximizado
+            document.getElementById('transferHeaderBadge').textContent = isUpload ? '⬆️ Carga a FileJump' : '⬇️ Descarga a Equipo Local';
+            document.getElementById('transferTitleText').textContent = job.title || 'Transferencia';
+            document.getElementById('transferCurrentFileText').textContent = job.error ? job.error : (job.current_file || '');
+            document.getElementById('transferSpeedBadge').textContent = speedStr;
+            document.getElementById('transferPctText').textContent = `${pct}%`;
+            document.getElementById('transferCountText').textContent = `${job.processed_files || 0} / ${job.total_files || 0} archivo(s)`;
+            document.getElementById('transferMainBar').style.width = `${pct}%`;
+            document.getElementById('transferBytesText').textContent = `${formatMB(job.bytes_done || 0)} / ${formatMB(job.bytes_total || 0)}`;
+
+            const dot = document.getElementById('transferStatusDot');
+            const stateLabel = document.getElementById('transferStateLabel');
+            const mainBar = document.getElementById('transferMainBar');
+
+            if (job.status === 'completed') {
+                dot.className = 'w-2 h-2 rounded-full bg-emerald-400 shrink-0';
+                stateLabel.textContent = 'Completado ✔';
+                stateLabel.className = 'text-emerald-400 font-semibold';
+                mainBar.className = 'h-full bg-emerald-500 rounded-full transition-all duration-150';
+            } else if (job.status === 'error') {
+                dot.className = 'w-2 h-2 rounded-full bg-rose-500 shrink-0';
+                stateLabel.textContent = 'Error ✖';
+                stateLabel.className = 'text-rose-400 font-semibold';
+                mainBar.className = 'h-full bg-rose-500 rounded-full transition-all duration-150';
+            } else {
+                dot.className = 'w-2 h-2 rounded-full bg-sky-400 animate-pulse shrink-0';
+                stateLabel.textContent = job.file_percent > 0 ? `Archivo actual: ${job.file_percent}%` : 'Transfiriendo...';
+                stateLabel.className = 'text-sky-300';
+                mainBar.className = 'h-full bg-gradient-to-r from-sky-500 via-indigo-500 to-emerald-400 rounded-full transition-all duration-150';
+            }
+
+            const items = job.items || [];
+            document.getElementById('transferDetailCountTag').textContent = `${items.length} archivo(s)`;
+            const listEl = document.getElementById('transferItemsList');
+            if (items.length === 0) {
+                listEl.innerHTML = '<div class="px-3.5 py-4 text-center text-slate-500">Esperando lista de archivos...</div>';
+            } else {
+                listEl.innerHTML = items.map(it => {
+                    let stIcon = '⏳';
+                    let rowCls = 'text-slate-400';
+                    let progressInfo = formatMB(it.size);
+                    if (it.status === 'active') {
+                        stIcon = '🔄';
+                        rowCls = 'bg-sky-600/15 text-white font-semibold';
+                        const fp = Number(it.file_pct || 0);
+                        progressInfo = `${formatMB(it.sent || 0)} / ${formatMB(it.size)} (${fp}%)`;
+                    } else if (it.status === 'done') {
+                        stIcon = '✅';
+                        rowCls = 'text-emerald-300';
+                        progressInfo = `${formatMB(it.size)} (100%)`;
+                    } else if (it.status === 'error') {
+                        stIcon = '❌';
+                        rowCls = 'text-rose-400';
+                    }
+                    return `
+                        <div class="px-3.5 py-1.5 flex items-center justify-between gap-2 ${rowCls}">
+                            <div class="flex items-center gap-2 min-w-0">
+                                <span class="shrink-0 text-[11px]">${stIcon}</span>
+                                <span class="truncate" title="${escapeAttr(it.name)}">${escapeAttr(it.name)}</span>
+                            </div>
+                            <span class="text-[10px] font-mono text-slate-400 shrink-0">${progressInfo}</span>
+                        </div>`;
+                }).join('');
+            }
+        }
+
+        function startTransferTracking(jobId, initialTitle, direction) {
+            if (activeTransferPollTimer) {
+                clearInterval(activeTransferPollTimer);
+                activeTransferPollTimer = null;
+            }
+
+            renderTransferJobUI({
+                direction,
+                title: initialTitle,
+                status: 'running',
+                current_file: 'Iniciando transferencia...',
+                processed_files: 0,
+                total_files: 0,
+                bytes_done: 0,
+                bytes_total: 0,
+                percent: 2,
+                items: []
+            });
+            setTransferDockMode(transferDockMode === 'minimized' ? 'normal' : (transferDockMode || 'normal'));
+
+            activeTransferPollTimer = setInterval(async () => {
+                try {
+                    const res = await fetch(`/api/transfer/status/${encodeURIComponent(jobId)}`);
+                    if (!res.ok) return;
+                    const job = await res.json();
+                    renderTransferJobUI(job);
+                    refreshStatusAndLogs();
+
+                    if (job.status === 'completed' || job.status === 'error') {
+                        clearInterval(activeTransferPollTimer);
+                        activeTransferPollTimer = null;
+                        if (job.direction === 'download') {
+                            await fetchLocalNodeChildren(localSelectedPath || '');
+                            renderLocalTreePanel();
+                            renderLocalContentsPanel();
+                        } else {
+                            await fetchRemoteNodeChildren(remoteSelectedKey || 'ROOT');
+                            renderRemoteTreePanel();
+                            renderRemoteContentsPanel();
+                            fetchUserStorageInfo();
+                        }
+                    }
+                } catch (e) {}
+            }, 220);
+        }
+
         async function ctxActionDownloadToLocal() {
             if (!activeContextTarget) return;
             const { item } = activeContextTarget;
@@ -4367,9 +5343,11 @@ HTML_TEMPLATE = r"""
             const taskName = document.getElementById('taskSelector').value || '';
             const currentLocalNode = localNodes.get(localSelectedPath || '');
             const payload = {
+                direction: 'download',
                 type: item.type,
                 id: item.id,
                 name: item.name,
+                size: item.size || 0,
                 mtime: item.mtime || 0,
                 dest_full_path: (currentLocalNode && currentLocalNode.full_path) || '',
                 dest_root_path: localActiveDriveRoot || '',
@@ -4378,22 +5356,19 @@ HTML_TEMPLATE = r"""
             };
 
             try {
-                const res = await fetch('/api/explorer/download_to_local', {
+                const res = await fetch('/api/explorer/transfer_start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
                 const data = await res.json();
-                if (data.success) {
-                    await fetchLocalNodeChildren(localSelectedPath || '');
-                    renderLocalTreePanel();
-                    renderLocalContentsPanel();
-                    showNotice('Descarga completada', `Se descargaron ${data.downloaded_files} archivo(s) hacia la carpeta local abierta.`);
+                if (data.job_id) {
+                    startTransferTracking(data.job_id, `Descargando: ${item.name}`, 'download');
                 } else {
-                    showNotice('Error de Descarga', data.error || 'No se pudo completar la descarga.');
+                    showNotice('Error de Descarga', data.error || 'No se pudo iniciar la descarga.');
                 }
             } catch (e) {
-                showNotice('Error de Descarga', 'Fallo de comunicación al descargar desde FileJump.');
+                showNotice('Error de Descarga', 'Fallo de comunicación al iniciar la descarga desde FileJump.');
             }
         }
 
@@ -4404,6 +5379,10 @@ HTML_TEMPLATE = r"""
 
             const taskName = document.getElementById('taskSelector').value || '';
             const payload = {
+                direction: 'upload',
+                type: item.type,
+                name: item.name,
+                size: item.size || 0,
                 full_path: item.full_path || '',
                 root_path: localActiveDriveRoot || '',
                 task: taskName,
@@ -4412,23 +5391,19 @@ HTML_TEMPLATE = r"""
             };
 
             try {
-                const res = await fetch('/api/explorer/upload_to_remote', {
+                const res = await fetch('/api/explorer/transfer_start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
                 const data = await res.json();
-                if (data.success) {
-                    await fetchRemoteNodeChildren(remoteSelectedKey || 'ROOT');
-                    renderRemoteTreePanel();
-                    renderRemoteContentsPanel();
-                    fetchUserStorageInfo();
-                    showNotice('Carga completada', `Se subieron ${data.uploaded_files} archivo(s) a FileJump.`);
+                if (data.job_id) {
+                    startTransferTracking(data.job_id, `Subiendo: ${item.name}`, 'upload');
                 } else {
-                    showNotice('Error de Carga', data.error || `Fallo al subir '${item.name}'`);
+                    showNotice('Error de Carga', data.error || `Fallo al iniciar la subida de '${item.name}'`);
                 }
             } catch (e) {
-                showNotice('Error de Carga', `Fallo al subir '${item.name}'`);
+                showNotice('Error de Carga', `Fallo de comunicación al subir '${item.name}'`);
             }
         }
 
@@ -4574,6 +5549,32 @@ HTML_TEMPLATE = r"""
         function closePropertiesModal() {
             document.getElementById('propertiesItemModal').classList.add('hidden');
             document.getElementById('propertiesItemModal').classList.remove('flex');
+        }
+
+        function shutdownApplication() {
+            showNotice(
+                'Cerrar FileJump Sync Studio',
+                'Se cerrará esta ventana del navegador, el servidor Python y la consola asociada. ¿Deseas salir ahora?',
+                async () => {
+                    try {
+                        await fetch('/api/shutdown', { method: 'POST' });
+                    } catch (e) {}
+
+                    // Intentar cerrar la pestaña/ventana del navegador
+                    try { window.open('', '_self'); } catch (e) {}
+                    try { window.close(); } catch (e) {}
+
+                    // Pantalla de respaldo si el navegador bloquea window.close() por seguridad
+                    setTimeout(() => {
+                        document.body.innerHTML = `
+                            <div class="min-h-screen bg-slate-950 text-slate-200 flex flex-col items-center justify-center p-6 text-center space-y-3">
+                                <div class="w-12 h-12 rounded-2xl bg-rose-600/20 border border-rose-500/40 text-rose-400 flex items-center justify-center text-2xl">⏻</div>
+                                <h1 class="text-lg font-bold text-white">Servidor y consola cerrados correctamente</h1>
+                                <p class="text-xs text-slate-400 max-w-md">El proceso de Python y la ventana de comandos han finalizado. Ya puedes cerrar esta pestaña.</p>
+                            </div>`;
+                    }, 300);
+                }
+            );
         }
 
         // =========================================================================
@@ -4741,7 +5742,7 @@ HTML_TEMPLATE = r"""
             row.innerHTML = `
                 <input type="text" placeholder="Nombre tarea" value="${escapeAttr(name)}" class="task-name sm:col-span-3 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white">
                 <input type="text" placeholder="Ruta local (ej. C:\\MisArchivos)" value="${escapeAttr(path)}" class="task-path sm:col-span-6 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200">
-                <input type="number" min="1" max="100" value="${threshold}" title="Umbral %" class="task-threshold sm:col-span-2 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white">
+                <input type="number" min="1" max="100" value="${threshold}" title="Umbral %" class="task-threshold sm:col-span-2 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white">
                 <button type="button" onclick="this.parentElement.remove()" class="sm:col-span-1 text-rose-400 hover:text-rose-300 text-sm font-bold text-center" title="Quitar">✕</button>
             `;
             container.appendChild(row);
