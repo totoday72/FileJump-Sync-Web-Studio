@@ -33,6 +33,9 @@ CONFIG_FILE = BASE_DIR / "sync_config.json"
 RECORDS_DIR = BASE_DIR / "sync_records"
 TEMP_CACHE_DIR = BASE_DIR / "temp_cache"
 CACHE_META_FILE = TEMP_CACHE_DIR / ".cache_index.json"
+LOCAL_FAVORITES_FALLBACK = BASE_DIR / "favorites_cache.json"
+REMOTE_APP_CONFIG_DIR = "filejump_sync_studio"
+REMOTE_FAVORITES_FILENAME = "favorites.json"
 RECORDS_DIR.mkdir(exist_ok=True)
 TEMP_CACHE_DIR.mkdir(exist_ok=True)
 
@@ -103,6 +106,7 @@ app = Flask(__name__)
 # Estado global en memoria para logs en tiempo real hacia la UI
 activity_logs = []
 transfer_jobs = {}
+audio_scan_jobs = {}
 
 def log_event(level, message):
     """Registra eventos con marca de tiempo para mostrarlos en la interfaz web."""
@@ -689,6 +693,123 @@ class FileJumpClient:
                 pass
         return False
 
+    def ensure_remote_app_config_dir(self):
+        """Obtiene o crea el directorio remoto 'filejump_sync_studio' en la raíz de FileJump."""
+        if not self.api_key:
+            return None
+        try:
+            root_folders = self.list_folders(parent_id=None)
+            for fld in root_folders:
+                fname = (fld.get("name") or fld.get("file_name") or "").strip()
+                if fname.lower() == REMOTE_APP_CONFIG_DIR.lower() and fld.get("id") is not None:
+                    return fld.get("id")
+            new_id = self.create_folder(REMOTE_APP_CONFIG_DIR, parent_id=None)
+            if new_id:
+                log_event("info", f"Directorio remoto '{REMOTE_APP_CONFIG_DIR}' creado en la raíz (ID #{new_id}).")
+            return new_id
+        except Exception as e:
+            log_event("warning", f"No se pudo verificar/crear '{REMOTE_APP_CONFIG_DIR}': {e}")
+            return None
+
+    def load_remote_favorites(self):
+        """Lee la lista de canciones favoritas desde '/filejump_sync_studio/favorites.json' en FileJump."""
+        default_payload = {"favorites": {}, "updated_at": None}
+        if not self.api_key:
+            return default_payload
+
+        folder_id = self.ensure_remote_app_config_dir()
+        if not folder_id:
+            return default_payload
+
+        try:
+            files = self.list_files(folder_id=folder_id)
+            target_file = None
+            for fl in files:
+                fname = (fl.get("name") or fl.get("file_name") or "").strip()
+                if fname.lower() == REMOTE_FAVORITES_FILENAME.lower() and fl.get("id") is not None:
+                    target_file = fl
+                    break
+
+            if not target_file:
+                return default_payload
+
+            fid = target_file.get("id")
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            for url in (f"{self.base_url}/files/{fid}/download", f"{self.base_url}/drive/file-entries/{fid}/download"):
+                try:
+                    resp = requests.get(url, headers=headers, timeout=20)
+                    if resp.status_code == 200 and resp.text.strip():
+                        parsed = json.loads(resp.text)
+                        if isinstance(parsed, dict):
+                            parsed.setdefault("favorites", {})
+                            with open(LOCAL_FAVORITES_FALLBACK, "w", encoding="utf-8") as lf:
+                                json.dump(parsed, lf, indent=4, ensure_ascii=False)
+                            return parsed
+                except Exception:
+                    pass
+        except Exception as e:
+            log_event("warning", f"No se pudo leer favoritos remotos: {e}")
+
+        if LOCAL_FAVORITES_FALLBACK.exists():
+            try:
+                with open(LOCAL_FAVORITES_FALLBACK, "r", encoding="utf-8") as lf:
+                    data = json.load(lf)
+                    if isinstance(data, dict):
+                        data.setdefault("favorites", {})
+                        return data
+            except Exception:
+                pass
+        return default_payload
+
+    def save_remote_favorites(self, favorites_map):
+        """Guarda la lista actualizada de canciones favoritas en '/filejump_sync_studio/favorites.json'."""
+        payload_data = {
+            "favorites": favorites_map if isinstance(favorites_map, dict) else {},
+            "updated_at": datetime.datetime.now(timezone.utc).isoformat()
+        }
+        try:
+            with open(LOCAL_FAVORITES_FALLBACK, "w", encoding="utf-8") as lf:
+                json.dump(payload_data, lf, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+
+        if not self.api_key:
+            return False, "Falta FILEJUMP_API_KEY"
+
+        folder_id = self.ensure_remote_app_config_dir()
+        if not folder_id:
+            return False, f"No se pudo crear ni acceder al directorio remoto '{REMOTE_APP_CONFIG_DIR}'"
+
+        try:
+            # Eliminar versión previa de favorites.json si existe para reemplazarla limpiamente
+            existing_files = self.list_files(folder_id=folder_id)
+            for fl in existing_files:
+                fname = (fl.get("name") or fl.get("file_name") or "").strip()
+                if fname.lower() == REMOTE_FAVORITES_FILENAME.lower() and fl.get("id") is not None:
+                    self.delete_file(fl.get("id"))
+
+            TEMP_CACHE_DIR.mkdir(exist_ok=True)
+            tmp_json_path = TEMP_CACHE_DIR / f".tmp_{REMOTE_FAVORITES_FILENAME}"
+            with open(tmp_json_path, "w", encoding="utf-8") as tf:
+                json.dump(payload_data, tf, indent=4, ensure_ascii=False)
+
+            cfg = load_config()
+            use_hs = cfg.get("use_high_speed_upload", True)
+            uploaded = self.upload_file(str(tmp_json_path), folder_id=folder_id, use_high_speed=use_hs)
+            try:
+                tmp_json_path.unlink()
+            except Exception:
+                pass
+
+            if uploaded is not None:
+                new_id = uploaded.get("id") if isinstance(uploaded, dict) else None
+                if new_id:
+                    self.rename_item("file", new_id, REMOTE_FAVORITES_FILENAME)
+                return True, "Favoritos sincronizados en FileJump"
+            return False, getattr(self, "last_upload_error", "No se pudo subir favorites.json")
+        except Exception as e:
+            return False, str(e)
+
     def download_file_direct(self, file_id, dest_path, remote_mtime=0.0, progress_callback=None):
         """Descarga un archivo remoto directamente a una ruta local reportando bytes por bloque y preservando mtime."""
         dest = Path(dest_path)
@@ -1111,7 +1232,7 @@ def list_remote_immediate_children(client, parent_id="ROOT", current_prefix=""):
 
     return items
 
-def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_depth=8):
+def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_depth=8, on_item_callback=None):
     """Construye el listado plano ordenado jerárquicamente de carpetas y archivos remotos."""
     if depth > max_depth:
         return []
@@ -1145,7 +1266,7 @@ def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_dep
         rel_path = f"{current_prefix}/{fname}".lstrip("/")
         updated_str = fld.get("updated_at") or fld.get("created_at") or ""
         mtime = preserved_mtimes.get(f"folder:{fid}") or parse_iso_timestamp(updated_str)
-        remote_items.append({
+        folder_entry = {
             "type": "folder",
             "id": fid,
             "name": fname,
@@ -1155,9 +1276,12 @@ def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_dep
             "size": 0,
             "mtime": mtime,
             "mtime_str": datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S") if mtime else "-"
-        })
+        }
+        remote_items.append(folder_entry)
+        if on_item_callback:
+            on_item_callback(folder_entry)
         # Recursión jerárquica dentro de la subcarpeta
-        remote_items.extend(scan_remote_tree(client, fid, rel_path, depth + 1, max_depth))
+        remote_items.extend(scan_remote_tree(client, fid, rel_path, depth + 1, max_depth, on_item_callback=on_item_callback))
 
     # Ordenar archivos alfabéticamente dentro del nivel actual
     sorted_files = sorted(files, key=lambda x: (x.get("name") or x.get("file_name") or "").lower())
@@ -1181,7 +1305,7 @@ def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_dep
         updated_str = fl.get("updated_at") or fl.get("created_at") or ""
         mtime = preserved_mtimes.get(f"file:{fid}") or parse_iso_timestamp(updated_str)
         size = fl.get("size") or fl.get("file_size") or 0
-        remote_items.append({
+        file_entry = {
             "type": "file",
             "id": fid,
             "name": fname,
@@ -1191,7 +1315,10 @@ def scan_remote_tree(client, root_folder_id, current_prefix="", depth=0, max_dep
             "size": int(size),
             "mtime": mtime,
             "mtime_str": datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S") if mtime else "-"
-        })
+        }
+        remote_items.append(file_entry)
+        if on_item_callback:
+            on_item_callback(file_entry)
 
     return remote_items
 
@@ -1299,6 +1426,48 @@ def api_user_profile():
     if not info:
         return jsonify({"connected": False})
     return jsonify({"connected": True, **info})
+
+
+@app.route("/api/music/favorites", methods=["GET", "POST"])
+def api_music_favorites():
+    """Carga o guarda las canciones favoritas en '/filejump_sync_studio/favorites.json'."""
+    client = FileJumpClient()
+    if request.method == "GET":
+        data = client.load_remote_favorites()
+        return jsonify({"success": True, "favorites": data.get("favorites", {})})
+
+    body = request.json or {}
+    action = body.get("action", "toggle")
+    track_key = str(body.get("key") or "").strip()
+    track_meta = body.get("meta") or {}
+    if not track_key:
+        return jsonify({"error": "Falta identificador de canción"}), 400
+
+    current_data = client.load_remote_favorites()
+    favs = current_data.get("favorites", {})
+
+    if action == "remove" or (action == "toggle" and track_key in favs):
+        favs.pop(track_key, None)
+        is_fav = False
+    else:
+        favs[track_key] = {
+            "name": track_meta.get("name", ""),
+            "title": track_meta.get("title", ""),
+            "artist": track_meta.get("artist", ""),
+            "album": track_meta.get("album", ""),
+            "source": track_meta.get("source", "remote"),
+            "remote_id": track_meta.get("remote_id"),
+            "added_at": datetime.datetime.now(timezone.utc).isoformat()
+        }
+        is_fav = True
+
+    ok, msg = client.save_remote_favorites(favs)
+    if ok:
+        title_lbl = track_meta.get("title") or track_meta.get("name") or track_key
+        log_event("info", f"{'❤️ Agregada a favoritos' if is_fav else '🤍 Quitada de favoritos'}: {title_lbl}")
+        return jsonify({"success": True, "is_favorite": is_fav, "favorites": favs})
+    return jsonify({"success": False, "error": msg, "is_favorite": is_fav, "favorites": favs}), 500
+
 
 @app.route("/api/remote/directories", methods=["GET"])
 def api_remote_directories():
@@ -2078,6 +2247,133 @@ def _resolve_local_explorer_target(data):
             base = Path(task["path"]).resolve()
             return (base / rel_path).resolve() if rel_path else base
     return None
+
+
+@app.route("/api/explorer/audio_scan_start", methods=["POST"])
+def api_explorer_audio_scan_start():
+    """Inicia en segundo plano el escaneo recursivo de archivos de audio con progreso en tiempo real."""
+    data = request.json or {}
+    source = data.get("source", "local")
+    item_name = data.get("name") or "Selección"
+    audio_exts = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
+    job_id = uuid.uuid4().hex[:12]
+
+    if source == "local":
+        target = _resolve_local_explorer_target(data)
+        if not target or not target.exists():
+            return jsonify({"error": "Ruta local no encontrada"}), 404
+        item_name = target.name or item_name
+    else:
+        client = FileJumpClient()
+        if not client.api_key:
+            return jsonify({"error": "Falta FILEJUMP_API_KEY"}), 400
+
+    audio_scan_jobs[job_id] = {
+        "id": job_id,
+        "source": source,
+        "title": f"Escaneando: {item_name}",
+        "status": "running",
+        "current_folder": item_name,
+        "found_count": 0,
+        "scanned_folders": 0,
+        "tracks": [],
+        "error": None
+    }
+
+    def _run_audio_scan():
+        job = audio_scan_jobs[job_id]
+        found_tracks = []
+        try:
+            if source == "local":
+                if target.is_file():
+                    job["scanned_folders"] = 1
+                    if target.suffix.lower() in audio_exts:
+                        st = target.stat()
+                        found_tracks.append({
+                            "type": "file",
+                            "name": target.name,
+                            "rel_path": target.name,
+                            "full_path": str(target),
+                            "size": st.st_size,
+                            "mtime": st.st_mtime
+                        })
+                        job["found_count"] = len(found_tracks)
+                else:
+                    for root, dirs, files in os.walk(target):
+                        dirs.sort(key=str.lower)
+                        job["scanned_folders"] += 1
+                        rel_dir = Path(root).relative_to(target).as_posix()
+                        job["current_folder"] = item_name if rel_dir == "." else rel_dir
+                        for fname in sorted(files, key=str.lower):
+                            fp = Path(root) / fname
+                            if fp.suffix.lower() in audio_exts:
+                                try:
+                                    st = fp.stat()
+                                    found_tracks.append({
+                                        "type": "file",
+                                        "name": fname,
+                                        "rel_path": fp.relative_to(target).as_posix(),
+                                        "full_path": str(fp),
+                                        "size": st.st_size,
+                                        "mtime": st.st_mtime
+                                    })
+                                    job["found_count"] = len(found_tracks)
+                                except OSError:
+                                    pass
+            else:
+                client = FileJumpClient()
+                folder_id = data.get("id")
+                if folder_id in (None, "", "ROOT"):
+                    folder_id = "ROOT"
+                elif str(folder_id).isdigit():
+                    folder_id = int(folder_id)
+
+                job["scanned_folders"] = 1
+
+                def _on_remote_entry(entry):
+                    if entry["type"] == "folder":
+                        job["scanned_folders"] += 1
+                        job["current_folder"] = entry.get("rel_path") or entry.get("name") or item_name
+                    elif entry["type"] == "file" and Path(entry["name"]).suffix.lower() in audio_exts:
+                        found_tracks.append(entry)
+                        job["found_count"] = len(found_tracks)
+
+                scan_remote_tree(client, folder_id, current_prefix="", depth=0, max_depth=12, on_item_callback=_on_remote_entry)
+
+            job["tracks"] = found_tracks
+            job["found_count"] = len(found_tracks)
+            job["status"] = "completed"
+            job["current_folder"] = "Escaneo completado"
+            origen_lbl = "equipo local" if source == "local" else "nube FileJump"
+            log_event("success", f"🎵 Playlist: se agregaron {len(found_tracks)} archivo(s) de audio desde '{item_name}' ({origen_lbl}).")
+        except Exception as exc:
+            job["status"] = "error"
+            job["error"] = str(exc)
+            log_event("error", f"Error escaneando audio en '{item_name}': {exc}")
+
+    threading.Thread(target=_run_audio_scan, daemon=True).start()
+    return jsonify({"job_id": job_id, "title": f"Escaneando: {item_name}"})
+
+
+@app.route("/api/explorer/audio_scan_status/<job_id>", methods=["GET"])
+def api_explorer_audio_scan_status(job_id):
+    """Devuelve el progreso en tiempo real del escaneo de archivos de audio."""
+    job = audio_scan_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Escaneo no encontrado"}), 404
+    resp = {
+        "id": job["id"],
+        "source": job["source"],
+        "title": job["title"],
+        "status": job["status"],
+        "current_folder": job["current_folder"],
+        "found_count": job["found_count"],
+        "scanned_folders": job["scanned_folders"],
+        "error": job["error"]
+    }
+    if job["status"] == "completed":
+        resp["tracks"] = job["tracks"]
+    return jsonify(resp)
 
 
 @app.route("/api/explorer/audio_collect", methods=["POST"])
@@ -3272,16 +3568,21 @@ HTML_TEMPLATE = r"""
 
     <!-- REPRODUCTOR DE MÚSICA FLOTANTE MINIMIZABLE Y MAXIMIZABLE (ESTILO CHAT EN VIVO EN ESQUINA DERECHA) -->
     <div id="musicDockWidget" class="fixed bottom-4 right-4 z-50 hidden transition-all duration-200">
-        <!-- Vista Minimizada (Burbuja Compacta) -->
-        <div id="musicDockMinimized" onclick="setMusicDockMode('normal')" class="hidden cursor-pointer bg-slate-900/95 hover:bg-slate-800 border border-indigo-500/40 rounded-full pl-2 pr-4 py-2 shadow-2xl flex items-center gap-3 backdrop-blur">
+        <!-- Vista Minimizada (Burbuja Compacta con Controles Rápidos) -->
+        <div id="musicDockMinimized" onclick="setMusicDockMode('normal')" class="hidden cursor-pointer bg-slate-900/95 hover:bg-slate-800 border border-indigo-500/40 rounded-full pl-2 pr-3 py-2 shadow-2xl flex items-center gap-2.5 backdrop-blur">
             <div id="miniCoverWrap" class="w-9 h-9 rounded-full bg-indigo-600/30 border border-indigo-500/40 overflow-hidden flex items-center justify-center shrink-0">
                 <span class="text-base">🎵</span>
             </div>
-            <div class="min-w-0 max-w-[160px]">
+            <div class="min-w-0 max-w-[130px] sm:max-w-[160px]">
                 <div id="miniTrackTitle" class="text-xs font-bold text-white truncate">Reproduciendo...</div>
                 <div id="miniTrackArtist" class="text-[10px] text-indigo-300 truncate">Clic para expandir</div>
             </div>
-            <button onclick="event.stopPropagation(); toggleDockPlayPause()" id="miniPlayPauseBtn" class="w-8 h-8 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-xs shrink-0">⏸</button>
+            <div class="flex items-center gap-1 shrink-0">
+                <button onclick="event.stopPropagation(); playDockPrev()" class="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center text-xs transition" title="Anterior">⏮</button>
+                <button onclick="event.stopPropagation(); toggleDockPlayPause()" id="miniPlayPauseBtn" class="w-8 h-8 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-xs transition" title="Play / Pausa">⏸</button>
+                <button onclick="event.stopPropagation(); playDockNext()" class="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center text-xs transition" title="Siguiente">⏭</button>
+                <button onclick="event.stopPropagation(); toggleCurrentTrackFavorite()" id="miniFavoriteBtn" class="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-rose-300 flex items-center justify-center text-xs transition" title="Marcar / Desmarcar canción favorita">🤍</button>
+            </div>
         </div>
 
         <!-- Vista Normal / Maximizada (Tarjeta Flotante o Modal Amplio con Carátula Grande + Playlist) -->
@@ -3304,16 +3605,21 @@ HTML_TEMPLATE = r"""
             <div id="musicDockMainGrid" class="flex flex-col flex-1 min-h-0 overflow-hidden">
                 <!-- Columna Izquierda / Superior: Carátula + Info + Controles -->
                 <div id="musicDockPlayerCol" class="p-4 space-y-3.5 flex flex-col justify-between shrink-0">
-                    <!-- Carátula ID3 + Metadatos -->
-                    <div id="dockMediaHeader" class="flex items-center gap-3.5">
-                        <div id="dockCoverBox" onclick="openCoverLightbox()" class="w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner transition-all">
-                            <span id="dockCoverEmoji" class="text-3xl">🎵</span>
+                    <!-- Carátula ID3 + Metadatos + Botón Ubicar Canción Actual -->
+                    <div id="dockMediaHeader" class="flex items-start justify-between gap-3">
+                        <div class="flex items-center gap-3.5 min-w-0 flex-1">
+                            <div id="dockCoverBox" onclick="openCoverLightbox()" class="w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner transition-all">
+                                <span id="dockCoverEmoji" class="text-3xl">🎵</span>
+                            </div>
+                            <div id="dockMetaTextWrap" class="min-w-0 flex-1">
+                                <div id="dockTrackTitle" class="text-sm font-bold text-white truncate" title="">Título de canción</div>
+                                <div id="dockTrackArtist" class="text-xs text-indigo-300 truncate mt-0.5">Artista desconocido</div>
+                                <div id="dockTrackAlbum" class="text-[11px] text-slate-400 truncate mt-0.5"></div>
+                            </div>
                         </div>
-                        <div id="dockMetaTextWrap" class="min-w-0 flex-1">
-                            <div id="dockTrackTitle" class="text-sm font-bold text-white truncate" title="">Título de canción</div>
-                            <div id="dockTrackArtist" class="text-xs text-indigo-300 truncate mt-0.5">Artista desconocido</div>
-                            <div id="dockTrackAlbum" class="text-[11px] text-slate-400 truncate mt-0.5"></div>
-                        </div>
+                        <button type="button" id="dockNormalLocateBtn" onclick="locateCurrentTrackInPlaylist()" class="w-8 h-8 rounded-xl bg-slate-800/90 hover:bg-indigo-600/30 border border-slate-700 hover:border-indigo-500/50 text-indigo-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Ubicar canción en reproducción en la lista">
+                            🎯
+                        </button>
                     </div>
 
                     <!-- Barra de Progreso Interactiva -->
@@ -3330,8 +3636,7 @@ HTML_TEMPLATE = r"""
                         <canvas id="dockVisualizerCanvas" width="360" height="54" class="w-full h-12 sm:h-14 block rounded-lg"></canvas>
                         <button onclick="cycleVisualizerStyle()" id="dockVisStyleBtn" class="absolute top-1.5 right-2 px-1.5 py-0.5 rounded bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 text-[9px] text-indigo-300 font-mono transition" title="Cambiar estilo visual">Barras</button>
                     </div>
-
-                    <!-- Botones de Control: Aleatorio, Anterior, Play/Pausa, Siguiente -->
+                    <!-- Botones de Control: Aleatorio, Anterior, Play/Pausa, Siguiente, Favorito -->
                     <div class="flex items-center justify-between gap-1.5 pt-1">
                         <button id="dockShuffleBtn" onclick="toggleDockShuffle()" class="px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-400 transition flex items-center gap-1" title="Modo Aleatorio (reordena y precarga la siguiente)">
                             <span>🔀</span><span class="text-[10px] font-medium hidden sm:inline">Aleatorio</span>
@@ -3341,6 +3646,7 @@ HTML_TEMPLATE = r"""
                             <button onclick="playDockPrev()" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center text-sm transition" title="Anterior">⏮</button>
                             <button id="dockPlayPauseBtn" onclick="toggleDockPlayPause()" class="w-11 h-11 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/30 flex items-center justify-center text-base transition" title="Play / Pausa">⏸</button>
                             <button onclick="playDockNext()" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center text-sm transition" title="Siguiente">⏭</button>
+                            <button id="dockFavoriteBtn" onclick="toggleCurrentTrackFavorite()" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-rose-300 flex items-center justify-center text-base transition" title="Marcar / Desmarcar canción favorita (guardado en FileJump)">🤍</button>
                         </div>
 
                         <div class="flex items-center gap-1.5">
@@ -3415,12 +3721,17 @@ HTML_TEMPLATE = r"""
                         <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Lista de Reproducción (Playlist)</span>
                         <span id="dockPlaylistOrderTag" class="text-[10px] text-slate-500">Orden normal</span>
                     </div>
-                    <!-- Buscador Rápido dentro de la Playlist (visible al maximizar) -->
+                    <!-- Buscador Rápido + Localizador de Pista Actual dentro de la Playlist (visible al maximizar) -->
                     <div id="dockPlaylistSearchWrap" class="hidden px-3 py-2 border-b border-slate-800/70 bg-slate-900/60 shrink-0">
-                        <div class="relative flex items-center">
-                            <span class="absolute left-2.5 text-slate-400 text-xs pointer-events-none">🔍</span>
-                            <input type="text" id="dockPlaylistSearchInput" oninput="filterMusicPlaylist(this.value)" placeholder="Buscar canción o artista en la playlist..." class="w-full bg-slate-950 border border-slate-700/90 focus:border-indigo-500 rounded-xl pl-8 pr-7 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none">
-                            <button type="button" id="dockPlaylistSearchClearBtn" onclick="clearMusicPlaylistSearch()" class="hidden absolute right-2 text-slate-400 hover:text-white text-xs px-1" title="Limpiar búsqueda">✕</button>
+                        <div class="flex items-center gap-2">
+                            <div class="relative flex items-center flex-1 min-w-0">
+                                <span class="absolute left-2.5 text-slate-400 text-xs pointer-events-none">🔍</span>
+                                <input type="text" id="dockPlaylistSearchInput" oninput="filterMusicPlaylist(this.value)" placeholder="Buscar canción o artista en la playlist..." class="w-full bg-slate-950 border border-slate-700/90 focus:border-indigo-500 rounded-xl pl-8 pr-7 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none">
+                                <button type="button" id="dockPlaylistSearchClearBtn" onclick="clearMusicPlaylistSearch()" class="hidden absolute right-2 text-slate-400 hover:text-white text-xs px-1" title="Limpiar búsqueda">✕</button>
+                            </div>
+                            <button type="button" onclick="locateCurrentTrackInPlaylist()" class="px-2.5 py-1.5 rounded-xl bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 hover:text-white text-xs font-medium transition flex items-center gap-1.5 shrink-0" title="Ubicar canción en reproducción actual">
+                                <span>🎯</span><span class="hidden sm:inline">Ubicar</span>
+                            </button>
                         </div>
                     </div>
                     <div id="dockPlaylistItems" class="max-h-44 overflow-y-auto divide-y divide-slate-800/40 text-xs">
@@ -3505,6 +3816,36 @@ HTML_TEMPLATE = r"""
         </div>
     </div>
 
+    <!-- VENTANA FLOTANTE DE ESCANEO DE AUDIO PARA PLAYLIST (CERRABLE CON ACTUALIZACIÓN ACTIVA) -->
+    <div id="audioScanDockWidget" class="fixed bottom-4 left-4 z-50 hidden w-80 sm:w-96 bg-slate-900/95 backdrop-blur border border-indigo-500/40 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200">
+        <div class="px-3.5 py-2.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+                <span id="audioScanDot" class="w-2 h-2 rounded-full bg-indigo-400 animate-pulse shrink-0"></span>
+                <span class="text-[11px] font-semibold uppercase tracking-wider text-indigo-300 truncate">Escaneando Música</span>
+            </div>
+            <button onclick="closeAudioScanDock()" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-sm transition" title="Cerrar ventana (continúa en segundo plano)">&times;</button>
+        </div>
+        <div class="p-4 space-y-3">
+            <div class="flex items-center justify-between gap-3">
+                <div class="min-w-0 flex-1">
+                    <div id="audioScanTitle" class="text-xs font-bold text-white truncate">Escaneando carpeta...</div>
+                    <div id="audioScanCurrentFolder" class="text-[11px] text-slate-400 truncate mt-0.5">Explorando subcarpetas...</div>
+                </div>
+                <div class="text-right shrink-0 bg-indigo-600/20 border border-indigo-500/30 rounded-xl px-2.5 py-1">
+                    <div id="audioScanCount" class="text-base font-bold font-mono text-indigo-300 leading-tight">0</div>
+                    <div class="text-[9px] uppercase tracking-wider text-slate-400">pistas</div>
+                </div>
+            </div>
+            <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div id="audioScanBar" class="h-full bg-gradient-to-r from-indigo-500 via-sky-400 to-emerald-400 rounded-full transition-all duration-200" style="width: 15%"></div>
+            </div>
+            <div class="flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                <span id="audioScanFoldersLabel">0 carpeta(s) revisada(s)</span>
+                <span id="audioScanStatusLabel" class="text-indigo-300">Agregando a playlist...</span>
+            </div>
+        </div>
+    </div>
+
     <!-- MODAL DE CARÁTULA GIGANTE (DELANTE DEL REPRODUCTOR MAXIMIZADO) -->
     <div id="coverLightboxModal" onclick="if(event.target===this) closeCoverLightbox()" class="fixed inset-0 bg-black/90 backdrop-blur-md hidden items-center justify-center p-4 z-[60]">
         <div class="relative bg-slate-900 border border-slate-700 rounded-2xl p-3 sm:p-4 max-w-3xl w-full flex flex-col items-center gap-3 shadow-2xl">
@@ -3579,8 +3920,8 @@ HTML_TEMPLATE = r"""
         let currentCoverDataUrl = null;
         let currentCoverFilename = 'caratula.jpg';
         const prefetchedRemoteIds = new Set();
-
-        // Estado de Volumen y Ecualizador Web Audio API (5 Bandas)
+        let favoriteTracksMap = {};
+        let favoritesSyncInProgress = false;
         let audioCtx = null;
         let eqFilters = [];
         let analyserNode = null;
@@ -3618,6 +3959,10 @@ HTML_TEMPLATE = r"""
         // Estado de la Ventana Flotante de Transferencias (Carga / Descarga)
         let transferDockMode = 'normal'; // 'minimized' | 'normal' | 'maximized'
         let activeTransferPollTimer = null;
+
+        // Estado de la Ventana Flotante de Escaneo de Audio para Playlist
+        let activeAudioScanPollTimer = null;
+        let audioScanDockClosedByUser = false;
 
         // Estado de Ordenamiento por Explorador ('name' | 'size' | 'mtime' | 'status')
         const explorerSortState = {
@@ -3813,6 +4158,7 @@ HTML_TEMPLATE = r"""
                         wasConnected = true;
                         fetchUserStorageInfo();
                         fetchRemoteDirectories(true);
+                        loadRemoteMusicFavorites();
                     }
                 } else {
                     wasConnected = false;
@@ -3961,6 +4307,8 @@ HTML_TEMPLATE = r"""
             const playlistItems = document.getElementById('dockPlaylistItems');
             const searchWrap = document.getElementById('dockPlaylistSearchWrap');
             const coverBox = document.getElementById('dockCoverBox');
+            const visWrap = document.getElementById('dockVisualizerWrap');
+            const visCanvas = document.getElementById('dockVisualizerCanvas');
             const maxBtn = document.getElementById('dockMaxRestoreBtn');
 
             widget.classList.remove('hidden');
@@ -3984,6 +4332,14 @@ HTML_TEMPLATE = r"""
                 playlistItems.className = 'flex-1 overflow-y-auto divide-y divide-slate-800/40 text-xs';
                 if (searchWrap) searchWrap.classList.remove('hidden');
                 coverBox.className = 'w-28 h-28 sm:w-36 sm:h-36 rounded-2xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-xl cursor-zoom-in transition-all';
+                if (visWrap) {
+                    visWrap.className = `bg-slate-950/90 border border-slate-800/90 rounded-2xl p-3 relative overflow-hidden flex-1 min-h-[150px] flex items-center${visualizerEnabled ? '' : ' hidden'}`;
+                }
+                if (visCanvas) {
+                    visCanvas.width = 560;
+                    visCanvas.height = 200;
+                    visCanvas.className = 'w-full h-full block rounded-xl';
+                }
                 if (maxBtn) { maxBtn.textContent = '🗗'; maxBtn.title = 'Restaurar tamaño'; }
             } else {
                 widget.className = 'fixed bottom-4 right-4 z-50 transition-all duration-200';
@@ -3994,6 +4350,14 @@ HTML_TEMPLATE = r"""
                 playlistItems.className = 'max-h-44 overflow-y-auto divide-y divide-slate-800/40 text-xs';
                 if (searchWrap) searchWrap.classList.add('hidden');
                 coverBox.className = 'w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner cursor-zoom-in transition-all';
+                if (visWrap) {
+                    visWrap.className = `bg-slate-950/90 border border-slate-800/90 rounded-xl p-2 relative overflow-hidden${visualizerEnabled ? '' : ' hidden'}`;
+                }
+                if (visCanvas) {
+                    visCanvas.width = 360;
+                    visCanvas.height = 54;
+                    visCanvas.className = 'w-full h-12 sm:h-14 block rounded-lg';
+                }
                 if (maxBtn) { maxBtn.textContent = '⛶'; maxBtn.title = 'Maximizar reproductor'; }
             }
         }
@@ -4013,6 +4377,14 @@ HTML_TEMPLATE = r"""
                 cancelAnimationFrame(visualizerRafId);
                 visualizerRafId = null;
             }
+            musicPlaylist = [];
+            musicPlayOrder = [];
+            musicOrderPos = -1;
+            musicPlaylistSearchQuery = '';
+            const searchInput = document.getElementById('dockPlaylistSearchInput');
+            if (searchInput) searchInput.value = '';
+            const clearBtn = document.getElementById('dockPlaylistSearchClearBtn');
+            if (clearBtn) clearBtn.classList.add('hidden');
             document.getElementById('musicDockWidget').classList.add('hidden');
         }
 
@@ -4125,6 +4497,139 @@ HTML_TEMPLATE = r"""
             return `${m}:${s < 10 ? '0' : ''}${s}`;
         }
 
+        function getTrackFavoriteKey(track, source = musicSource) {
+            if (!track) return '';
+            if (source === 'remote' && track.id != null) {
+                return `remote:${track.id}`;
+            }
+            const cleanName = (track.name || '').trim().toLowerCase();
+            return `name:${cleanName}`;
+        }
+
+        function isTrackFavorite(track, source = musicSource) {
+            if (!track) return false;
+            const primaryKey = getTrackFavoriteKey(track, source);
+            if (primaryKey && favoriteTracksMap[primaryKey]) return true;
+            const byNameKey = `name:${(track.name || '').trim().toLowerCase()}`;
+            return Boolean(favoriteTracksMap[byNameKey]);
+        }
+
+        function updateDockFavoriteButtonUI() {
+            const btn = document.getElementById('dockFavoriteBtn');
+            const miniBtn = document.getElementById('miniFavoriteBtn');
+            const currentTrack = (musicOrderPos >= 0 && musicPlayOrder.length > 0)
+                ? musicPlaylist[musicPlayOrder[musicOrderPos]]
+                : null;
+            const isFav = isTrackFavorite(currentTrack, musicSource);
+
+            if (btn) {
+                if (isFav) {
+                    btn.textContent = '❤️';
+                    btn.className = 'w-9 h-9 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/50 text-rose-400 flex items-center justify-center text-base shadow-md shadow-rose-500/15 transition';
+                    btn.title = 'Quitar de favoritos (guardado en filejump_sync_studio)';
+                } else {
+                    btn.textContent = '🤍';
+                    btn.className = 'w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-rose-300 flex items-center justify-center text-base transition';
+                    btn.title = 'Agregar a favoritos (guardado en filejump_sync_studio)';
+                }
+            }
+
+            if (miniBtn) {
+                if (isFav) {
+                    miniBtn.textContent = '❤️';
+                    miniBtn.className = 'w-7 h-7 rounded-full bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/50 text-rose-400 flex items-center justify-center text-xs transition';
+                    miniBtn.title = 'Quitar de favoritos';
+                } else {
+                    miniBtn.textContent = '🤍';
+                    miniBtn.className = 'w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-rose-300 flex items-center justify-center text-xs transition';
+                    miniBtn.title = 'Agregar a favoritos';
+                }
+            }
+        }
+
+        async function loadRemoteMusicFavorites() {
+            try {
+                const res = await fetch('/api/music/favorites');
+                const data = await res.json();
+                if (data && data.favorites && typeof data.favorites === 'object') {
+                    favoriteTracksMap = data.favorites;
+                    updateDockFavoriteButtonUI();
+                    if (musicPlaylist.length > 0) {
+                        renderMusicPlaylist();
+                    }
+                }
+            } catch (e) {}
+        }
+
+        async function toggleCurrentTrackFavorite() {
+            if (favoritesSyncInProgress || musicOrderPos < 0 || musicPlayOrder.length === 0) return;
+            const track = musicPlaylist[musicPlayOrder[musicOrderPos]];
+            if (!track) return;
+
+            const key = getTrackFavoriteKey(track, musicSource);
+            const nameKey = `name:${(track.name || '').trim().toLowerCase()}`;
+            const currentlyFav = isTrackFavorite(track, musicSource);
+            const activeKey = favoriteTracksMap[key] ? key : (favoriteTracksMap[nameKey] ? nameKey : key);
+
+            // Actualización optimista inmediata en la interfaz
+            if (currentlyFav) {
+                delete favoriteTracksMap[key];
+                delete favoriteTracksMap[nameKey];
+            } else {
+                favoriteTracksMap[key] = {
+                    name: track.name || '',
+                    title: track.id3_title || '',
+                    artist: track.id3_artist || '',
+                    album: track.id3_album || '',
+                    source: musicSource,
+                    remote_id: track.id || null
+                };
+            }
+            updateDockFavoriteButtonUI();
+            renderMusicPlaylist();
+
+            favoritesSyncInProgress = true;
+            const btn = document.getElementById('dockFavoriteBtn');
+            const miniBtn = document.getElementById('miniFavoriteBtn');
+            if (btn) btn.classList.add('opacity-70');
+            if (miniBtn) miniBtn.classList.add('opacity-70');
+
+            try {
+                const res = await fetch('/api/music/favorites', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: currentlyFav ? 'remove' : 'add',
+                        key: activeKey,
+                        meta: {
+                            name: track.name || '',
+                            title: track.id3_title || '',
+                            artist: track.id3_artist || '',
+                            album: track.id3_album || '',
+                            source: musicSource,
+                            remote_id: track.id || null
+                        }
+                    })
+                });
+                const data = await res.json();
+                if (data && data.favorites) {
+                    favoriteTracksMap = data.favorites;
+                }
+                if (!data.success && data.error) {
+                    showNotice('Aviso de Favoritos', data.error);
+                }
+                refreshStatusAndLogs();
+            } catch (e) {
+                showNotice('Error', 'No se pudo guardar la lista de favoritos en FileJump.');
+            } finally {
+                favoritesSyncInProgress = false;
+                if (btn) btn.classList.remove('opacity-70');
+                if (miniBtn) miniBtn.classList.remove('opacity-70');
+                updateDockFavoriteButtonUI();
+                renderMusicPlaylist();
+            }
+        }
+
         async function openMusicDockPlayer(source, fileMeta, keepExistingPlaylist = false) {
             musicSource = source;
             if (!keepExistingPlaylist) {
@@ -4176,6 +4681,7 @@ HTML_TEMPLATE = r"""
             document.getElementById('dockCoverBox').innerHTML = '<span id="dockCoverEmoji" class="text-3xl">🎵</span>';
             document.getElementById('miniCoverWrap').innerHTML = '<span class="text-base">🎵</span>';
 
+            updateDockFavoriteButtonUI();
             renderMusicPlaylist();
 
             initDockWebAudio(audioEl);
@@ -4267,6 +4773,29 @@ HTML_TEMPLATE = r"""
             filterMusicPlaylist('');
         }
 
+        function locateCurrentTrackInPlaylist() {
+            if (musicOrderPos < 0 || musicPlayOrder.length === 0) return;
+
+            // Si hay un filtro de búsqueda activo que oculta la pista actual, limpiarlo para mostrarla en su posición
+            if (musicPlaylistSearchQuery) {
+                const input = document.getElementById('dockPlaylistSearchInput');
+                if (input) input.value = '';
+                musicPlaylistSearchQuery = '';
+                const clearBtn = document.getElementById('dockPlaylistSearchClearBtn');
+                if (clearBtn) clearBtn.classList.add('hidden');
+                renderMusicPlaylist();
+            }
+
+            const rowEl = document.getElementById(`dockPlaylistRow_${musicOrderPos}`);
+            if (!rowEl) return;
+
+            rowEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            rowEl.classList.add('ring-2', 'ring-indigo-400', 'bg-indigo-500/35');
+            setTimeout(() => {
+                rowEl.classList.remove('ring-2', 'ring-indigo-400', 'bg-indigo-500/35');
+            }, 1300);
+        }
+
         function renderMusicPlaylist() {
             const container = document.getElementById('dockPlaylistItems');
             const orderTag = document.getElementById('dockPlaylistOrderTag');
@@ -4301,15 +4830,19 @@ HTML_TEMPLATE = r"""
             container.innerHTML = visibleEntries.map(({ tr, pos }) => {
                 const isCurrent = pos === musicOrderPos;
                 const isCached = musicSource === 'remote' && tr.id && prefetchedRemoteIds.has(String(tr.id));
+                const isFav = isTrackFavorite(tr, musicSource);
                 const displayTitle = tr.id3_title || tr.name;
                 const displaySub = tr.id3_artist && tr.id3_artist !== 'Artista desconocido' ? `${tr.id3_artist} • ${tr.name}` : tr.name;
                 return `
-                    <div onclick="playDockTrackAtOrderPos(${pos})"
+                    <div id="dockPlaylistRow_${pos}" onclick="playDockTrackAtOrderPos(${pos})"
                          class="px-3.5 py-2 flex items-center justify-between gap-2 cursor-pointer transition ${isCurrent ? 'bg-indigo-600/25 text-white font-semibold' : 'text-slate-300 hover:bg-slate-800/70'}">
                         <div class="flex items-center gap-2 min-w-0">
                             <span class="text-[10px] font-mono ${isCurrent ? 'text-indigo-300' : 'text-slate-500'} w-5 shrink-0">${isCurrent ? '▶' : (pos + 1)}</span>
                             <div class="min-w-0">
-                                <div class="truncate" title="${escapeAttr(displayTitle)}">${escapeAttr(displayTitle)}</div>
+                                <div class="flex items-center gap-1.5 min-w-0">
+                                    <span class="truncate" title="${escapeAttr(displayTitle)}">${escapeAttr(displayTitle)}</span>
+                                    ${isFav ? '<span class="text-[11px] text-rose-400 shrink-0" title="Canción favorita">❤️</span>' : ''}
+                                </div>
                                 ${tr.id3_title ? `<div class="text-[10px] text-slate-400 truncate font-normal">${escapeAttr(displaySub)}</div>` : ''}
                             </div>
                         </div>
@@ -5109,6 +5642,48 @@ HTML_TEMPLATE = r"""
             }
         }
 
+        function closeAudioScanDock() {
+            audioScanDockClosedByUser = true;
+            const dock = document.getElementById('audioScanDockWidget');
+            if (dock) dock.classList.add('hidden');
+        }
+
+        function renderAudioScanProgressUI(job) {
+            const dock = document.getElementById('audioScanDockWidget');
+            if (!dock || audioScanDockClosedByUser) return;
+
+            dock.classList.remove('hidden');
+            document.getElementById('audioScanTitle').textContent = job.title || 'Escaneando música...';
+            document.getElementById('audioScanCurrentFolder').textContent = job.error ? job.error : (job.current_folder || '');
+            document.getElementById('audioScanCount').textContent = String(job.found_count || 0);
+            document.getElementById('audioScanFoldersLabel').textContent = `${job.scanned_folders || 0} carpeta(s) revisada(s)`;
+
+            const dot = document.getElementById('audioScanDot');
+            const bar = document.getElementById('audioScanBar');
+            const statusLbl = document.getElementById('audioScanStatusLabel');
+
+            if (job.status === 'completed') {
+                dot.className = 'w-2 h-2 rounded-full bg-emerald-400 shrink-0';
+                bar.style.width = '100%';
+                bar.className = 'h-full bg-emerald-500 rounded-full transition-all duration-200';
+                statusLbl.textContent = '¡Listo! ✔';
+                statusLbl.className = 'text-emerald-400 font-semibold';
+            } else if (job.status === 'error') {
+                dot.className = 'w-2 h-2 rounded-full bg-rose-500 shrink-0';
+                bar.style.width = '100%';
+                bar.className = 'h-full bg-rose-500 rounded-full transition-all duration-200';
+                statusLbl.textContent = 'Error ✖';
+                statusLbl.className = 'text-rose-400 font-semibold';
+            } else {
+                dot.className = 'w-2 h-2 rounded-full bg-indigo-400 animate-pulse shrink-0';
+                const pseudoPct = Math.min(92, 18 + ((job.scanned_folders || 1) * 7) % 74);
+                bar.style.width = `${pseudoPct}%`;
+                bar.className = 'h-full bg-gradient-to-r from-indigo-500 via-sky-400 to-emerald-400 rounded-full transition-all duration-200';
+                statusLbl.textContent = 'Escaneando subcarpetas...';
+                statusLbl.className = 'text-indigo-300';
+            }
+        }
+
         async function ctxActionAddToPlaylist() {
             if (!activeContextTarget) return;
             const { source, item } = activeContextTarget;
@@ -5119,6 +5694,7 @@ HTML_TEMPLATE = r"""
                 source,
                 type: item.type,
                 id: item.id,
+                name: item.name || 'Selección',
                 full_path: item.full_path || '',
                 root_path: localActiveDriveRoot || '',
                 task: taskName,
@@ -5126,36 +5702,84 @@ HTML_TEMPLATE = r"""
             };
 
             try {
-                const res = await fetch('/api/explorer/audio_collect', {
+                const res = await fetch('/api/explorer/audio_scan_start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
-                const data = await res.json();
-                const tracks = data.tracks || [];
-                if (tracks.length === 0) {
-                    showNotice('Sin archivos de audio', 'No se encontraron pistas de audio compatibles en la selección.');
+                const startData = await res.json();
+                if (!startData.job_id) {
+                    showNotice('Error', startData.error || 'No se pudo iniciar el escaneo de audio.');
                     return;
                 }
 
-                const wasEmpty = musicPlaylist.length === 0 || musicSource !== source;
-                if (wasEmpty) {
-                    musicSource = source;
-                    musicPlaylist = tracks;
-                    rebuildMusicPlayOrder(0);
-                    setMusicDockMode(musicDockMode === 'minimized' ? 'normal' : (musicDockMode || 'normal'));
-                    await playDockTrackAtOrderPos(0);
-                } else {
-                    const startLen = musicPlaylist.length;
-                    tracks.forEach(t => {
-                        musicPlaylist.push(t);
-                        musicPlayOrder.push(musicPlaylist.length - 1);
-                    });
-                    document.getElementById('dockTrackCounter').textContent = `(${musicOrderPos + 1}/${musicPlayOrder.length})`;
-                    renderMusicPlaylist();
-                    prefetchNextRemoteTrack();
-                    showNotice('Lista actualizada', `Se agregaron ${tracks.length} pista(s) a la cola de reproducción.`);
+                if (activeAudioScanPollTimer) {
+                    clearInterval(activeAudioScanPollTimer);
+                    activeAudioScanPollTimer = null;
                 }
+
+                audioScanDockClosedByUser = false;
+                renderAudioScanProgressUI({
+                    title: startData.title || `Escaneando: ${item.name}`,
+                    status: 'running',
+                    current_folder: item.name || 'Iniciando...',
+                    found_count: 0,
+                    scanned_folders: 0
+                });
+
+                activeAudioScanPollTimer = setInterval(async () => {
+                    try {
+                        const stRes = await fetch(`/api/explorer/audio_scan_status/${encodeURIComponent(startData.job_id)}`);
+                        if (!stRes.ok) return;
+                        const job = await stRes.json();
+                        renderAudioScanProgressUI(job);
+
+                        if (job.status === 'completed' || job.status === 'error') {
+                            clearInterval(activeAudioScanPollTimer);
+                            activeAudioScanPollTimer = null;
+                            refreshStatusAndLogs();
+
+                            if (job.status === 'error') {
+                                showNotice('Error de Escaneo', job.error || 'Ocurrió un error al buscar pistas de audio.');
+                                return;
+                            }
+
+                            const tracks = job.tracks || [];
+                            if (tracks.length === 0) {
+                                showNotice('Sin archivos de audio', 'No se encontraron pistas de audio compatibles en la selección.');
+                                setTimeout(() => {
+                                    const d = document.getElementById('audioScanDockWidget');
+                                    if (d) d.classList.add('hidden');
+                                }, 1800);
+                                return;
+                            }
+
+                            const dockWidget = document.getElementById('musicDockWidget');
+                            const isDockHidden = !dockWidget || dockWidget.classList.contains('hidden');
+                            const wasEmpty = isDockHidden || musicPlaylist.length === 0 || musicSource !== source;
+                            if (wasEmpty) {
+                                musicSource = source;
+                                musicPlaylist = tracks;
+                                rebuildMusicPlayOrder(0);
+                                setMusicDockMode(musicDockMode === 'minimized' ? 'normal' : (musicDockMode || 'normal'));
+                                await playDockTrackAtOrderPos(0);
+                            } else {
+                                tracks.forEach(t => {
+                                    musicPlaylist.push(t);
+                                    musicPlayOrder.push(musicPlaylist.length - 1);
+                                });
+                                document.getElementById('dockTrackCounter').textContent = `(${musicOrderPos + 1}/${musicPlayOrder.length})`;
+                                renderMusicPlaylist();
+                                prefetchNextRemoteTrack();
+                            }
+
+                            setTimeout(() => {
+                                const d = document.getElementById('audioScanDockWidget');
+                                if (d) d.classList.add('hidden');
+                            }, 2400);
+                        }
+                    } catch (e) {}
+                }, 220);
             } catch (e) {
                 showNotice('Error', 'No se pudieron recopilar los archivos multimedia de audio.');
             }
@@ -5788,6 +6412,7 @@ HTML_TEMPLATE = r"""
         // Inicialización
         refreshStatusAndLogs();
         syncCachedRemoteIds();
+        loadRemoteMusicFavorites();
         fetchLocalDrives(true);
         loadInitialConfig();
         setInterval(refreshStatusAndLogs, 4000);
