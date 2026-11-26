@@ -23,6 +23,7 @@ from config_manager import (
     activity_logs,
     transfer_jobs,
     audio_scan_jobs,
+    compare_jobs,
     log_event,
     compute_api_key_hash,
     load_cache_index,
@@ -322,15 +323,18 @@ def api_settings():
         existing_cfg = load_config()
         incoming_cfg = data["config"]
         incoming_cfg.setdefault("account_profiles", existing_cfg.get("account_profiles", {}))
+        incoming_cfg.setdefault("preserved_mtimes", existing_cfg.get("preserved_mtimes", {}))
+        if "tasks" not in incoming_cfg:
+            incoming_cfg["tasks"] = existing_cfg.get("tasks", [])
         save_config(incoming_cfg)
-        log_event("info", "Parámetros de sincronización guardados en sync_config.json")
+        log_event("info", f"Configuración guardada en sync_config.json ({len(incoming_cfg.get('tasks', []))} perfil(es)).")
 
     return jsonify({"success": True})
 
 
 @api_bp.route("/api/inspect/<task_name>", methods=["GET"])
 def api_inspect_task(task_name):
-    """Carga únicamente el nivel raíz (1 nivel) de local y remoto para inicialización rápida."""
+    """Carga el nivel raíz (1 nivel) de local y remoto para la tarea seleccionada."""
     config = load_config()
     task = next((t for t in config["tasks"] if t["name"] == task_name), None)
     if not task:
@@ -342,34 +346,27 @@ def api_inspect_task(task_name):
     recorded_files = record.get("files", {})
     recorded_folders = record.get("folders", {})
 
-    local_items = list_local_immediate_children(local_path, "") if local_exists else []
-    for item in local_items:
-        rel = item["rel_path"]
-        if item["type"] == "folder":
-            item["sync_status"] = "synced" if rel in recorded_folders else "new"
-        else:
-            rec = recorded_files.get(rel)
-            if not rec:
-                item["sync_status"] = "new"
-            else:
-                changed = (item["size"] != rec.get("size")) or (abs(item["mtime"] - rec.get("local_mtime", 0)) > 2.0)
-                item["sync_status"] = "modified" if changed else "synced"
-
     client = FileJumpClient()
     remote_items = []
     override_remote_id = request.args.get("remote_id", "").strip()
-    remote_root_id = override_remote_id if override_remote_id else record.get("task_remote_id")
+    configured_remote_id = task.get("remote_folder_id")
+
+    if override_remote_id:
+        remote_root_id = override_remote_id
+    elif configured_remote_id not in (None, ""):
+        remote_root_id = configured_remote_id
+    else:
+        remote_root_id = record.get("task_remote_id")
+
+    if remote_root_id not in (None, "", "ROOT") and str(remote_root_id).isdigit():
+        remote_root_id = int(remote_root_id)
 
     if client.api_key:
-        if override_remote_id:
-            if override_remote_id == "ROOT":
-                remote_root_id = "ROOT"
-            else:
-                record["task_remote_id"] = int(override_remote_id) if override_remote_id.isdigit() else override_remote_id
+        if remote_root_id not in (None, ""):
+            if remote_root_id != "ROOT":
+                record["task_remote_id"] = remote_root_id
                 save_task_record(task_name, record)
-                remote_root_id = record["task_remote_id"]
-
-        if not remote_root_id:
+        else:
             top_folders = client.list_folders(parent_id=None)
             for f in top_folders:
                 if f.get("name", "").lower() == task_name.lower():
@@ -377,27 +374,44 @@ def api_inspect_task(task_name):
                     record["task_remote_id"] = remote_root_id
                     save_task_record(task_name, record)
                     break
+            if not remote_root_id:
+                remote_root_id = "ROOT"
 
-        if remote_root_id:
+        if remote_root_id is not None:
             remote_items = list_remote_immediate_children(client, remote_root_id, current_prefix="")
-            for item in remote_items:
-                rel = item["rel_path"]
-                local_candidate = Path(local_path) / rel
-                if not local_candidate.exists():
-                    item["sync_status"] = "remote_only"
-                elif item["type"] == "folder":
-                    item["sync_status"] = "synced"
-                else:
-                    st = local_candidate.stat()
-                    rec = recorded_files.get(rel)
-                    ref_mtime = rec["local_mtime"] if rec else item["mtime"]
-                    changed = (st.st_size != item["size"]) or (abs(st.st_mtime - ref_mtime) > 2.0)
-                    item["sync_status"] = "modified" if changed else "synced"
+
+    remote_by_name = {i["rel_path"]: i for i in remote_items}
+    local_items = list_local_immediate_children(local_path, "") if local_exists else []
+    for item in local_items:
+        rel = item["rel_path"]
+        rem = remote_by_name.get(rel)
+        if item["type"] == "folder":
+            item["sync_status"] = "synced" if (rem or rel in recorded_folders) else "new"
+        else:
+            if not rem:
+                item["sync_status"] = "new"
+            else:
+                size_diff = item["size"] != rem["size"]
+                time_diff = abs(item["mtime"] - rem["mtime"]) > 2.0
+                item["sync_status"] = "modified" if (size_diff or time_diff) else "synced"
+
+    for item in remote_items:
+        rel = item["rel_path"]
+        local_candidate = Path(local_path) / rel
+        if not local_candidate.exists():
+            item["sync_status"] = "remote_only"
+        elif item["type"] == "folder":
+            item["sync_status"] = "synced"
+        else:
+            st = local_candidate.stat()
+            size_diff = st.st_size != item["size"]
+            time_diff = abs(st.st_mtime - item["mtime"]) > 2.0
+            item["sync_status"] = "modified" if (size_diff or time_diff) else "synced"
 
     return jsonify({
         "task": task,
         "local_exists": local_exists,
-        "remote_root_id": remote_root_id,
+        "remote_root_id": remote_root_id if remote_root_id is not None else "ROOT",
         "last_sync": record.get("last_sync"),
         "local_items": local_items,
         "remote_items": remote_items
@@ -406,7 +420,7 @@ def api_inspect_task(task_name):
 
 @api_bp.route("/api/sync/<task_name>", methods=["POST"])
 def api_run_sync(task_name):
-    """Ejecuta la sincronización de archivos nuevos y modificados hacia FileJump."""
+    """Ejecuta la sincronización según la dirección del perfil: local_to_remote, remote_to_local o bidirectional."""
     config = load_config()
     task = next((t for t in config["tasks"] if t["name"] == task_name), None)
     if not task:
@@ -417,60 +431,114 @@ def api_run_sync(task_name):
         return jsonify({"error": "Falta FILEJUMP_API_KEY en el archivo .env"}), 400
 
     local_root = Path(task["path"])
-    if not local_root.exists():
+    direction = task.get("sync_direction", "local_to_remote")
+    if direction == "local_to_remote" and not local_root.exists():
         return jsonify({"error": f"La ruta local no existe: {local_root}"}), 400
+    local_root.mkdir(parents=True, exist_ok=True)
 
-    log_event("info", f"Iniciando sincronización para tarea '{task_name}'...")
+    dir_labels = {
+        "local_to_remote": "Local ➡ FileJump",
+        "remote_to_local": "FileJump ⬅ Local",
+        "bidirectional": "Bidireccional (Local ⇄ FileJump)"
+    }
+    log_event("info", f"Iniciando sincronización [{dir_labels.get(direction, direction)}] para '{task_name}'...")
     record = load_task_record(task_name)
 
-    task_remote_id = record.get("task_remote_id")
-    if not task_remote_id:
-        for f in client.list_folders(parent_id=None):
-            if f.get("name") == task_name:
-                task_remote_id = f.get("id")
-                break
-        if not task_remote_id:
-            task_remote_id = client.create_folder(task_name, parent_id=None)
-        if not task_remote_id:
-            return jsonify({"error": "No se pudo crear la carpeta raíz en FileJump"}), 500
+    configured_remote_id = task.get("remote_folder_id")
+    if configured_remote_id not in (None, "", "ROOT"):
+        task_remote_id = int(configured_remote_id) if str(configured_remote_id).isdigit() else configured_remote_id
         record["task_remote_id"] = task_remote_id
+    elif configured_remote_id == "ROOT":
+        task_remote_id = "ROOT"
+        record["task_remote_id"] = "ROOT"
+    else:
+        task_remote_id = record.get("task_remote_id")
+        if not task_remote_id:
+            for f in client.list_folders(parent_id=None):
+                if f.get("name") == task_name:
+                    task_remote_id = f.get("id")
+                    break
+            if not task_remote_id:
+                task_remote_id = client.create_folder(task_name, parent_id=None)
+            if not task_remote_id:
+                return jsonify({"error": "No se pudo crear la carpeta raíz en FileJump"}), 500
+            record["task_remote_id"] = task_remote_id
 
     local_items = scan_local_directory(local_root)
     remote_items = scan_remote_tree(client, task_remote_id)
-    comp_local, _ = compare_local_and_remote(local_items, remote_items, record)
+    comp_local, comp_remote = compare_local_and_remote(local_items, remote_items, record)
 
-    folder_id_map = {"": task_remote_id}
-    for r_item in remote_items:
-        if r_item["type"] == "folder":
-            folder_id_map[r_item["rel_path"]] = r_item["id"]
+    local_by_rel = {i["rel_path"]: i for i in comp_local}
+    remote_by_rel = {i["rel_path"]: i for i in comp_remote}
 
-    for item in comp_local:
-        if item["type"] == "folder" and item["rel_path"] not in folder_id_map:
-            parent_rel = Path(item["rel_path"]).parent.as_posix()
-            if parent_rel == ".":
-                parent_rel = ""
-            parent_remote_id = folder_id_map.get(parent_rel, task_remote_id)
-            new_fid = client.create_folder(item["name"], parent_id=parent_remote_id)
-            if new_fid:
-                folder_id_map[item["rel_path"]] = new_fid
-                record["folders"][item["rel_path"]] = {"remote_id": new_fid}
-                log_event("success", f"Carpeta creada en nube: {item['rel_path']}")
+    to_upload = []
+    to_download = []
 
-    to_upload = [i for i in comp_local if i["type"] == "file" and i["sync_status"] in ("new", "modified")]
+    if direction == "local_to_remote":
+        to_upload = [i for i in comp_local if i["type"] == "file" and i["sync_status"] in ("new", "modified")]
+    elif direction == "remote_to_local":
+        to_download = [i for i in comp_remote if i["type"] == "file" and i["sync_status"] in ("remote_only", "modified")]
+    elif direction == "bidirectional":
+        all_rels = sorted(set(local_by_rel.keys()) | set(remote_by_rel.keys()))
+        for rel in all_rels:
+            loc = local_by_rel.get(rel)
+            rem = remote_by_rel.get(rel)
+            if loc and loc["type"] == "file" and not rem:
+                to_upload.append(loc)
+            elif rem and rem["type"] == "file" and not loc:
+                to_download.append(rem)
+            elif loc and rem and loc["type"] == "file" and rem["type"] == "file":
+                if loc["sync_status"] == "modified" or rem["sync_status"] == "modified":
+                    if loc["mtime"] >= (rem["mtime"] + 2.0):
+                        to_upload.append(loc)
+                    elif rem["mtime"] >= (loc["mtime"] + 2.0):
+                        to_download.append(rem)
+                    elif loc["size"] != rem["size"]:
+                        to_upload.append(loc)
 
+    total_ops = len(to_upload) + len(to_download)
     total_tracked = max(len(record.get("files", {})), 1)
-    impact_pct = (len(to_upload) / total_tracked) * 100
+    impact_pct = (total_ops / total_tracked) * 100
     force = (request.json or {}).get("force", False)
     threshold = task.get("min_impact_percentage", config.get("min_impact_percentage", 40))
 
     if len(record.get("files", {})) > 0 and impact_pct > threshold and not force:
         msg = f"Impacto del {impact_pct:.1f}% supera el umbral del {threshold}%. Confirma con 'Forzar Sincronización'."
         log_event("warning", msg)
-        return jsonify({"requires_confirmation": True, "message": msg, "count": len(to_upload)}), 200
+        return jsonify({"requires_confirmation": True, "message": msg, "count": total_ops}), 200
+
+    # 1. Crear carpetas necesarias en FileJump si hay subidas
+    folder_id_map = {"": None if task_remote_id == "ROOT" else task_remote_id}
+    for r_item in remote_items:
+        if r_item["type"] == "folder":
+            folder_id_map[r_item["rel_path"]] = r_item["id"]
+
+    if direction in ("local_to_remote", "bidirectional"):
+        for item in comp_local:
+            if item["type"] == "folder" and item["rel_path"] not in folder_id_map:
+                parent_rel = Path(item["rel_path"]).parent.as_posix()
+                if parent_rel == ".":
+                    parent_rel = ""
+                parent_remote_id = folder_id_map.get(parent_rel, folder_id_map[""])
+                new_fid = client.create_folder(item["name"], parent_id=parent_remote_id)
+                if new_fid:
+                    folder_id_map[item["rel_path"]] = new_fid
+                    record["folders"][item["rel_path"]] = {"remote_id": new_fid}
+                    log_event("success", f"Carpeta creada en nube: {item['rel_path']}")
+
+    # 2. Crear carpetas necesarias en Local si hay descargas
+    if direction in ("remote_to_local", "bidirectional"):
+        for r_item in comp_remote:
+            if r_item["type"] == "folder":
+                target_local_dir = local_root / Path(r_item["rel_path"])
+                if not target_local_dir.exists():
+                    target_local_dir.mkdir(parents=True, exist_ok=True)
+                    record["folders"][r_item["rel_path"]] = {"remote_id": r_item["id"]}
 
     use_hs = config.get("use_high_speed_upload", True)
     workers = config.get("max_workers", 4)
     uploaded_count = 0
+    downloaded_count = 0
 
     def upload_worker(file_item):
         if file_item["sync_status"] == "modified" and file_item.get("remote_id"):
@@ -479,28 +547,598 @@ def api_run_sync(task_name):
         parent_rel = Path(file_item["rel_path"]).parent.as_posix()
         if parent_rel == ".":
             parent_rel = ""
-        target_folder_id = folder_id_map.get(parent_rel, task_remote_id)
+        target_folder_id = folder_id_map.get(parent_rel, folder_id_map[""])
         res = client.upload_file(file_item["full_path"], folder_id=target_folder_id, use_high_speed=use_hs)
         return file_item, res, target_folder_id
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(upload_worker, item) for item in to_upload]
-        for fut in as_completed(futures):
-            f_item, api_res, folder_id = fut.result()
-            if api_res is not None:
-                uploaded_count += 1
-                remote_file_id = api_res.get("id") if isinstance(api_res, dict) else None
-                record["files"][f_item["rel_path"]] = {
-                    "remote_id": remote_file_id,
-                    "folder_id": folder_id,
-                    "size": f_item["size"],
-                    "local_mtime": f_item["mtime"],
-                    "updated_at": datetime.datetime.now(timezone.utc).isoformat()
-                }
-                log_event("success", f"Sincronizado: {f_item['rel_path']} (ID: {remote_file_id or 'OK'})")
+    if to_upload:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(upload_worker, item) for item in to_upload]
+            for fut in as_completed(futures):
+                f_item, api_res, folder_id = fut.result()
+                if api_res is not None:
+                    uploaded_count += 1
+                    remote_file_id = api_res.get("id") if isinstance(api_res, dict) else None
+                    record["files"][f_item["rel_path"]] = {
+                        "remote_id": remote_file_id,
+                        "folder_id": folder_id,
+                        "size": f_item["size"],
+                        "local_mtime": f_item["mtime"],
+                        "updated_at": datetime.datetime.now(timezone.utc).isoformat()
+                    }
+                    log_event("success", f"⬆ Subido: {f_item['rel_path']} (ID: {remote_file_id or 'OK'})")
+
+    def download_worker(rem_item):
+        dest_file = local_root / Path(rem_item["rel_path"])
+        ok = client.download_file_direct(rem_item["id"], dest_file, remote_mtime=rem_item.get("mtime", 0.0))
+        return rem_item, dest_file, ok
+
+    if to_download:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(download_worker, item) for item in to_download]
+            for fut in as_completed(futures):
+                r_item, dest_file, ok = fut.result()
+                if ok and dest_file.exists():
+                    downloaded_count += 1
+                    st = dest_file.stat()
+                    record["files"][r_item["rel_path"]] = {
+                        "remote_id": r_item["id"],
+                        "folder_id": r_item.get("parent_id"),
+                        "size": st.st_size,
+                        "local_mtime": st.st_mtime,
+                        "updated_at": datetime.datetime.now(timezone.utc).isoformat()
+                    }
+                    log_event("success", f"⬇ Descargado: {r_item['rel_path']}")
+
     save_task_record(task_name, record)
-    log_event("info", f"Sincronización finalizada: {uploaded_count}/{len(to_upload)} archivos subidos.")
-    return jsonify({"success": True, "uploaded": uploaded_count, "total": len(to_upload)})
+    log_event("info", f"Sincronización finalizada: {uploaded_count} subido(s), {downloaded_count} descargado(s).")
+    return jsonify({
+        "success": True,
+        "direction": direction,
+        "uploaded": uploaded_count,
+        "downloaded": downloaded_count,
+        "total": total_ops
+    })
+
+
+
+
+# ==============================================================================
+# VISTA PREVIA DE COMPARACIÓN DETALLADA (CON BARRA DE PROGRESO Y ACCIONES POR FILA)
+# ==============================================================================
+def _build_detailed_comparison_rows(task_name, task, client, progress_cb=None):
+    """
+    Escanea recursivamente local y remoto reportando cada archivo verificado.
+    Regla principal según la dirección del perfil (`sync_direction`):
+      - `local_to_remote` (➡): Local es el origen maestro.
+          * Existe en Local y no en Remoto -> `->` (Subir a Nube)
+          * Existe en ambos y difiere -> `->` (Subir Local a Nube)
+          * Solo existe en Remoto -> `del_remote` (Eliminar de Nube)
+      - `remote_to_local` (⬅): FileJump es el origen maestro.
+          * Existe en Remoto y no en Local -> `<-` (Descargar a Local)
+          * Existe en ambos y difiere -> `<-` (Descargar Nube a Local)
+          * Solo existe en Local -> `del_local` (Eliminar de Local)
+      - `bidirectional` (⇄):
+          * Solo en Local -> `->`
+          * Solo en Remoto -> `<-`
+          * En ambos y difiere -> conserva el archivo más nuevo según `mtime`
+    """
+    local_root = Path(task["path"])
+    direction = task.get("sync_direction", "local_to_remote")
+    record = load_task_record(task_name)
+    recorded_files = record.get("files", {})
+    recorded_folders = record.get("folders", {})
+
+    configured_remote_id = task.get("remote_folder_id")
+    if configured_remote_id not in (None, "", "ROOT"):
+        task_remote_id = int(configured_remote_id) if str(configured_remote_id).isdigit() else configured_remote_id
+    elif configured_remote_id == "ROOT":
+        task_remote_id = "ROOT"
+    else:
+        task_remote_id = record.get("task_remote_id")
+        if not task_remote_id:
+            for f in client.list_folders(parent_id=None):
+                if f.get("name", "").lower() == task_name.lower():
+                    task_remote_id = f.get("id")
+                    break
+
+    local_items = []
+    if local_root.exists() and local_root.is_dir():
+        for root, dirs, files in os.walk(local_root):
+            rel_root = Path(root).relative_to(local_root).as_posix()
+            if rel_root == ".":
+                rel_root = ""
+
+            for d in sorted(dirs):
+                rel_path = f"{rel_root}/{d}".lstrip("/")
+                full_path = Path(root) / d
+                st = full_path.stat()
+                local_items.append({
+                    "type": "folder",
+                    "name": d,
+                    "rel_path": rel_path,
+                    "full_path": str(full_path),
+                    "size": 0,
+                    "mtime": st.st_mtime,
+                    "mtime_str": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                })
+                if progress_cb:
+                    progress_cb("local", rel_path, len(local_items))
+
+            for f in sorted(files):
+                rel_path = f"{rel_root}/{f}".lstrip("/")
+                full_path = Path(root) / f
+                st = full_path.stat()
+                local_items.append({
+                    "type": "file",
+                    "name": f,
+                    "rel_path": rel_path,
+                    "full_path": str(full_path),
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "mtime_str": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                })
+                if progress_cb:
+                    progress_cb("local", rel_path, len(local_items))
+
+    remote_items = []
+    if task_remote_id:
+        def _on_rem_item(entry):
+            if progress_cb:
+                progress_cb("remote", entry.get("rel_path", entry.get("name", "")), len(remote_items) + 1)
+
+        remote_items = scan_remote_tree(client, task_remote_id, on_item_callback=_on_rem_item)
+
+    local_map = {i["rel_path"]: i for i in local_items}
+    remote_map = {i["rel_path"]: i for i in remote_items}
+    all_paths = sorted(
+        set(local_map.keys()) | set(remote_map.keys()),
+        key=lambda p: (0 if (local_map.get(p) or remote_map.get(p))["type"] == "folder" else 1, p.lower())
+    )
+
+    rows = []
+    stats = {
+        "total": 0,
+        "changed": 0,
+        "deleted": 0,
+        "equal": 0,
+        "to_upload": 0,
+        "to_download": 0,
+        "to_delete": 0
+    }
+
+    for idx, rel in enumerate(all_paths):
+        loc = local_map.get(rel)
+        rem = remote_map.get(rel)
+        rec = recorded_files.get(rel) or recorded_folders.get(rel)
+        item_type = (loc or rem)["type"]
+        item_name = (loc or rem)["name"]
+
+        if progress_cb:
+            progress_cb("compare", rel, idx + 1, total=len(all_paths))
+
+        category = "equal"     # 'equal' | 'changed' | 'deleted'
+        default_action = "="   # '->' | '<-' | 'del_remote' | 'del_local' | '='
+        reason = "Sin cambios"
+
+        if loc and rem:
+            if item_type == "folder":
+                category = "equal"
+                default_action = "="
+                reason = "Carpeta existente en ambos lados"
+            else:
+                size_diff = loc["size"] != rem["size"]
+                time_diff = abs(loc["mtime"] - rem["mtime"]) > 2.0
+                if not size_diff and not time_diff:
+                    category = "equal"
+                    default_action = "="
+                    reason = "Idéntico (mismo tamaño y fecha)"
+                else:
+                    category = "changed"
+                    if direction == "local_to_remote":
+                        default_action = "->"
+                        reason = "Perfil Local ➡ Nube (actualizar en FileJump)"
+                    elif direction == "remote_to_local":
+                        default_action = "<-"
+                        reason = "Perfil Nube ⬅ Local (actualizar en Local)"
+                    else:
+                        if loc["mtime"] >= rem["mtime"]:
+                            default_action = "->"
+                            reason = "Bidireccional: Local más reciente"
+                        else:
+                            default_action = "<-"
+                            reason = "Bidireccional: FileJump más reciente"
+
+        elif loc and not rem:
+            # Solo existe en Local
+            if direction == "remote_to_local":
+                category = "deleted"
+                default_action = "del_local"
+                reason = "No existe en FileJump (perfil Nube ⬅ Local: eliminar en Local)"
+            elif direction == "local_to_remote":
+                category = "changed"
+                default_action = "->"
+                reason = "Nuevo en Local (perfil Local ➡ Nube: subir a FileJump)"
+            else:
+                # Bidireccional
+                if rec:
+                    category = "deleted"
+                    default_action = "->"
+                    reason = "Bidireccional: solo existe en Local (subir a FileJump)"
+                else:
+                    category = "changed"
+                    default_action = "->"
+                    reason = "Bidireccional: nuevo en Local (subir a FileJump)"
+
+        elif rem and not loc:
+            # Solo existe en FileJump (Remoto)
+            if direction == "local_to_remote":
+                category = "deleted"
+                default_action = "del_remote"
+                reason = "No existe en Local (perfil Local ➡ Nube: eliminar en FileJump)"
+            elif direction == "remote_to_local":
+                category = "changed"
+                default_action = "<-"
+                reason = "Nuevo en FileJump (perfil Nube ⬅ Local: descargar a Local)"
+            else:
+                # Bidireccional
+                if rec:
+                    category = "deleted"
+                    default_action = "<-"
+                    reason = "Bidireccional: solo existe en FileJump (descargar a Local)"
+                else:
+                    category = "changed"
+                    default_action = "<-"
+                    reason = "Bidireccional: nuevo en FileJump (descargar a Local)"
+
+        stats["total"] += 1
+        if category == "changed":
+            stats["changed"] += 1
+        elif category == "deleted":
+            stats["deleted"] += 1
+        else:
+            stats["equal"] += 1
+
+        if default_action == "->":
+            stats["to_upload"] += 1
+        elif default_action == "<-":
+            stats["to_download"] += 1
+        elif default_action in ("del_remote", "del_local"):
+            stats["to_delete"] += 1
+
+        rows.append({
+            "rel_path": rel,
+            "name": item_name,
+            "type": item_type,
+            "category": category,
+            "default_action": default_action,
+            "action": default_action,
+            "reason": reason,
+            "local": {
+                "exists": True,
+                "name": loc["name"],
+                "full_path": loc["full_path"],
+                "size": loc["size"],
+                "mtime": loc["mtime"],
+                "mtime_str": loc["mtime_str"]
+            } if loc else None,
+            "remote": {
+                "exists": True,
+                "id": rem["id"],
+                "name": rem["name"],
+                "parent_id": rem.get("parent_id"),
+                "size": rem["size"],
+                "mtime": rem["mtime"],
+                "mtime_str": rem["mtime_str"]
+            } if rem else None
+        })
+
+    return {
+        "task": task,
+        "remote_root_id": task_remote_id or "ROOT",
+        "rows": rows,
+        "stats": stats
+    }
+
+
+@api_bp.route("/api/compare/start/<task_name>", methods=["POST"])
+def api_compare_start(task_name):
+    """Inicia en segundo plano el escaneo y comparación completa reportando progreso en vivo."""
+    config = load_config()
+    task = next((t for t in config["tasks"] if t["name"] == task_name), None)
+    if not task:
+        return jsonify({"error": "Tarea no encontrada"}), 404
+
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY en el archivo .env"}), 400
+
+    job_id = uuid.uuid4().hex
+    compare_jobs[job_id] = {
+        "job_id": job_id,
+        "task_name": task_name,
+        "status": "running",
+        "phase": "local",
+        "current_file": "Iniciando exploración local...",
+        "checked_count": 0,
+        "percent": 5,
+        "result": None,
+        "error": None
+    }
+
+    def worker():
+        try:
+            def on_progress(phase, rel_path, count, total=0):
+                job = compare_jobs.get(job_id)
+                if not job:
+                    return
+                job["phase"] = phase
+                job["current_file"] = rel_path or "/"
+                job["checked_count"] = count
+                if phase == "local":
+                    job["percent"] = min(35, 5 + (count % 30))
+                elif phase == "remote":
+                    job["percent"] = min(75, 36 + (count % 39))
+                elif phase == "compare":
+                    pct = 75 + int((count / max(total, 1)) * 24)
+                    job["percent"] = min(99, pct)
+
+            result_data = _build_detailed_comparison_rows(task_name, task, client, progress_cb=on_progress)
+            compare_jobs[job_id]["status"] = "completed"
+            compare_jobs[job_id]["percent"] = 100
+            compare_jobs[job_id]["current_file"] = f"Verificación completada ({result_data['stats']['total']} elementos)."
+            compare_jobs[job_id]["result"] = result_data
+        except Exception as e:
+            compare_jobs[job_id]["status"] = "error"
+            compare_jobs[job_id]["error"] = str(e)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@api_bp.route("/api/compare/status/<job_id>", methods=["GET"])
+def api_compare_status(job_id):
+    """Devuelve el progreso en vivo y resultado final de la comparación."""
+    job = compare_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Trabajo de comparación no encontrado"}), 404
+    return jsonify(job)
+
+
+@api_bp.route("/api/compare/execute", methods=["POST"])
+def api_compare_execute():
+    """
+    Ejecuta exactamente la acción configurada en cada fila de la vista previa:
+      - '->'         : Subir archivo/carpeta de Local a FileJump
+      - '<-'         : Descargar archivo/carpeta de FileJump a Local
+      - 'del_remote' : Eliminar archivo/carpeta en FileJump
+      - 'del_local'  : Eliminar archivo/carpeta en Local
+    """
+    data = request.json or {}
+    task_name = data.get("task_name", "")
+    items = data.get("items", [])
+
+    config = load_config()
+    task = next((t for t in config["tasks"] if t["name"] == task_name), None)
+    if not task:
+        return jsonify({"error": "Tarea no encontrada"}), 404
+
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY en el archivo .env"}), 400
+
+    local_root = Path(task["path"])
+    local_root.mkdir(parents=True, exist_ok=True)
+    record = load_task_record(task_name)
+
+    configured_remote_id = task.get("remote_folder_id")
+    if configured_remote_id not in (None, "", "ROOT"):
+        task_remote_id = int(configured_remote_id) if str(configured_remote_id).isdigit() else configured_remote_id
+    elif configured_remote_id == "ROOT":
+        task_remote_id = "ROOT"
+    else:
+        task_remote_id = record.get("task_remote_id")
+        if not task_remote_id:
+            for f in client.list_folders(parent_id=None):
+                if f.get("name", "").lower() == task_name.lower():
+                    task_remote_id = f.get("id")
+                    break
+            if not task_remote_id:
+                task_remote_id = client.create_folder(task_name, parent_id=None)
+            record["task_remote_id"] = task_remote_id
+
+    remote_items = scan_remote_tree(client, task_remote_id)
+    folder_id_map = {"": None if task_remote_id == "ROOT" else task_remote_id}
+    for r_item in remote_items:
+        if r_item["type"] == "folder":
+            folder_id_map[r_item["rel_path"]] = r_item["id"]
+
+    def ensure_remote_folder_chain(rel_folder_path):
+        if not rel_folder_path or rel_folder_path == ".":
+            return folder_id_map[""]
+        if rel_folder_path in folder_id_map:
+            return folder_id_map[rel_folder_path]
+        parts = rel_folder_path.split("/")
+        acc = ""
+        parent_id = folder_id_map[""]
+        for p in parts:
+            acc = f"{acc}/{p}".lstrip("/")
+            if acc in folder_id_map:
+                parent_id = folder_id_map[acc]
+            else:
+                new_id = client.create_folder(p, parent_id=parent_id)
+                if new_id:
+                    folder_id_map[acc] = new_id
+                    record["folders"][acc] = {"remote_id": new_id}
+                    parent_id = new_id
+        return parent_id
+
+    to_upload = [it for it in items if it.get("action") == "->"]
+    to_download = [it for it in items if it.get("action") == "<-"]
+    to_del_remote = [it for it in items if it.get("action") == "del_remote"]
+    to_del_local = [it for it in items if it.get("action") == "del_local"]
+
+    use_hs = config.get("use_high_speed_upload", True)
+    workers = config.get("max_workers", 4)
+    uploaded_count = 0
+    downloaded_count = 0
+    deleted_count = 0
+
+    log_event(
+        "info",
+        f"Ejecutando sincronización para '{task_name}': {len(to_upload)} subida(s), {len(to_download)} descarga(s), {len(to_del_remote) + len(to_del_local)} eliminación(es)..."
+    )
+
+    # 1. Crear carpetas necesarias antes de subir/descargar
+    for it in to_upload:
+        rel = it["rel_path"]
+        if it.get("type") == "folder":
+            ensure_remote_folder_chain(rel)
+            uploaded_count += 1
+        else:
+            parent_rel = Path(rel).parent.as_posix()
+            ensure_remote_folder_chain("" if parent_rel == "." else parent_rel)
+
+    for it in to_download:
+        rel = it["rel_path"]
+        if it.get("type") == "folder":
+            (local_root / Path(rel)).mkdir(parents=True, exist_ok=True)
+            downloaded_count += 1
+        else:
+            (local_root / Path(rel)).parent.mkdir(parents=True, exist_ok=True)
+
+    # 2. Ejecutar subidas (->)
+    file_uploads = [it for it in to_upload if it.get("type") == "file"]
+
+    def upload_worker(it):
+        rel = it["rel_path"]
+        loc_info = it.get("local") or {}
+        rem_info = it.get("remote") or {}
+        local_file = Path(loc_info.get("full_path") or (local_root / Path(rel)))
+        if not local_file.exists():
+            return it, None, None
+        if rem_info.get("id"):
+            client.delete_file(rem_info["id"])
+        parent_rel = Path(rel).parent.as_posix()
+        target_fid = folder_id_map.get("" if parent_rel == "." else parent_rel, folder_id_map[""])
+        res = client.upload_file(str(local_file), folder_id=target_fid, use_high_speed=use_hs)
+        return it, res, target_fid
+
+    if file_uploads:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for fut in as_completed([executor.submit(upload_worker, it) for it in file_uploads]):
+                it, api_res, folder_id = fut.result()
+                if api_res is not None:
+                    uploaded_count += 1
+                    rel = it["rel_path"]
+                    loc_file = Path((it.get("local") or {}).get("full_path") or (local_root / Path(rel)))
+                    st = loc_file.stat()
+                    remote_file_id = api_res.get("id") if isinstance(api_res, dict) else None
+                    record["files"][rel] = {
+                        "remote_id": remote_file_id,
+                        "folder_id": folder_id,
+                        "size": st.st_size,
+                        "local_mtime": st.st_mtime,
+                        "updated_at": datetime.datetime.now(timezone.utc).isoformat()
+                    }
+                    log_event("success", f"⬆ Subido a FileJump: {rel}")
+
+    # 3. Ejecutar descargas (<-)
+    file_downloads = [it for it in to_download if it.get("type") == "file"]
+
+    def download_worker(it):
+        rel = it["rel_path"]
+        rem_info = it.get("remote") or {}
+        rem_id = rem_info.get("id")
+        if not rem_id:
+            return it, None, False
+        dest_file = local_root / Path(rel)
+        ok = client.download_file_direct(rem_id, dest_file, remote_mtime=rem_info.get("mtime", 0.0))
+        return it, dest_file, ok
+
+    if file_downloads:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for fut in as_completed([executor.submit(download_worker, it) for it in file_downloads]):
+                it, dest_file, ok = fut.result()
+                if ok and dest_file and dest_file.exists():
+                    downloaded_count += 1
+                    rel = it["rel_path"]
+                    rem_info = it.get("remote") or {}
+                    st = dest_file.stat()
+                    record["files"][rel] = {
+                        "remote_id": rem_info.get("id"),
+                        "folder_id": rem_info.get("parent_id"),
+                        "size": st.st_size,
+                        "local_mtime": st.st_mtime,
+                        "updated_at": datetime.datetime.now(timezone.utc).isoformat()
+                    }
+                    log_event("success", f"⬇ Descargado a Local: {rel}")
+
+    # 4. Ejecutar eliminaciones en FileJump (del_remote) — primero archivos, luego carpetas más profundas
+    rem_files_del = [it for it in to_del_remote if it.get("type") == "file"]
+    rem_folders_del = sorted(
+        [it for it in to_del_remote if it.get("type") == "folder"],
+        key=lambda x: len(x.get("rel_path", "")),
+        reverse=True
+    )
+    for it in rem_files_del:
+        rel = it["rel_path"]
+        rem_id = (it.get("remote") or {}).get("id")
+        if rem_id and client.delete_file(rem_id):
+            deleted_count += 1
+            record["files"].pop(rel, None)
+            log_event("warning", f"🗑️ Eliminado en FileJump: {rel}")
+
+    for it in rem_folders_del:
+        rel = it["rel_path"]
+        rem_id = (it.get("remote") or {}).get("id")
+        if rem_id and client.delete_folder(rem_id):
+            deleted_count += 1
+            record["folders"].pop(rel, None)
+            log_event("warning", f"🗑️ Carpeta eliminada en FileJump: {rel}")
+
+    # 5. Ejecutar eliminaciones en Local (del_local) — primero archivos, luego carpetas más profundas
+    loc_files_del = [it for it in to_del_local if it.get("type") == "file"]
+    loc_folders_del = sorted(
+        [it for it in to_del_local if it.get("type") == "folder"],
+        key=lambda x: len(x.get("rel_path", "")),
+        reverse=True
+    )
+    for it in loc_files_del:
+        rel = it["rel_path"]
+        target_f = Path((it.get("local") or {}).get("full_path") or (local_root / Path(rel)))
+        try:
+            if target_f.exists() and target_f.is_file():
+                target_f.unlink()
+                deleted_count += 1
+                record["files"].pop(rel, None)
+                log_event("warning", f"🗑️ Eliminado en Local: {rel}")
+        except Exception as e:
+            log_event("error", f"No se pudo eliminar archivo local '{rel}': {e}")
+
+    for it in loc_folders_del:
+        rel = it["rel_path"]
+        target_d = Path((it.get("local") or {}).get("full_path") or (local_root / Path(rel)))
+        try:
+            if target_d.exists() and target_d.is_dir():
+                shutil.rmtree(target_d)
+                deleted_count += 1
+                record["folders"].pop(rel, None)
+                log_event("warning", f"🗑️ Carpeta eliminada en Local: {rel}")
+        except Exception as e:
+            log_event("error", f"No se pudo eliminar carpeta local '{rel}': {e}")
+
+    save_task_record(task_name, record)
+    log_event(
+        "info",
+        f"Sincronización personalizada completada: {uploaded_count} subido(s), {downloaded_count} descargado(s), {deleted_count} eliminado(s)."
+    )
+    return jsonify({
+        "success": True,
+        "uploaded": uploaded_count,
+        "downloaded": downloaded_count,
+        "deleted": deleted_count
+    })
 
 
 # ==============================================================================

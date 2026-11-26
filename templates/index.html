@@ -80,15 +80,19 @@
                 <select id="taskSelector" onchange="inspectSelectedTask()" class="bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 min-w-[220px]">
                     <option value="">-- Selecciona o crea una tarea --</option>
                 </select>
+                <button type="button" onclick="openSyncProfilesModal()" class="px-3.5 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/35 border border-indigo-500/40 text-xs sm:text-sm font-semibold text-indigo-300 hover:text-white transition-colors flex items-center gap-1.5 whitespace-nowrap" title="Crear, editar o eliminar perfiles y tareas de sincronización">
+                    <span>📁</span>
+                    <span>Perfiles de Sincronización</span>
+                </button>
                 <span id="lastSyncLabel" class="text-xs text-slate-400"></span>
             </div>
 
             <div class="flex flex-wrap items-center gap-2.5">
-                <button onclick="inspectSelectedTask()" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs sm:text-sm font-medium text-slate-200 transition flex items-center gap-1.5">
+                <button type="button" onclick="openComparePreviewModal(false)" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs sm:text-sm font-medium text-slate-200 border border-slate-700 transition flex items-center gap-1.5">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                     Comparar Ahora
                 </button>
-                <button id="syncBtn" onclick="triggerSync(false)" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs sm:text-sm font-semibold text-white shadow-lg shadow-indigo-600/20 transition flex items-center gap-1.5">
+                <button id="syncBtn" type="button" onclick="openComparePreviewModal(true)" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs sm:text-sm font-semibold text-white shadow-lg shadow-indigo-600/20 transition flex items-center gap-1.5">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
                     Sincronizar a FileJump
                 </button>
@@ -327,6 +331,164 @@
             <div class="px-6 py-4 border-t border-slate-800 flex justify-end gap-3">
                 <button onclick="closeSettingsModal()" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300">Cancelar</button>
                 <button onclick="saveSettings()" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar Cambios</button>
+            </div>
+        </div>
+    </div>
+
+
+
+    <!-- VENTANA DE VISTA PREVIA DE COMPARACIÓN (CON BARRA DE PROGRESO, FILTROS Y ACCIONES) -->
+    <div id="comparePreviewModal" class="fixed inset-0 bg-black/85 hidden items-center justify-center p-3 sm:p-5 z-50">
+        <div id="comparePreviewWindow" class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-7xl h-[90vh] flex flex-col shadow-2xl transition-all duration-200">
+            <!-- Barra superior de ventana -->
+            <div class="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between gap-3 bg-slate-950/60 rounded-t-2xl">
+                <div class="flex items-center gap-3 min-w-0">
+                    <span class="text-lg">🔍</span>
+                    <div class="min-w-0">
+                        <h2 id="compareModalTitle" class="text-sm sm:text-base font-bold text-white truncate">Vista Previa de Comparación</h2>
+                        <p id="compareModalSubtitle" class="text-[11px] text-slate-400 truncate">Comparación por fecha de modificación (predeterminado: conservar el más actualizado)</p>
+                    </div>
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                    <button type="button" onclick="toggleCompareModalMaximize()" id="compareMaximizeBtn" class="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-200 font-medium" title="Maximizar / Restaurar ventana">
+                        ⛶ Maximizar
+                    </button>
+                    <button type="button" onclick="closeComparePreviewModal()" class="px-2.5 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/30 border border-rose-500/30 text-xs text-rose-300 font-semibold" title="Cerrar ventana">
+                        ✕ Cerrar
+                    </button>
+                </div>
+            </div>
+
+            <!-- Barra de progreso en vivo durante el escaneo y comparación -->
+            <div id="compareProgressSection" class="px-5 py-3 bg-slate-950 border-b border-slate-800 space-y-2">
+                <div class="flex items-center justify-between text-xs">
+                    <div class="flex items-center gap-2 min-w-0">
+                        <span id="compareProgressSpinner" class="inline-block w-2.5 h-2.5 rounded-full bg-indigo-400 animate-ping"></span>
+                        <span id="compareProgressPhase" class="font-semibold text-indigo-300 shrink-0">Verificando archivos...</span>
+                        <span id="compareProgressFile" class="text-slate-400 truncate font-mono text-[11px]">Preparando comparación...</span>
+                    </div>
+                    <span id="compareProgressPercent" class="font-bold text-white shrink-0 ml-3">0%</span>
+                </div>
+                <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                    <div id="compareProgressBar" class="h-full bg-gradient-to-r from-indigo-500 via-sky-500 to-emerald-400 transition-all duration-200" style="width: 0%"></div>
+                </div>
+            </div>
+
+            <!-- Barra de filtros y contadores -->
+            <div class="px-5 py-2.5 border-b border-slate-800 bg-slate-900/90 flex flex-wrap items-center justify-between gap-3">
+                <div class="flex flex-wrap items-center gap-2">
+                    <button type="button" onclick="setCompareFilter('all')" id="cmpFilter_all" class="px-3 py-1.5 rounded-xl text-xs font-semibold bg-indigo-600 text-white border border-indigo-500 transition">
+                        1. Todos los archivos y carpetas (<span id="cmpCount_all">0</span>)
+                    </button>
+                    <button type="button" onclick="setCompareFilter('changed')" id="cmpFilter_changed" class="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition">
+                        2. Archivos que cambiaron (<span id="cmpCount_changed">0</span>)
+                    </button>
+                    <button type="button" onclick="setCompareFilter('deleted')" id="cmpFilter_deleted" class="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition">
+                        3. Archivos eliminados (<span id="cmpCount_deleted">0</span>)
+                    </button>
+                </div>
+
+                <div class="flex flex-wrap items-center gap-2.5 text-[11px] text-slate-400">
+                    <span class="flex items-center gap-1"><span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/40">-&gt;</span> Subir (<strong id="cmpSummaryUpload" class="text-emerald-300">0</strong>)</span>
+                    <span class="flex items-center gap-1"><span class="px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 font-bold border border-sky-500/40">&lt;-</span> Bajar (<strong id="cmpSummaryDownload" class="text-sky-300">0</strong>)</span>
+                    <span class="flex items-center gap-1"><span class="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-bold border border-rose-500/40">🗑️</span> Eliminar (<strong id="cmpSummaryDelete" class="text-rose-300">0</strong>)</span>
+                    <span class="flex items-center gap-1"><span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-bold border border-slate-700">=</span> Igual</span>
+                </div>
+            </div>
+
+            <!-- Tabla comparativa de doble panel (Izquierda Local | Centro Acción | Derecha Nube FileJump) -->
+            <div class="flex-1 overflow-auto">
+                <table class="w-full text-left border-collapse text-xs">
+                    <thead class="sticky top-0 z-10 bg-slate-950 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800">
+                        <tr>
+                            <th class="py-2.5 px-3 w-[25%]">Archivo / Carpeta Local</th>
+                            <th class="py-2.5 px-2.5 w-[12%]">Modificación Local</th>
+                            <th class="py-2.5 px-2.5 w-[8%] text-right">Tamaño Local</th>
+                            <th class="py-2.5 px-2 w-[10%] text-center">Acción</th>
+                            <th class="py-2.5 px-3 w-[25%]">Archivo / Carpeta Nube</th>
+                            <th class="py-2.5 px-2.5 w-[12%]">Modificación Nube</th>
+                            <th class="py-2.5 px-2.5 w-[8%] text-right">Tamaño Nube</th>
+                        </tr>
+                    </thead>
+                    <tbody id="comparePreviewTableBody" class="divide-y divide-slate-800/70">
+                        <tr>
+                            <td colspan="7" class="py-12 text-center text-slate-500">Iniciando comparación...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Barra inferior con acción de Sincronizar a FileJump -->
+            <div class="px-5 py-3.5 border-t border-slate-800 bg-slate-950/70 rounded-b-2xl flex flex-wrap items-center justify-between gap-3">
+                <div id="compareModalFooterHint" class="text-xs text-slate-400">
+                    Haz clic en el botón central (<code class="text-emerald-300">-&gt;</code>, <code class="text-sky-300">&lt;-</code>, <code class="text-rose-300">🗑️</code> o <code class="text-slate-300">=</code>) de cada fila para elegir exactamente qué acción ejecutar.
+                </div>
+                <div class="flex items-center gap-3">
+                    <button type="button" onclick="closeComparePreviewModal()" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300">
+                        Cerrar
+                    </button>
+                    <button type="button" id="executeCompareSyncBtn" onclick="executeComparePreviewSync(false)" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs sm:text-sm font-semibold text-white shadow-lg shadow-indigo-600/20 flex items-center gap-2">
+                        <span>☁️</span>
+                        <span>Sincronizar a FileJump</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL DEDICADO DE PERFILES DE SINCRONIZACIÓN (TAREAS) -->
+    <div id="syncProfilesModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-5xl w-full max-h-[92vh] flex flex-col shadow-2xl">
+            <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
+                <div class="flex items-center gap-2.5">
+                    <span class="text-lg">📁</span>
+                    <div>
+                        <h2 class="text-base font-bold text-white">Perfiles de Sincronización</h2>
+                        <p class="text-[11px] text-slate-400">Configura el origen local, la dirección de respaldo (➡ / ⬅ / ⇄) y el destino en FileJump</p>
+                    </div>
+                </div>
+                <button type="button" onclick="closeSyncProfilesModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+
+            <div class="p-6 overflow-y-auto space-y-4 text-sm">
+                <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-950/70 border border-slate-800 rounded-xl px-4 py-3">
+                    <div class="text-xs text-slate-300">
+                        <span class="font-semibold text-indigo-400">Captura rápida desde exploradores:</span>
+                        <span id="selectedProfileTargetHint" class="text-slate-400">Rellena el perfil activo o crea uno nuevo con las carpetas abiertas.</span>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <button type="button" onclick="captureCurrentLocalIntoProfile()" class="text-xs px-3 py-1.5 rounded-lg bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/35 border border-emerald-500/40 font-semibold flex items-center gap-1.5" title="Capturar la carpeta seleccionada actualmente en el Explorador Local">
+                            <span>📂</span>
+                            <span>+ Usar Carpeta Local Actual</span>
+                        </button>
+                        <button type="button" onclick="captureCurrentRemoteIntoProfile()" class="text-xs px-3 py-1.5 rounded-lg bg-sky-600/20 text-sky-300 hover:bg-sky-600/35 border border-sky-500/40 font-semibold flex items-center gap-1.5" title="Capturar la carpeta seleccionada actualmente en el Explorador Remoto">
+                            <span>☁️</span>
+                            <span>+ Usar Carpeta Remota Actual</span>
+                        </button>
+                        <button type="button" onclick="addSyncProfileRow()" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600/25 text-indigo-300 hover:bg-indigo-600/40 border border-indigo-500/40 font-semibold">
+                            + Nuevo Perfil
+                        </button>
+                    </div>
+                </div>
+
+                <div class="hidden lg:grid lg:grid-cols-12 gap-2 px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400 items-center">
+                    <div class="lg:col-span-2">Nombre del Perfil</div>
+                    <div class="lg:col-span-4">Ruta Local en Equipo</div>
+                    <div class="lg:col-span-1 text-center">Dirección</div>
+                    <div class="lg:col-span-3">Carpeta Destino FileJump</div>
+                    <div class="lg:col-span-1 text-center">Umbral %</div>
+                    <div class="lg:col-span-1 text-center">Quitar</div>
+                </div>
+
+                <div id="syncProfilesListContainer" class="space-y-2.5"></div>
+            </div>
+
+            <div class="px-6 py-4 border-t border-slate-800 flex items-center justify-between gap-3">
+                <span id="syncProfilesCountLabel" class="text-xs text-slate-400">0 perfil(es) configurado(s)</span>
+                <div class="flex items-center gap-3">
+                    <button type="button" onclick="closeSyncProfilesModal()" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300">Cancelar</button>
+                    <button type="button" onclick="saveSyncProfiles()" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar Perfiles</button>
+                </div>
             </div>
         </div>
     </div>

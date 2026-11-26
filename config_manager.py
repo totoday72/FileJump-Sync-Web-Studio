@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import threading
 import shutil
 import hashlib
 import datetime
@@ -36,6 +38,7 @@ load_dotenv(ENV_FILE)
 activity_logs = []
 transfer_jobs = {}
 audio_scan_jobs = {}
+compare_jobs = {}
 
 
 def log_event(level, message):
@@ -108,35 +111,90 @@ ensure_cache_matches_api_key(os.getenv("FILEJUMP_API_KEY", "").strip())
 
 
 # ==============================================================================
-# GESTIÓN DE CONFIGURACIÓN Y REGISTROS JSON
+# GESTIÓN DE CONFIGURACIÓN Y REGISTROS JSON (THREAD-SAFE Y ESCRITURA ATÓMICA)
 # ==============================================================================
+CONFIG_LOCK = threading.RLock()
+CONFIG_BACKUP_FILE = BASE_DIR / "sync_config.json.bak"
+_LAST_VALID_CONFIG = None
+
+
+def _atomic_write_json(target_path, data_dict, backup_path=None):
+    """Escribe un archivo JSON de manera atómica mediante archivo temporal + os.replace."""
+    target_path = Path(target_path)
+    tmp_path = target_path.with_name(f"{target_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    serialized = json.dumps(data_dict, indent=4, ensure_ascii=False)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(serialized)
+        f.flush()
+        os.fsync(f.fileno())
+    if backup_path and target_path.exists():
+        try:
+            shutil.copy2(target_path, backup_path)
+        except Exception:
+            pass
+    os.replace(tmp_path, target_path)
+
+
 def load_config():
-    """Carga la configuración de tareas y parámetros globales desde sync_config.json."""
+    """Carga la configuración de tareas y parámetros globales desde sync_config.json de forma segura."""
+    global _LAST_VALID_CONFIG
     default_config = {
         "max_workers": 4,
         "min_impact_percentage": 40,
         "use_high_speed_upload": True,
         "account_profiles": {},
+        "preserved_mtimes": {},
         "tasks": []
     }
-    if not CONFIG_FILE.exists():
-        save_config(default_config)
-        return default_config
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            for k, v in default_config.items():
-                data.setdefault(k, v)
-            return data
-    except Exception as e:
-        log_event("error", f"Error leyendo {CONFIG_FILE.name}: {e}")
+    with CONFIG_LOCK:
+        if not CONFIG_FILE.exists():
+            if CONFIG_BACKUP_FILE.exists():
+                try:
+                    shutil.copy2(CONFIG_BACKUP_FILE, CONFIG_FILE)
+                except Exception:
+                    pass
+            if not CONFIG_FILE.exists():
+                save_config(default_config)
+                return default_config
+
+        last_err = None
+        for attempt in range(4):
+            try:
+                raw_text = CONFIG_FILE.read_text(encoding="utf-8").strip()
+                if not raw_text:
+                    raise ValueError("Archivo vacío temporalmente")
+                data = json.loads(raw_text)
+                for k, v in default_config.items():
+                    data.setdefault(k, v)
+                _LAST_VALID_CONFIG = json.loads(json.dumps(data))
+                return data
+            except Exception as e:
+                last_err = e
+                time.sleep(0.03 * (attempt + 1))
+
+        # Si falló la lectura, recuperar desde memoria o respaldo .bak en lugar de devolver vacío
+        if _LAST_VALID_CONFIG is not None:
+            return json.loads(json.dumps(_LAST_VALID_CONFIG))
+        if CONFIG_BACKUP_FILE.exists():
+            try:
+                data = json.loads(CONFIG_BACKUP_FILE.read_text(encoding="utf-8"))
+                for k, v in default_config.items():
+                    data.setdefault(k, v)
+                _LAST_VALID_CONFIG = json.loads(json.dumps(data))
+                return data
+            except Exception:
+                pass
+
+        log_event("error", f"Error leyendo {CONFIG_FILE.name}: {last_err}")
         return default_config
 
 
 def save_config(config_data):
-    """Guarda la configuración en sync_config.json."""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config_data, f, indent=4, ensure_ascii=False)
+    """Guarda la configuración en sync_config.json usando bloqueo de hilo y reemplazo atómico."""
+    global _LAST_VALID_CONFIG
+    with CONFIG_LOCK:
+        _atomic_write_json(CONFIG_FILE, config_data, backup_path=CONFIG_BACKUP_FILE)
+        _LAST_VALID_CONFIG = json.loads(json.dumps(config_data))
 
 
 def get_task_record_path(task_name):
@@ -148,21 +206,25 @@ def get_task_record_path(task_name):
 def load_task_record(task_name):
     """Carga el registro JSON local de archivos/carpetas sincronizados."""
     path = get_task_record_path(task_name)
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                data.setdefault("files", {})
-                data.setdefault("folders", {})
-                return data
-        except Exception:
-            pass
+    with CONFIG_LOCK:
+        if path.exists():
+            for attempt in range(3):
+                try:
+                    raw = path.read_text(encoding="utf-8").strip()
+                    if not raw:
+                        raise ValueError("Registro vacío")
+                    data = json.loads(raw)
+                    data.setdefault("files", {})
+                    data.setdefault("folders", {})
+                    return data
+                except Exception:
+                    time.sleep(0.02 * (attempt + 1))
     return {"files": {}, "folders": {}, "last_sync": None}
 
 
 def save_task_record(task_name, record_data):
-    """Guarda el registro JSON local de archivos/carpetas sincronizados."""
-    record_data["last_sync"] = datetime.datetime.now(timezone.utc).isoformat()
-    path = get_task_record_path(task_name)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(record_data, f, indent=4, ensure_ascii=False)
+    """Guarda el registro JSON local de archivos/carpetas sincronizados de manera atómica."""
+    with CONFIG_LOCK:
+        record_data["last_sync"] = datetime.datetime.now(timezone.utc).isoformat()
+        path = get_task_record_path(task_name)
+        _atomic_write_json(path, record_data)
