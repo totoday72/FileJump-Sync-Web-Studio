@@ -220,6 +220,9 @@ class FileJumpClient:
         saved_profile = cfg.get("account_profiles", {}).get(key_hash, {})
 
         user_name = None
+        user_email = None
+        user_avatar = None
+        user_role = None
         used_bytes = 0
         total_bytes = 0
         api_percentage = None
@@ -245,7 +248,7 @@ class FileJumpClient:
         except Exception as e:
             log_event("warning", f"No se pudo leer /auth/usage: {e}")
 
-        # 2. Consultar GET /api/auth/user (perfil autenticado y cuota)
+        # 2. Consultar GET /api/auth/user (perfil autenticado: nombre, correo, avatar y plan)
         try:
             resp_user = requests.get(f"{api_root}/auth/user", headers=self._headers(), timeout=10)
             if resp_user.status_code == 200:
@@ -265,11 +268,19 @@ class FileJumpClient:
                         or u_obj.get("name")
                         or u_obj.get("username")
                         or (f"{u_obj.get('first_name', '')} {u_obj.get('last_name', '')}".strip())
-                        or u_obj.get("email")
                     )
-                    if found_name:
+                    if found_name and not user_name:
                         user_name = str(found_name).strip()
-                        break
+                    if u_obj.get("email") and not user_email:
+                        user_email = str(u_obj["email"]).strip()
+                    avatar_val = u_obj.get("avatar") or u_obj.get("avatar_url") or u_obj.get("profile_photo_url")
+                    if avatar_val and not user_avatar:
+                        user_avatar = str(avatar_val).strip()
+                    if isinstance(u_obj.get("roles"), list) and len(u_obj["roles"]) > 0 and not user_role:
+                        first_role = u_obj["roles"][0]
+                        user_role = first_role.get("name") if isinstance(first_role, dict) else str(first_role)
+                    elif u_obj.get("plan") and not user_role:
+                        user_role = str(u_obj["plan"]).strip()
         except Exception as e:
             log_event("warning", f"No se pudo leer /auth/user: {e}")
 
@@ -284,6 +295,8 @@ class FileJumpClient:
                         t_user = t_list[0].get("tokenable") or t_list[0].get("user") or {}
                         if isinstance(t_user, dict):
                             user_name = t_user.get("display_name") or t_user.get("name") or t_user.get("email")
+                            if not user_email and t_user.get("email"):
+                                user_email = str(t_user["email"]).strip()
             except Exception:
                 pass
 
@@ -291,7 +304,7 @@ class FileJumpClient:
         if saved_profile.get("user_name"):
             user_name = saved_profile["user_name"]
         elif not user_name:
-            user_name = "Cuenta FileJump"
+            user_name = user_email or "Cuenta FileJump"
 
         free_bytes = max(0, total_bytes - used_bytes) if total_bytes > 0 else 0
         if api_percentage is not None:
@@ -301,6 +314,9 @@ class FileJumpClient:
 
         return {
             "user_name": user_name,
+            "user_email": user_email or "",
+            "user_avatar": user_avatar or "",
+            "user_role": user_role or "Cuenta Activa",
             "used_bytes": used_bytes,
             "free_bytes": free_bytes,
             "total_bytes": total_bytes,
@@ -862,7 +878,7 @@ class FileJumpClient:
             pass
         return 0.0
 
-    def download_file_to_cache(self, file_id, filename, remote_mtime=0.0):
+    def download_file_to_cache(self, file_id, filename, remote_mtime=0.0, progress_callback=None):
         """
         Descarga un archivo remoto a TEMP_CACHE_DIR solo si no existe en caché
         o si la versión remota tiene una fecha de modificación más reciente.
@@ -887,6 +903,9 @@ class FileJumpClient:
             ref_cached_ts = cached_remote_mtime if cached_remote_mtime > 0 else local_cache_mtime
             # Si el archivo remoto NO es más nuevo (tolerancia de 2s), reutilizamos el archivo en caché
             if effective_remote_mtime <= 0.0 or effective_remote_mtime <= (ref_cached_ts + 2.0):
+                if progress_callback:
+                    sz = cached_path.stat().st_size
+                    progress_callback(sz, sz)
                 return cached_path
             log_event("info", f"Archivo remoto #{file_id} actualizado en nube; descargando versión más reciente...")
 
@@ -897,12 +916,24 @@ class FileJumpClient:
         ]
         for url in candidate_urls:
             try:
-                with requests.get(url, headers=headers, stream=True, timeout=120) as resp:
+                with requests.get(url, headers=headers, stream=True, timeout=300) as resp:
                     if resp.status_code == 200:
+                        total_len = int(resp.headers.get("Content-Length") or 0)
+                        downloaded = 0
+                        last_cb = 0.0
+                        if progress_callback:
+                            progress_callback(0, total_len)
                         with open(cached_path, "wb") as out_f:
                             for chunk in resp.iter_content(chunk_size=65536):
                                 if chunk:
                                     out_f.write(chunk)
+                                    downloaded += len(chunk)
+                                    now = time.time()
+                                    if progress_callback and (now - last_cb >= 0.12):
+                                        last_cb = now
+                                        progress_callback(downloaded, total_len)
+                        if progress_callback:
+                            progress_callback(downloaded, max(total_len, downloaded))
                         # Actualizar índice persistente con la fecha de modificación remota
                         cache_index.setdefault("files", {})[rid_key] = {
                             "filename": cached_path.name,
@@ -2249,6 +2280,120 @@ def _resolve_local_explorer_target(data):
     return None
 
 
+@app.route("/api/explorer/open_native", methods=["POST"])
+def api_explorer_open_native():
+    """Abre un archivo local directamente o descarga un remoto a caché con barra de progreso y luego lo abre."""
+    data = request.json or {}
+    source = (data.get("source") or "local").strip()
+
+    if source == "local":
+        target = _resolve_local_explorer_target(data)
+        if not target or not target.exists() or not target.is_file():
+            return jsonify({"error": "Archivo local no encontrado"}), 404
+        try:
+            if os.name == "nt":
+                os.startfile(str(target))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+            log_event("info", f"🖥️ Abierto en programa local del sistema: {target.name}")
+            return jsonify({"success": True, "path": str(target)})
+        except Exception as e:
+            log_event("error", f"No se pudo abrir '{target.name}' en programa local: {e}")
+            return jsonify({"error": f"No se pudo abrir en el programa del sistema: {e}"}), 500
+
+    # Para archivos remotos: iniciar tarea con progreso en tiempo real hacia temp_cache y abrir al finalizar
+    remote_id = str(data.get("id") or data.get("remote_id") or "").strip()
+    filename = (data.get("name") or f"archivo_{remote_id}").strip()
+    f_size = int(data.get("size") or 0)
+    try:
+        remote_mtime = float(data.get("mtime") or 0)
+    except (ValueError, TypeError):
+        remote_mtime = 0.0
+
+    if not remote_id or remote_id == "ROOT":
+        return jsonify({"error": "ID remoto inválido"}), 400
+
+    client = FileJumpClient()
+    if not client.api_key:
+        return jsonify({"error": "Falta FILEJUMP_API_KEY en el archivo .env"}), 400
+
+    job_id = uuid.uuid4().hex[:12]
+    single_items = [{"name": filename, "size": f_size, "sent": 0, "file_pct": 0, "status": "active"}]
+    transfer_jobs[job_id] = {
+        "id": job_id,
+        "direction": "download",
+        "title": f"Preparando en caché: {filename}",
+        "status": "running",
+        "current_file": filename,
+        "processed_files": 0,
+        "total_files": 1,
+        "bytes_done": 0,
+        "bytes_total": f_size,
+        "percent": 0,
+        "file_percent": 0,
+        "speed_bps": 0.0,
+        "speed_text": "0.00 MB/s",
+        "items": list(single_items),
+        "error": None
+    }
+
+    def _download_to_cache_and_open():
+        try:
+            log_event("info", f"⬇ Descargando '{filename}' a caché local para abrirlo con el programa del sistema...")
+            cb = _make_speed_tracker(job_id, 0, f_size, single_items, 0)
+            cached_target = client.download_file_to_cache(
+                remote_id,
+                filename,
+                remote_mtime=remote_mtime,
+                progress_callback=cb
+            )
+            if not cached_target or not cached_target.exists():
+                _update_transfer_job(
+                    job_id,
+                    status="error",
+                    error=f"No se pudo descargar '{filename}' en caché",
+                    items=[{"name": filename, "size": f_size, "sent": 0, "file_pct": 0, "status": "error"}]
+                )
+                log_event("error", f"✖ No se pudo descargar '{filename}' en caché.")
+                return
+
+            actual_size = cached_target.stat().st_size
+            _update_transfer_job(
+                job_id,
+                status="completed",
+                processed_files=1,
+                bytes_done=actual_size,
+                bytes_total=max(f_size, actual_size),
+                percent=100,
+                file_percent=100,
+                speed_text="Listo",
+                current_file="Abriendo en programa local...",
+                items=[{"name": filename, "size": actual_size, "sent": actual_size, "file_pct": 100, "status": "done"}]
+            )
+
+            if os.name == "nt":
+                os.startfile(str(cached_target))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(cached_target)])
+            else:
+                subprocess.Popen(["xdg-open", str(cached_target)])
+
+            log_event("success", f"🖥️ '{filename}' guardado en caché y abierto en programa local.")
+        except Exception as exc:
+            _update_transfer_job(
+                job_id,
+                status="error",
+                error=f"Error al abrir '{filename}': {exc}",
+                items=[{"name": filename, "size": f_size, "sent": 0, "file_pct": 0, "status": "error"}]
+            )
+            log_event("error", f"✖ Error preparando/abriendo '{filename}': {exc}")
+
+    threading.Thread(target=_download_to_cache_and_open, daemon=True).start()
+    return jsonify({"success": True, "job_id": job_id, "remote_id": remote_id})
+
+
 @app.route("/api/explorer/audio_scan_start", methods=["POST"])
 def api_explorer_audio_scan_start():
     """Inicia en segundo plano el escaneo recursivo de archivos de audio con progreso en tiempo real."""
@@ -3174,7 +3319,7 @@ HTML_TEMPLATE = r"""
 <body class="bg-slate-950 text-slate-100 min-h-screen lg:h-screen lg:overflow-hidden flex flex-col">
 
     <!-- Barra Superior -->
-    <header class="bg-slate-900/90 backdrop-blur border-b border-slate-800 px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0 z-30">
+    <header class="bg-slate-900 border-b border-slate-800 px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0 z-30">
         <div class="flex items-center gap-3 shrink-0">
             <div class="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
                 <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -3191,9 +3336,12 @@ HTML_TEMPLATE = r"""
         <div id="userStorageWidget" class="hidden flex-1 max-w-2xl mx-2 bg-slate-950/90 border border-slate-800/90 rounded-xl px-3.5 py-2 flex flex-col justify-center gap-1.5 shadow-inner">
             <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
                 <div class="flex items-center gap-2 min-w-0">
-                    <span class="w-5 h-5 rounded-full bg-indigo-600/25 border border-indigo-500/40 text-indigo-300 flex items-center justify-center text-[11px] shrink-0">👤</span>
-                    <span id="headerUserName" class="font-semibold text-white truncate">Usuario</span>
-                    <button onclick="openAccountQuotaModal()" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 border border-slate-700 text-[10px] text-slate-300 hover:text-indigo-200 transition shrink-0" title="Ajustar cuota o nombre manualmente">✏️</button>
+                    <div id="headerUserAvatarWrap" class="w-6 h-6 rounded-full bg-indigo-600/25 border border-indigo-500/40 text-indigo-300 flex items-center justify-center text-[11px] overflow-hidden shrink-0">👤</div>
+                    <div class="min-w-0 flex items-center gap-1.5">
+                        <span id="headerUserName" class="font-semibold text-white truncate">Usuario</span>
+                        <span id="headerUserEmail" class="hidden sm:inline text-[11px] text-slate-400 truncate"></span>
+                    </div>
+                    <button onclick="openAccountQuotaModal()" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/30 border border-slate-700 text-[10px] text-slate-300 hover:text-indigo-200 transition shrink-0" title="Ver perfil de cuenta FileJump">✏️</button>
                 </div>
                 <div class="flex items-center gap-2 sm:gap-3 text-[11px] font-mono shrink-0">
                     <span class="text-sky-300" title="Espacio ocupado">Ocupado: <strong id="headerStorageUsed">0 B</strong></span>
@@ -3211,7 +3359,7 @@ HTML_TEMPLATE = r"""
         <div class="flex items-center gap-3 shrink-0">
             <!-- Estado de Conexión API -->
             <div id="apiStatusBadge" class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-800 border border-slate-700 text-slate-300">
-                <span id="apiStatusDot" class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                <span id="apiStatusDot" class="w-2 h-2 rounded-full bg-amber-400"></span>
                 <span id="apiStatusText">Verificando API...</span>
             </div>
 
@@ -3365,7 +3513,7 @@ HTML_TEMPLATE = r"""
                 </button>
             </div>
 
-            <!-- Cuerpo Dividido estilo Explorador de Windows: Árbol de Carpetas (Izq) + Contenido (Der) -->
+            <!-- Cuerpo Dividido estilo Explorador de Windows: Árbol Jerárquico Remoto (Izq) + Contenido (Der) -->
             <div class="flex flex-1 min-h-0 overflow-hidden">
                 <!-- Panel Izquierdo: Árbol Jerárquico Remoto (Lazy Load con +) -->
                 <div class="w-44 sm:w-52 xl:w-64 bg-slate-950/60 border-r border-slate-800/80 overflow-y-auto p-1.5 select-none shrink-0">
@@ -3417,7 +3565,7 @@ HTML_TEMPLATE = r"""
     </section>
 
     <!-- MODAL DE CONFIGURACIÓN (.env + TAREAS) -->
-    <div id="settingsModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4 z-50">
+    <div id="settingsModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
         <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full max-h-[90vh] flex flex-col shadow-2xl">
             <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
                 <h2 class="text-base font-bold text-white">Configuración del Sistema y Credenciales (.env)</h2>
@@ -3492,21 +3640,29 @@ HTML_TEMPLATE = r"""
     </div>
 
     <!-- MODAL DE NOMBRE DE USUARIO Y RESUMEN DE ALMACENAMIENTO (SOLO LECTURA) -->
-    <div id="accountQuotaModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4 z-50">
+    <div id="accountQuotaModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
         <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
             <div class="flex items-center justify-between">
                 <h3 class="text-base font-bold text-white">Perfil de Cuenta FileJump</h3>
                 <button onclick="closeAccountQuotaModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
             </div>
             <div class="space-y-3 text-xs">
+                <div class="flex items-center gap-3 bg-slate-950/80 border border-slate-800 rounded-xl p-3">
+                    <div id="modalUserAvatarWrap" class="w-11 h-11 rounded-full bg-indigo-600/25 border border-indigo-500/40 text-indigo-300 flex items-center justify-center text-lg overflow-hidden shrink-0">👤</div>
+                    <div class="min-w-0 flex-1">
+                        <div id="readonlyModalAccountName" class="text-sm font-bold text-white truncate">Usuario</div>
+                        <div id="readonlyModalAccountEmail" class="text-[11px] text-slate-400 truncate">-</div>
+                        <span id="readonlyModalAccountPlan" class="inline-block mt-1 text-[10px] px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/25">Cuenta Activa</span>
+                    </div>
+                </div>
                 <div>
-                    <label class="block text-slate-400 mb-1">Nombre de Usuario / Cuenta (Editable)</label>
-                    <input type="text" id="quotaUserNameInput" placeholder="Dejar vacío para usar el nombre de la API..." class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white focus:border-indigo-500 focus:outline-none">
+                    <label class="block text-slate-400 mb-1">Alias Local Visible en la App (Opcional)</label>
+                    <input type="text" id="quotaUserNameInput" placeholder="Dejar vacío para usar el nombre de la cuenta..." class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white focus:border-indigo-500 focus:outline-none">
                 </div>
                 <div class="bg-slate-950/80 border border-slate-800 rounded-xl p-3 space-y-1.5">
                     <div class="flex items-center justify-between">
                         <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Almacenamiento en Nube</span>
-                        <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">Lectura API</span>
+                        <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">Solo Lectura (API)</span>
                     </div>
                     <div class="grid grid-cols-3 gap-2 pt-1 text-center font-mono">
                         <div class="bg-slate-900/90 rounded-lg p-2 border border-slate-800">
@@ -3526,13 +3682,13 @@ HTML_TEMPLATE = r"""
             </div>
             <div class="flex justify-end gap-2.5 pt-2">
                 <button onclick="closeAccountQuotaModal()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Cancelar</button>
-                <button onclick="saveAccountQuota()" class="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar Nombre</button>
+                <button onclick="saveAccountQuota()" class="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Guardar Alias</button>
             </div>
         </div>
     </div>
 
     <!-- MODAL DE NOTIFICACIÓN / CONFIRMACIÓN (Sin usar alert/confirm nativos) -->
-    <div id="noticeModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4 z-50">
+    <div id="noticeModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
         <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
             <h3 id="noticeTitle" class="text-base font-bold text-white">Aviso</h3>
             <p id="noticeMessage" class="text-xs text-slate-300 leading-relaxed"></p>
@@ -3541,7 +3697,7 @@ HTML_TEMPLATE = r"""
     </div>
 
     <!-- MODAL DE VISTA PREVIA Y REPRODUCTOR MULTIMEDIA -->
-    <div id="previewModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm hidden items-center justify-center p-4 z-50">
+    <div id="previewModal" class="fixed inset-0 bg-black/85 hidden items-center justify-center p-4 z-50">
         <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-4xl w-full max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
             <div class="px-4 sm:px-5 py-3.5 border-b border-slate-800 flex items-center justify-between gap-3 bg-slate-900">
                 <div class="flex items-center gap-2 min-w-0">
@@ -3566,10 +3722,10 @@ HTML_TEMPLATE = r"""
         </div>
     </div>
 
-    <!-- REPRODUCTOR DE MÚSICA FLOTANTE MINIMIZABLE Y MAXIMIZABLE (ESTILO CHAT EN VIVO EN ESQUINA DERECHA) -->
-    <div id="musicDockWidget" class="fixed bottom-4 right-4 z-50 hidden transition-all duration-200">
+    <!-- REPRODUCTOR DE MÚSICA FLOTANTE MINIMIZABLE Y MAXIMIZABLE (CERO BLUR PARA <3% GPU) -->
+    <div id="musicDockWidget" class="fixed bottom-4 right-4 z-50 hidden">
         <!-- Vista Minimizada (Burbuja Compacta con Controles Rápidos) -->
-        <div id="musicDockMinimized" onclick="setMusicDockMode('normal')" class="hidden cursor-pointer bg-slate-900/95 hover:bg-slate-800 border border-indigo-500/40 rounded-full pl-2 pr-3 py-2 shadow-2xl flex items-center gap-2.5 backdrop-blur">
+        <div id="musicDockMinimized" onclick="setMusicDockMode('normal')" class="hidden cursor-pointer bg-slate-900 hover:bg-slate-800 border border-indigo-500/40 rounded-full pl-2 pr-3 py-2 shadow-2xl flex items-center gap-2.5">
             <div id="miniCoverWrap" class="w-9 h-9 rounded-full bg-indigo-600/30 border border-indigo-500/40 overflow-hidden flex items-center justify-center shrink-0">
                 <span class="text-base">🎵</span>
             </div>
@@ -3585,11 +3741,11 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
 
-        <!-- Vista Normal / Maximizada (Tarjeta Flotante o Modal Amplio con Carátula Grande + Playlist) -->
-        <div id="musicDockExpanded" class="w-80 sm:w-[410px] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
-            <div class="px-3.5 py-2.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between shrink-0">
+        <!-- Vista Normal / Maximizada (Fondo Opaco de Alto Rendimiento sin backdrop-filter) -->
+        <div id="musicDockExpanded" class="w-80 sm:w-[410px] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
+            <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between shrink-0">
                 <div class="flex items-center gap-2 min-w-0">
-                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0"></span>
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 shrink-0"></span>
                     <span class="text-[11px] font-semibold uppercase tracking-wider text-indigo-300 truncate">Reproductor Musical</span>
                     <span id="dockTrackCounter" class="text-[10px] text-slate-400 shrink-0"></span>
                     <span id="dockPrefetchBadge" class="hidden text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shrink-0" title="Siguiente pista remota precargada en caché">⚡ Siguiente lista</span>
@@ -3608,7 +3764,7 @@ HTML_TEMPLATE = r"""
                     <!-- Carátula ID3 + Metadatos + Botón Ubicar Canción Actual -->
                     <div id="dockMediaHeader" class="flex items-start justify-between gap-3">
                         <div class="flex items-center gap-3.5 min-w-0 flex-1">
-                            <div id="dockCoverBox" onclick="openCoverLightbox()" class="w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner transition-all">
+                            <div id="dockCoverBox" onclick="openCoverLightbox()" class="w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner">
                                 <span id="dockCoverEmoji" class="text-3xl">🎵</span>
                             </div>
                             <div id="dockMetaTextWrap" class="min-w-0 flex-1">
@@ -3617,7 +3773,7 @@ HTML_TEMPLATE = r"""
                                 <div id="dockTrackAlbum" class="text-[11px] text-slate-400 truncate mt-0.5"></div>
                             </div>
                         </div>
-                        <button type="button" id="dockNormalLocateBtn" onclick="locateCurrentTrackInPlaylist()" class="w-8 h-8 rounded-xl bg-slate-800/90 hover:bg-indigo-600/30 border border-slate-700 hover:border-indigo-500/50 text-indigo-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Ubicar canción en reproducción en la lista">
+                        <button type="button" id="dockNormalLocateBtn" onclick="locateCurrentTrackInPlaylist()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-indigo-600/30 border border-slate-700 hover:border-indigo-500/50 text-indigo-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Ubicar canción en reproducción en la lista">
                             🎯
                         </button>
                     </div>
@@ -3630,11 +3786,10 @@ HTML_TEMPLATE = r"""
                             <span id="dockTotalTime">0:00</span>
                         </div>
                     </div>
-
-                    <!-- Visualizador Rítmico en Tiempo Real (Canvas Web Audio Analyser) -->
-                    <div id="dockVisualizerWrap" class="bg-slate-950/90 border border-slate-800/90 rounded-xl p-2 relative overflow-hidden">
-                        <canvas id="dockVisualizerCanvas" width="360" height="54" class="w-full h-12 sm:h-14 block rounded-lg"></canvas>
-                        <button onclick="cycleVisualizerStyle()" id="dockVisStyleBtn" class="absolute top-1.5 right-2 px-1.5 py-0.5 rounded bg-slate-900/85 hover:bg-slate-800 border border-slate-700/80 text-[9px] text-indigo-300 font-mono transition" title="Cambiar estilo visual">Barras</button>
+                    <!-- Visualizador Rítmico SVG con Gradiente Dinámico al Ritmo (< 4% GPU) -->
+                    <div id="dockVisualizerWrap" class="bg-slate-950 border border-slate-800 rounded-xl p-2 relative overflow-hidden h-14 flex items-center">
+                        <svg id="dockSvgVisualizer" viewBox="0 0 320 44" preserveAspectRatio="none" shape-rendering="optimizeSpeed" class="w-full h-10 block"></svg>
+                        <button onclick="cycleVisualizerStyle()" id="dockVisStyleBtn" class="absolute top-1.5 right-2 px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[9px] text-emerald-300 font-mono transition z-10" title="Cambiar estilo visual">SVG Barras</button>
                     </div>
                     <!-- Botones de Control: Aleatorio, Anterior, Play/Pausa, Siguiente, Favorito -->
                     <div class="flex items-center justify-between gap-1.5 pt-1">
@@ -3662,7 +3817,7 @@ HTML_TEMPLATE = r"""
                     <!-- Control de Volumen y Origen -->
                     <div class="flex items-center justify-between gap-2.5 pt-1 border-t border-slate-800/70">
                         <div class="flex items-center gap-2 flex-1 min-w-0">
-                            <button id="dockMuteBtn" onclick="toggleDockMute()" class="w-7 h-7 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 flex items-center justify-center text-xs shrink-0 transition" title="Silenciar / Activar sonido">🔊</button>
+                            <button id="dockMuteBtn" onclick="toggleDockMute()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center text-xs shrink-0 transition" title="Silenciar / Activar sonido">🔊</button>
                             <input type="range" id="dockVolumeBar" min="0" max="100" value="85" oninput="setDockVolume(this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-400" title="Volumen">
                             <span id="dockVolumeLabel" class="text-[10px] font-mono text-slate-400 w-8 text-right shrink-0">85%</span>
                         </div>
@@ -3670,7 +3825,7 @@ HTML_TEMPLATE = r"""
                     </div>
 
                     <!-- Panel Ecualizador Gráfico de 5 Bandas (Web Audio API) -->
-                    <div id="dockEqPanel" class="hidden bg-slate-950/90 border border-slate-800 rounded-xl p-3 space-y-2.5">
+                    <div id="dockEqPanel" class="hidden bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-2.5">
                         <div class="flex items-center justify-between gap-2">
                             <span class="text-[10px] font-semibold uppercase tracking-wider text-indigo-300">Ecualizador 5 Bandas</span>
                             <div class="flex items-center gap-1.5">
@@ -3716,17 +3871,17 @@ HTML_TEMPLATE = r"""
                 </div>
 
                 <!-- Columna Derecha / Inferior: Playlist de Canciones -->
-                <div id="musicDockPlaylistCol" class="border-t border-slate-800 bg-slate-950/75 flex flex-col min-h-0">
-                    <div class="px-3.5 py-2 border-b border-slate-800/80 flex items-center justify-between gap-2 shrink-0">
+                <div id="musicDockPlaylistCol" class="border-t border-slate-800 bg-slate-950 flex flex-col min-h-0">
+                    <div class="px-3.5 py-2 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
                         <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Lista de Reproducción (Playlist)</span>
                         <span id="dockPlaylistOrderTag" class="text-[10px] text-slate-500">Orden normal</span>
                     </div>
                     <!-- Buscador Rápido + Localizador de Pista Actual dentro de la Playlist (visible al maximizar) -->
-                    <div id="dockPlaylistSearchWrap" class="hidden px-3 py-2 border-b border-slate-800/70 bg-slate-900/60 shrink-0">
+                    <div id="dockPlaylistSearchWrap" class="hidden px-3 py-2 border-b border-slate-800 bg-slate-900 shrink-0">
                         <div class="flex items-center gap-2">
                             <div class="relative flex items-center flex-1 min-w-0">
                                 <span class="absolute left-2.5 text-slate-400 text-xs pointer-events-none">🔍</span>
-                                <input type="text" id="dockPlaylistSearchInput" oninput="filterMusicPlaylist(this.value)" placeholder="Buscar canción o artista en la playlist..." class="w-full bg-slate-950 border border-slate-700/90 focus:border-indigo-500 rounded-xl pl-8 pr-7 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none">
+                                <input type="text" id="dockPlaylistSearchInput" oninput="filterMusicPlaylist(this.value)" placeholder="Buscar canción o artista en la playlist..." class="w-full bg-slate-950 border border-slate-700 focus:border-indigo-500 rounded-xl pl-8 pr-7 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none">
                                 <button type="button" id="dockPlaylistSearchClearBtn" onclick="clearMusicPlaylistSearch()" class="hidden absolute right-2 text-slate-400 hover:text-white text-xs px-1" title="Limpiar búsqueda">✕</button>
                             </div>
                             <button type="button" onclick="locateCurrentTrackInPlaylist()" class="px-2.5 py-1.5 rounded-xl bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 hover:text-white text-xs font-medium transition flex items-center gap-1.5 shrink-0" title="Ubicar canción en reproducción actual">
@@ -3744,9 +3899,9 @@ HTML_TEMPLATE = r"""
     </div>
 
     <!-- VENTANA FLOTANTE DE PROGRESO DE TRANSFERENCIA (CARGA / DESCARGA) -->
-    <div id="transferDockWidget" class="fixed bottom-4 left-4 z-50 hidden transition-all duration-200">
+    <div id="transferDockWidget" class="fixed bottom-4 left-4 z-50 hidden">
         <!-- Vista Minimizada (Solo barra compacta) -->
-        <div id="transferDockMinimized" onclick="setTransferDockMode('normal')" class="hidden cursor-pointer bg-slate-900/95 hover:bg-slate-800 border border-sky-500/40 rounded-2xl px-3.5 py-2.5 shadow-2xl w-72 sm:w-80 space-y-1.5 backdrop-blur">
+        <div id="transferDockMinimized" onclick="setTransferDockMode('normal')" class="hidden cursor-pointer bg-slate-900 hover:bg-slate-800 border border-sky-500/40 rounded-2xl px-3.5 py-2.5 shadow-2xl w-72 sm:w-80 space-y-1.5">
             <div class="flex items-center justify-between gap-2 text-xs">
                 <div class="flex items-center gap-2 min-w-0">
                     <span id="transferMiniIcon" class="text-sm shrink-0">⬆️</span>
@@ -3763,10 +3918,10 @@ HTML_TEMPLATE = r"""
         </div>
 
         <!-- Vista Normal / Maximizada (Progreso + Detalle de Archivos) -->
-        <div id="transferDockExpanded" class="w-80 sm:w-[440px] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
-            <div class="px-3.5 py-2.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between shrink-0">
+        <div id="transferDockExpanded" class="w-80 sm:w-[440px] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
+            <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between shrink-0">
                 <div class="flex items-center gap-2 min-w-0">
-                    <span id="transferStatusDot" class="w-2 h-2 rounded-full bg-sky-400 animate-pulse shrink-0"></span>
+                    <span id="transferStatusDot" class="w-2 h-2 rounded-full bg-sky-400 shrink-0"></span>
                     <span id="transferHeaderBadge" class="text-[11px] font-semibold uppercase tracking-wider text-sky-300 truncate">Transferencia en Curso</span>
                 </div>
                 <div class="flex items-center gap-1 shrink-0">
@@ -3817,10 +3972,10 @@ HTML_TEMPLATE = r"""
     </div>
 
     <!-- VENTANA FLOTANTE DE ESCANEO DE AUDIO PARA PLAYLIST (CERRABLE CON ACTUALIZACIÓN ACTIVA) -->
-    <div id="audioScanDockWidget" class="fixed bottom-4 left-4 z-50 hidden w-80 sm:w-96 bg-slate-900/95 backdrop-blur border border-indigo-500/40 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200">
-        <div class="px-3.5 py-2.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between gap-2">
+    <div id="audioScanDockWidget" class="fixed bottom-4 left-4 z-50 hidden w-80 sm:w-96 bg-slate-900 border border-indigo-500/40 rounded-2xl shadow-2xl overflow-hidden">
+        <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between gap-2">
             <div class="flex items-center gap-2 min-w-0">
-                <span id="audioScanDot" class="w-2 h-2 rounded-full bg-indigo-400 animate-pulse shrink-0"></span>
+                <span id="audioScanDot" class="w-2 h-2 rounded-full bg-indigo-400 shrink-0"></span>
                 <span class="text-[11px] font-semibold uppercase tracking-wider text-indigo-300 truncate">Escaneando Música</span>
             </div>
             <button onclick="closeAudioScanDock()" class="w-6 h-6 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-sm transition" title="Cerrar ventana (continúa en segundo plano)">&times;</button>
@@ -3847,7 +4002,7 @@ HTML_TEMPLATE = r"""
     </div>
 
     <!-- MODAL DE CARÁTULA GIGANTE (DELANTE DEL REPRODUCTOR MAXIMIZADO) -->
-    <div id="coverLightboxModal" onclick="if(event.target===this) closeCoverLightbox()" class="fixed inset-0 bg-black/90 backdrop-blur-md hidden items-center justify-center p-4 z-[60]">
+    <div id="coverLightboxModal" onclick="if(event.target===this) closeCoverLightbox()" class="fixed inset-0 bg-black/95 hidden items-center justify-center p-4 z-[60]">
         <div class="relative bg-slate-900 border border-slate-700 rounded-2xl p-3 sm:p-4 max-w-3xl w-full flex flex-col items-center gap-3 shadow-2xl">
             <div class="w-full flex items-center justify-end gap-2">
                 <a id="coverDownloadBtn" href="#" download="caratula.jpg" class="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white shadow-lg shadow-indigo-600/20 transition flex items-center gap-1.5">
@@ -3862,12 +4017,12 @@ HTML_TEMPLATE = r"""
     </div>
 
     <!-- MENÚ CONTEXTUAL PARA EXPLORADORES LOCAL Y REMOTO -->
-    <div id="explorerContextMenu" class="fixed hidden z-[70] min-w-[235px] bg-slate-900/95 backdrop-blur border border-slate-700 rounded-xl shadow-2xl py-1.5 text-xs text-slate-200 select-none">
+    <div id="explorerContextMenu" class="fixed hidden z-[70] min-w-[235px] bg-slate-900 border border-slate-700 rounded-xl shadow-2xl py-1.5 text-xs text-slate-200 select-none">
         <!-- Opciones dinámicas -->
     </div>
 
     <!-- MODAL DE CAMBIO DE NOMBRE -->
-    <div id="renameItemModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4 z-[65]">
+    <div id="renameItemModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-[65]">
         <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
             <div class="flex items-center justify-between">
                 <h3 class="text-base font-bold text-white">Cambiar de Nombre</h3>
@@ -3885,7 +4040,7 @@ HTML_TEMPLATE = r"""
     </div>
 
     <!-- MODAL DE PROPIEDADES -->
-    <div id="propertiesItemModal" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4 z-[65]">
+    <div id="propertiesItemModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-[65]">
         <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
             <div class="flex items-center justify-between">
                 <h3 class="text-base font-bold text-white flex items-center gap-2"><span>ℹ️</span><span>Propiedades</span></h3>
@@ -3928,8 +4083,17 @@ HTML_TEMPLATE = r"""
         let eqInitialized = false;
         let lastNonZeroVolume = 85;
         let visualizerEnabled = true;
-        let visualizerStyle = 'bars'; // 'bars' | 'mirror' | 'wave'
+        let visualizerStyle = 'bars'; // 'bars' | 'mirror' | 'wave' (SVG de bajo impacto GPU)
         let visualizerRafId = null;
+        let lastVisualizerFrameTime = 0;
+        let svgVisBars = [];
+        let svgVisPolyline = null;
+        let svgVisGradStops = [];
+        let svgVisInitialized = false;
+        let beatHueSmooth = 225;
+        let beatEnergySmooth = 0;
+        const SVG_BARS_COUNT = 32;
+        const VISUALIZER_FPS_INTERVAL = 1000 / 32; // 32 FPS ágiles con < 4% GPU
         const EQ_BANDS_CONFIG = [
             { freq: 60, type: 'lowshelf' },
             { freq: 230, type: 'peaking' },
@@ -4097,6 +4261,16 @@ HTML_TEMPLATE = r"""
                 }
                 lastProfileInfo = data;
                 document.getElementById('headerUserName').textContent = data.user_name || 'Cuenta FileJump';
+                const emailEl = document.getElementById('headerUserEmail');
+                if (emailEl) {
+                    emailEl.textContent = data.user_email ? `(${data.user_email})` : '';
+                }
+                const avatarWrap = document.getElementById('headerUserAvatarWrap');
+                if (avatarWrap) {
+                    avatarWrap.innerHTML = data.user_avatar
+                        ? `<img src="${escapeAttr(data.user_avatar)}" alt="Avatar" class="w-full h-full object-cover">`
+                        : '👤';
+                }
                 document.getElementById('headerStorageUsed').textContent = formatBytes(data.used_bytes || 0);
                 document.getElementById('headerStorageFree').textContent = data.total_bytes > 0 ? formatBytes(data.free_bytes || 0) : 'N/D';
                 document.getElementById('headerStorageTotal').textContent = data.total_bytes > 0 ? formatBytes(data.total_bytes) : 'N/D';
@@ -4120,6 +4294,15 @@ HTML_TEMPLATE = r"""
             if (!modal) return;
             const info = lastProfileInfo || {};
             document.getElementById('quotaUserNameInput').value = info.user_name || '';
+            document.getElementById('readonlyModalAccountName').textContent = info.user_name || 'Cuenta FileJump';
+            document.getElementById('readonlyModalAccountEmail').textContent = info.user_email || 'Sin correo asociado';
+            document.getElementById('readonlyModalAccountPlan').textContent = info.user_role || 'Cuenta Activa';
+            const modalAvatar = document.getElementById('modalUserAvatarWrap');
+            if (modalAvatar) {
+                modalAvatar.innerHTML = info.user_avatar
+                    ? `<img src="${escapeAttr(info.user_avatar)}" alt="Avatar" class="w-full h-full object-cover">`
+                    : '👤';
+            }
             document.getElementById('readonlyModalUsed').textContent = formatBytes(info.used_bytes || 0);
             document.getElementById('readonlyModalFree').textContent = info.total_bytes > 0 ? formatBytes(info.free_bytes || 0) : 'N/D';
             document.getElementById('readonlyModalTotal').textContent = info.total_bytes > 0 ? formatBytes(info.total_bytes) : 'N/D';
@@ -4146,11 +4329,12 @@ HTML_TEMPLATE = r"""
         }
 
         async function refreshStatusAndLogs() {
+            const dot = document.getElementById('apiStatusDot');
+            const txt = document.getElementById('apiStatusText');
             try {
                 const res = await fetch('/api/status');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
-                const dot = document.getElementById('apiStatusDot');
-                const txt = document.getElementById('apiStatusText');
                 if (data.connected) {
                     dot.className = 'w-2 h-2 rounded-full bg-emerald-400';
                     txt.textContent = `Conectado (${data.masked_key})`;
@@ -4176,62 +4360,10 @@ HTML_TEMPLATE = r"""
                     }).join('');
                     consoleEl.scrollTop = consoleEl.scrollHeight;
                 }
-            } catch (e) {}
-        }
-
-        async function syncCachedRemoteIds() {
-            try {
-                const res = await fetch('/api/cache/status');
-                const data = await res.json();
-                if (Array.isArray(data.cached_ids)) {
-                    data.cached_ids.forEach(id => prefetchedRemoteIds.add(String(id)));
-                    if (musicSource === 'remote' && musicPlaylist.length > 0) {
-                        renderMusicPlaylist();
-                    }
-                }
-            } catch (e) {}
-        }
-
-        async function fetchLocalDrives(autoBrowseFirst = false) {
-            const selector = document.getElementById('localDriveSelector');
-            if (!selector) return;
-            try {
-                const res = await fetch('/api/local/drives');
-                const data = await res.json();
-                const drives = data.drives || [];
-                const prevVal = selector.value;
-                selector.innerHTML = '<option value="">Auto (Carpeta de Tarea)</option>';
-                drives.forEach(d => {
-                    const opt = document.createElement('option');
-                    opt.value = d.id;
-                    opt.textContent = d.name;
-                    selector.appendChild(opt);
-                });
-                if (prevVal && Array.from(selector.options).some(o => o.value === prevVal)) {
-                    selector.value = prevVal;
-                } else if (autoBrowseFirst && !document.getElementById('taskSelector').value && drives.length > 0) {
-                    selector.value = drives[0].id;
-                    onLocalDriveChange();
-                }
-            } catch (e) {}
-        }
-
-        async function onLocalDriveChange() {
-            const driveVal = document.getElementById('localDriveSelector').value;
-            if (!driveVal) {
-                localActiveDriveRoot = '';
-                inspectSelectedTask();
-                return;
-            }
-            localActiveDriveRoot = driveVal;
-            document.getElementById('localPathSubtitle').textContent = driveVal;
-            document.getElementById('localTableBody').innerHTML = '<tr><td colspan="4" class="py-10 text-center text-slate-400">Cargando unidad local...</td></tr>';
-            try {
-                const res = await fetch(`/api/local/browse?root_path=${encodeURIComponent(driveVal)}`);
-                const data = await res.json();
-                initLocalExplorer(data.items || []);
             } catch (e) {
-                showNotice('Error', 'No se pudo leer la unidad local seleccionada.');
+                wasConnected = false;
+                if (dot) dot.className = 'w-2 h-2 rounded-full bg-rose-500';
+                if (txt) txt.textContent = 'Sin conexión con servidor local';
             }
         }
 
@@ -4272,6 +4404,80 @@ HTML_TEMPLATE = r"""
             inspectSelectedTask(selectedDirId);
         }
 
+        async function fetchLocalDrives(autoSelectFirst = false) {
+            const selector = document.getElementById('localDriveSelector');
+            if (!selector) return;
+            try {
+                const res = await fetch('/api/local/drives');
+                const data = await res.json();
+                const drives = data.drives || [];
+                const prevVal = selector.value;
+
+                selector.innerHTML = '<option value="">Auto (Carpeta de Tarea)</option>';
+                drives.forEach(d => {
+                    const opt = document.createElement('option');
+                    opt.value = d.id;
+                    opt.textContent = `💽 ${d.name}`;
+                    selector.appendChild(opt);
+                });
+
+                if (prevVal && Array.from(selector.options).some(o => o.value === prevVal)) {
+                    selector.value = prevVal;
+                    if (autoSelectFirst && prevVal) {
+                        await onLocalDriveChange();
+                    }
+                } else if (autoSelectFirst && !document.getElementById('taskSelector').value && drives.length > 0) {
+                    selector.value = drives[0].id;
+                    await onLocalDriveChange();
+                }
+            } catch (e) {}
+        }
+
+        async function onLocalDriveChange() {
+            const selector = document.getElementById('localDriveSelector');
+            if (!selector) return;
+            const drivePath = selector.value;
+            localActiveDriveRoot = drivePath;
+
+            if (!drivePath) {
+                const taskName = document.getElementById('taskSelector').value;
+                if (taskName) {
+                    inspectSelectedTask();
+                } else {
+                    document.getElementById('localPathSubtitle').textContent = 'Sin ruta seleccionada';
+                    initLocalExplorer([]);
+                }
+                return;
+            }
+
+            try {
+                const res = await fetch(`/api/local/browse?root_path=${encodeURIComponent(drivePath)}`);
+                const data = await res.json();
+                if (data.error) {
+                    showNotice('Aviso', data.error);
+                    return;
+                }
+                document.getElementById('localPathSubtitle').textContent = drivePath;
+                initLocalExplorer(data.items || []);
+                const rootNode = localNodes.get('');
+                if (rootNode) {
+                    rootNode.name = drivePath;
+                    rootNode.full_path = drivePath;
+                    renderLocalTreePanel();
+                }
+            } catch (e) {
+                showNotice('Error', 'No se pudo explorar la unidad local seleccionada.');
+            }
+        }
+
+        async function syncCachedRemoteIds() {
+            try {
+                const res = await fetch('/api/cache/status');
+                const data = await res.json();
+                (data.cached_ids || []).forEach(id => prefetchedRemoteIds.add(String(id)));
+            } catch (e) {}
+        }
+
         // =========================================================================
         // REPRODUCTOR MUSICAL FLOTANTE (ID3 + PLAYLIST + EQ 5 BANDAS + VISUALIZADOR)
         // =========================================================================
@@ -4308,13 +4514,12 @@ HTML_TEMPLATE = r"""
             const searchWrap = document.getElementById('dockPlaylistSearchWrap');
             const coverBox = document.getElementById('dockCoverBox');
             const visWrap = document.getElementById('dockVisualizerWrap');
-            const visCanvas = document.getElementById('dockVisualizerCanvas');
             const maxBtn = document.getElementById('dockMaxRestoreBtn');
 
             widget.classList.remove('hidden');
 
             if (mode === 'minimized') {
-                widget.className = 'fixed bottom-4 right-4 z-50 transition-all duration-200';
+                widget.className = 'fixed bottom-4 right-4 z-50';
                 minEl.classList.remove('hidden');
                 expEl.classList.add('hidden');
                 return;
@@ -4324,41 +4529,37 @@ HTML_TEMPLATE = r"""
             expEl.classList.remove('hidden');
 
             if (mode === 'maximized') {
-                widget.className = 'fixed inset-0 w-screen h-screen p-3 sm:p-6 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md transition-all duration-200';
-                expEl.className = 'w-full h-full max-w-5xl max-h-[90vh] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                // Sin backdrop-blur para evitar que Chromium recomponga toda la pantalla en cada frame (GPU < 3%)
+                widget.className = 'fixed inset-0 w-screen h-screen p-3 sm:p-6 z-50 flex items-center justify-center bg-slate-950/90';
+                expEl.className = 'w-full h-full max-w-5xl max-h-[90vh] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
                 mainGrid.className = 'grid grid-cols-1 md:grid-cols-12 flex-1 min-h-0 overflow-hidden';
                 playerCol.className = 'md:col-span-6 p-5 sm:p-6 space-y-4 flex flex-col justify-between overflow-y-auto';
-                playlistCol.className = 'md:col-span-6 border-t md:border-t-0 md:border-l border-slate-800 bg-slate-950/75 flex flex-col min-h-0';
+                playlistCol.className = 'md:col-span-6 border-t md:border-t-0 md:border-l border-slate-800 bg-slate-950 flex flex-col min-h-0';
                 playlistItems.className = 'flex-1 overflow-y-auto divide-y divide-slate-800/40 text-xs';
                 if (searchWrap) searchWrap.classList.remove('hidden');
-                coverBox.className = 'w-28 h-28 sm:w-36 sm:h-36 rounded-2xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-xl cursor-zoom-in transition-all';
+                coverBox.className = 'w-28 h-28 sm:w-36 sm:h-36 rounded-2xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-xl cursor-zoom-in';
                 if (visWrap) {
-                    visWrap.className = `bg-slate-950/90 border border-slate-800/90 rounded-2xl p-3 relative overflow-hidden flex-1 min-h-[150px] flex items-center${visualizerEnabled ? '' : ' hidden'}`;
-                }
-                if (visCanvas) {
-                    visCanvas.width = 560;
-                    visCanvas.height = 200;
-                    visCanvas.className = 'w-full h-full block rounded-xl';
+                    visWrap.className = `bg-slate-950 border border-slate-800 rounded-xl p-2 relative overflow-hidden h-14 flex items-center${visualizerEnabled ? '' : ' hidden'}`;
                 }
                 if (maxBtn) { maxBtn.textContent = '🗗'; maxBtn.title = 'Restaurar tamaño'; }
             } else {
-                widget.className = 'fixed bottom-4 right-4 z-50 transition-all duration-200';
-                expEl.className = 'w-80 sm:w-[410px] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                widget.className = 'fixed bottom-4 right-4 z-50';
+                expEl.className = 'w-80 sm:w-[410px] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
                 mainGrid.className = 'flex flex-col flex-1 min-h-0 overflow-hidden';
                 playerCol.className = 'p-4 space-y-3.5 flex flex-col justify-between shrink-0';
-                playlistCol.className = 'border-t border-slate-800 bg-slate-950/75 flex flex-col min-h-0';
+                playlistCol.className = 'border-t border-slate-800 bg-slate-950 flex flex-col min-h-0';
                 playlistItems.className = 'max-h-44 overflow-y-auto divide-y divide-slate-800/40 text-xs';
                 if (searchWrap) searchWrap.classList.add('hidden');
-                coverBox.className = 'w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner cursor-zoom-in transition-all';
+                coverBox.className = 'w-16 h-16 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center shrink-0 shadow-inner cursor-zoom-in';
                 if (visWrap) {
-                    visWrap.className = `bg-slate-950/90 border border-slate-800/90 rounded-xl p-2 relative overflow-hidden${visualizerEnabled ? '' : ' hidden'}`;
-                }
-                if (visCanvas) {
-                    visCanvas.width = 360;
-                    visCanvas.height = 54;
-                    visCanvas.className = 'w-full h-12 sm:h-14 block rounded-lg';
+                    visWrap.className = `bg-slate-950 border border-slate-800 rounded-xl p-2 relative overflow-hidden h-14 flex items-center${visualizerEnabled ? '' : ' hidden'}`;
                 }
                 if (maxBtn) { maxBtn.textContent = '⛶'; maxBtn.title = 'Maximizar reproductor'; }
+            }
+
+            const audioEl = document.getElementById('dockAudioElement');
+            if (visualizerEnabled && audioEl && !audioEl.paused) {
+                startVisualizerLoop();
             }
         }
 
@@ -4419,6 +4620,7 @@ HTML_TEMPLATE = r"""
 
                 analyserNode = audioCtx.createAnalyser();
                 analyserNode.fftSize = 128;
+                analyserNode.smoothingTimeConstant = 0.62;
 
                 let prevNode = sourceNode;
                 eqFilters.forEach(f => {
@@ -4429,65 +4631,6 @@ HTML_TEMPLATE = r"""
                 analyserNode.connect(audioCtx.destination);
                 eqInitialized = true;
             } catch (e) {}
-        }
-
-        function startVisualizerLoop() {
-            if (visualizerRafId) cancelAnimationFrame(visualizerRafId);
-            const canvas = document.getElementById('dockVisualizerCanvas');
-            if (!canvas) return;
-            const ctx = canvas.getContext('2d');
-
-            function draw() {
-                visualizerRafId = requestAnimationFrame(draw);
-                if (!visualizerEnabled) return;
-                const w = canvas.width;
-                const h = canvas.height;
-                ctx.clearRect(0, 0, w, h);
-
-                if (!analyserNode) return;
-                const bufferLength = analyserNode.frequencyBinCount;
-                const dataArray = new Uint8Array(bufferLength);
-
-                if (visualizerStyle === 'wave') {
-                    analyserNode.getByteTimeDomainData(dataArray);
-                    ctx.lineWidth = 2;
-                    ctx.strokeStyle = '#818cf8';
-                    ctx.beginPath();
-                    const sliceWidth = w / bufferLength;
-                    let x = 0;
-                    for (let i = 0; i < bufferLength; i++) {
-                        const v = dataArray[i] / 128.0;
-                        const y = (v * h) / 2;
-                        if (i === 0) ctx.moveTo(x, y);
-                        else ctx.lineTo(x, y);
-                        x += sliceWidth;
-                    }
-                    ctx.lineTo(w, h / 2);
-                    ctx.stroke();
-                } else {
-                    analyserNode.getByteFrequencyData(dataArray);
-                    const bars = Math.min(40, bufferLength);
-                    const barWidth = (w / bars) - 2;
-                    for (let i = 0; i < bars; i++) {
-                        const val = dataArray[i] / 255;
-                        const barHeight = Math.max(2, val * (h - 4));
-                        const x = i * (barWidth + 2);
-                        const grad = ctx.createLinearGradient(0, h, 0, 0);
-                        grad.addColorStop(0, '#4f46e5');
-                        grad.addColorStop(0.6, '#38bdf8');
-                        grad.addColorStop(1, '#34d399');
-                        ctx.fillStyle = grad;
-
-                        if (visualizerStyle === 'mirror') {
-                            const halfH = barHeight / 2;
-                            ctx.fillRect(x, (h / 2) - halfH, barWidth, barHeight);
-                        } else {
-                            ctx.fillRect(x, h - barHeight, barWidth, barHeight);
-                        }
-                    }
-                }
-            }
-            draw();
         }
 
         function formatTrackTime(secs) {
@@ -4696,7 +4839,11 @@ HTML_TEMPLATE = r"""
             audioEl.onloadedmetadata = () => {
                 document.getElementById('dockTotalTime').textContent = formatTrackTime(audioEl.duration);
             };
+            let lastTimeUiUpdate = 0;
             audioEl.ontimeupdate = () => {
+                const now = performance.now();
+                if (now - lastTimeUiUpdate < 250) return;
+                lastTimeUiUpdate = now;
                 const cur = audioEl.currentTime || 0;
                 const dur = audioEl.duration || 0;
                 document.getElementById('dockCurrentTime').textContent = formatTrackTime(cur);
@@ -4960,15 +5107,6 @@ HTML_TEMPLATE = r"""
                 ? 'px-2 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-500/60 text-[10px] font-medium text-indigo-300 transition flex items-center gap-1'
                 : 'px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-medium text-slate-400 transition flex items-center gap-1';
             if (visualizerEnabled) startVisualizerLoop();
-        }
-
-        function cycleVisualizerStyle() {
-            const order = ['bars', 'mirror', 'wave'];
-            const labels = { bars: 'Barras', mirror: 'Espejo', wave: 'Onda' };
-            const nextIdx = (order.indexOf(visualizerStyle) + 1) % order.length;
-            visualizerStyle = order[nextIdx];
-            const btn = document.getElementById('dockVisStyleBtn');
-            if (btn) btn.textContent = labels[visualizerStyle];
         }
 
         function openCoverLightbox() {
@@ -5422,6 +5560,109 @@ HTML_TEMPLATE = r"""
             renderPreviewItem(currentPreviewList[currentPreviewIndex]);
         }
 
+        async function renderPreviewItem(fileMeta) {
+            if (!fileMeta) return;
+            const modal = document.getElementById('previewModal');
+            const titleEl = document.getElementById('previewTitle');
+            const badgeEl = document.getElementById('previewBadge');
+            const counterEl = document.getElementById('previewCounter');
+            const openTabBtn = document.getElementById('previewOpenTabBtn');
+            const prevBtn = document.getElementById('previewPrevBtn');
+            const nextBtn = document.getElementById('previewNextBtn');
+            const body = document.getElementById('previewBody');
+
+            const name = fileMeta.name || 'Archivo';
+            const ext = name.split('.').pop().toLowerCase();
+            const qParams = buildAudioQueryParams(currentPreviewSource, fileMeta);
+            const streamUrl = `/api/file/stream?${qParams}`;
+
+            titleEl.textContent = name;
+            badgeEl.textContent = currentPreviewSource === 'remote' ? '☁️ Nube' : '💻 Local';
+            counterEl.textContent = currentPreviewList.length > 1 ? `(${currentPreviewIndex + 1} / ${currentPreviewList.length})` : '';
+            openTabBtn.href = streamUrl;
+            prevBtn.disabled = currentPreviewList.length <= 1;
+            nextBtn.disabled = currentPreviewList.length <= 1;
+
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+
+            const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'];
+            const videoExts = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv', 'wmv', 'flv'];
+
+            if (ext === 'pdf') {
+                body.innerHTML = `<iframe src="${streamUrl}" class="w-full h-[72vh] rounded-xl border border-slate-800 bg-white"></iframe>`;
+                return;
+            }
+
+            if (imageExts.includes(ext)) {
+                body.innerHTML = `<img src="${streamUrl}" alt="${escapeAttr(name)}" class="max-h-[72vh] max-w-full object-contain rounded-xl shadow-lg">`;
+                return;
+            }
+
+            if (videoExts.includes(ext)) {
+                const fileMetaEncoded = escapeAttr(JSON.stringify(fileMeta));
+                body.innerHTML = `
+                    <div class="w-full flex flex-col items-center gap-3">
+                        <video id="activePreviewVideo" src="${streamUrl}" controls autoplay playsinline class="max-h-[68vh] w-full rounded-xl bg-black"></video>
+                        <div id="videoAudioControlsBar" class="w-full flex flex-wrap items-center justify-between gap-2 bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-2 text-xs">
+                            <div class="flex items-center gap-2">
+                                <span class="text-slate-400">Pista de audio:</span>
+                                <select id="videoAudioTrackSelect" onchange="onSelectVideoAudioTrack('${escapeAttr(streamUrl)}', '${escapeAttr(name)}', this.value)" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-slate-200">
+                                    <option value="0">Pista 1 (Predeterminada)</option>
+                                </select>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <button type="button" onclick="openFileInNativeProgram('${escapeAttr(currentPreviewSource)}', ${fileMetaEncoded})" class="px-3 py-1 rounded-lg bg-emerald-600/25 hover:bg-emerald-600/40 border border-emerald-500/40 text-emerald-300 transition flex items-center gap-1.5" title="Abrir este video directamente en el reproductor local de tu equipo">
+                                    <span>🖥️</span><span>Abrir con programa local</span>
+                                </button>
+                                <button type="button" onclick="forceVideoAudioTranscode('${escapeAttr(streamUrl)}', '${escapeAttr(name)}', document.getElementById('videoAudioTrackSelect').value)" class="px-3 py-1 rounded-lg bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 transition">
+                                    🔊 Convertir Audio a AAC
+                                </button>
+                            </div>
+                        </div>
+                    </div>`;
+                fetch(`/api/video/tracks?${qParams}`)
+                    .then(r => r.json())
+                    .then(d => {
+                        const sel = document.getElementById('videoAudioTrackSelect');
+                        if (sel && Array.isArray(d.tracks) && d.tracks.length > 0) {
+                            sel.innerHTML = d.tracks.map(t => `<option value="${t.audio_index}">${escapeAttr(t.label)}</option>`).join('');
+                        }
+                    })
+                    .catch(() => {});
+                return;
+            }
+
+            body.innerHTML = '<div class="text-xs text-slate-400 animate-pulse">Generando vista previa...</div>';
+            try {
+                const res = await fetch(`/api/file/preview?${qParams}`);
+                const data = await res.json();
+                if (data.kind === 'text') {
+                    body.innerHTML = `<pre class="w-full h-[68vh] overflow-auto bg-slate-950 border border-slate-800 rounded-xl p-4 text-xs font-mono text-slate-200 whitespace-pre-wrap break-words">${escapeAttr(data.content || '')}</pre>`;
+                } else if (data.kind === 'office') {
+                    body.innerHTML = `<div class="w-full h-[68vh] overflow-auto bg-slate-950 border border-slate-800 rounded-xl p-5 text-slate-200">${data.html}</div>`;
+                } else {
+                    body.innerHTML = `
+                        <div class="text-center space-y-3 py-8">
+                            <div class="text-4xl">📄</div>
+                            <div class="text-sm font-semibold text-white">${escapeAttr(name)}</div>
+                            <p class="text-xs text-slate-400">Vista previa directa no disponible para archivos .${escapeAttr(ext)}.</p>
+                            <a href="${streamUrl}" target="_blank" rel="noopener" class="inline-block px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Descargar / Abrir Archivo</a>
+                        </div>`;
+                }
+            } catch (e) {
+                body.innerHTML = '<div class="text-xs text-rose-400">No se pudo cargar la vista previa del archivo.</div>';
+            }
+        }
+
+        function closePreviewModal() {
+            const modal = document.getElementById('previewModal');
+            const body = document.getElementById('previewBody');
+            if (body) body.innerHTML = '';
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
         function prefetchNextRemoteTrack() {
             if (musicSource !== 'remote' || musicPlayOrder.length <= 1) return;
             const nextPos = (musicOrderPos + 1) % musicPlayOrder.length;
@@ -5469,124 +5710,204 @@ HTML_TEMPLATE = r"""
             forceVideoAudioTranscode(streamUrl, fileName, Number(trackIdx || 0));
         }
 
-        async function renderPreviewItem(fileMeta) {
-            if (!fileMeta) return;
-            const ext = (fileMeta.name || '').split('.').pop().toLowerCase();
-            const qParams = buildAudioQueryParams(currentPreviewSource, fileMeta);
-            const streamUrl = `/api/file/stream?${qParams}`;
+        function initSvgVisualizerDom() {
+            const svg = document.getElementById('dockSvgVisualizer');
+            if (!svg || svgVisInitialized) return;
+            const ns = 'http://www.w3.org/2000/svg';
+            svg.innerHTML = '';
 
-            if (ext === 'pdf') {
-                window.open(streamUrl, '_blank', 'noopener');
-                return;
+            const defs = document.createElementNS(ns, 'defs');
+            const grad = document.createElementNS(ns, 'linearGradient');
+            grad.setAttribute('id', 'svgVisGrad');
+            grad.setAttribute('x1', '0%');
+            grad.setAttribute('y1', '100%');
+            grad.setAttribute('x2', '100%');
+            grad.setAttribute('y2', '0%');
+            svgVisGradStops = [
+                { offset: '0%', color: 'hsl(235, 85%, 58%)' },
+                { offset: '55%', color: 'hsl(195, 92%, 55%)' },
+                { offset: '100%', color: 'hsl(155, 85%, 52%)' }
+            ].map(st => {
+                const stop = document.createElementNS(ns, 'stop');
+                stop.setAttribute('offset', st.offset);
+                stop.setAttribute('stop-color', st.color);
+                grad.appendChild(stop);
+                return stop;
+            });
+            defs.appendChild(grad);
+            svg.appendChild(defs);
+
+            svgVisBars = [];
+            const slotW = 320 / SVG_BARS_COUNT;
+            const barW = Math.max(3, slotW - 2.2);
+            for (let i = 0; i < SVG_BARS_COUNT; i++) {
+                const rect = document.createElementNS(ns, 'rect');
+                rect.setAttribute('x', (i * slotW + 1.1).toFixed(1));
+                rect.setAttribute('y', '41');
+                rect.setAttribute('width', barW.toFixed(1));
+                rect.setAttribute('height', '3');
+                rect.setAttribute('rx', '1.8');
+                rect.setAttribute('fill', 'url(#svgVisGrad)');
+                svg.appendChild(rect);
+                svgVisBars.push(rect);
             }
 
-            const modal = document.getElementById('previewModal');
-            const body = document.getElementById('previewBody');
-            document.getElementById('previewTitle').textContent = fileMeta.name || 'Archivo';
-            document.getElementById('previewBadge').textContent = ext.toUpperCase() || 'ARCHIVO';
-            document.getElementById('previewCounter').textContent = currentPreviewList.length > 1 ? `(${currentPreviewIndex + 1}/${currentPreviewList.length})` : '';
-            document.getElementById('previewOpenTabBtn').href = streamUrl;
-            document.getElementById('previewPrevBtn').disabled = currentPreviewList.length <= 1;
-            document.getElementById('previewNextBtn').disabled = currentPreviewList.length <= 1;
+            svgVisPolyline = document.createElementNS(ns, 'polyline');
+            svgVisPolyline.setAttribute('fill', 'none');
+            svgVisPolyline.setAttribute('stroke', 'url(#svgVisGrad)');
+            svgVisPolyline.setAttribute('stroke-width', '2.4');
+            svgVisPolyline.setAttribute('stroke-linejoin', 'round');
+            svgVisPolyline.setAttribute('stroke-linecap', 'round');
+            svgVisPolyline.setAttribute('points', '0,22 320,22');
+            svgVisPolyline.style.display = 'none';
+            svg.appendChild(svgVisPolyline);
 
-            modal.classList.remove('hidden');
-            modal.classList.add('flex');
+            svgVisInitialized = true;
+        }
 
-            const imgExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'];
-            const vidExts = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv'];
+        function syncSvgVisualizerMode() {
+            initSvgVisualizerDom();
+            const isWave = visualizerStyle === 'wave';
+            svgVisBars.forEach(b => { b.style.display = isWave ? 'none' : ''; });
+            if (svgVisPolyline) svgVisPolyline.style.display = isWave ? '' : 'none';
+        }
 
-            if (imgExts.includes(ext)) {
-                body.innerHTML = `<img src="${streamUrl}" alt="${escapeAttr(fileMeta.name)}" class="max-h-[74vh] max-w-full object-contain rounded-xl shadow-lg">`;
-                return;
-            }
+        function startVisualizerLoop() {
+            if (visualizerRafId) cancelAnimationFrame(visualizerRafId);
+            syncSvgVisualizerMode();
+            const audioEl = document.getElementById('dockAudioElement');
+            let freqData = null;
+            let timeData = null;
 
-            if (vidExts.includes(ext)) {
-                const transcodeParam = ['avi', 'mkv', 'mov'].includes(ext) ? '&transcode=1&audio_track=0' : '';
-                body.innerHTML = `
-                    <div class="w-full flex flex-col items-center gap-2.5">
-                        <video id="activePreviewVideo" src="${streamUrl}${transcodeParam}" controls autoplay playsinline class="max-h-[68vh] w-full rounded-xl bg-black"></video>
-                        <div id="videoAudioControlsBar" class="w-full flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-400">
-                            <div class="flex items-center gap-2">
-                                <span id="videoTrackStatusLabel">Pista de audio:</span>
-                                <select id="videoAudioTrackSelect" onchange="onSelectVideoAudioTrack('${escapeAttr(streamUrl)}', '${escapeAttr(fileMeta.name)}', this.value)" class="hidden bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"></select>
-                            </div>
-                            <button type="button" onclick="forceVideoAudioTranscode('${escapeAttr(streamUrl)}', '${escapeAttr(fileMeta.name)}', Number(document.getElementById('videoAudioTrackSelect')?.value || 0))" class="px-2.5 py-1 rounded-lg bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 font-medium transition">
-                                🔊 Extraer Pista a AAC Compatible
-                            </button>
-                        </div>
-                    </div>`;
-                const vid = document.getElementById('activePreviewVideo');
-                if (vid) {
-                    vid.muted = false;
-                    vid.volume = 0.85;
-                    vid.play().catch(() => {});
+            function draw(now) {
+                if (!visualizerEnabled || document.hidden || musicDockMode === 'minimized' || (audioEl && audioEl.paused)) {
+                    visualizerRafId = null;
+                    return;
                 }
-                // Consultar pistas de audio disponibles en el contenedor (ej. [spa] y [jpn])
-                fetch(`/api/video/tracks?${qParams}`)
-                    .then(r => r.json())
-                    .then(data => {
-                        const tracks = data.tracks || [];
-                        const sel = document.getElementById('videoAudioTrackSelect');
-                        const lbl = document.getElementById('videoTrackStatusLabel');
-                        if (!sel || !lbl) return;
-                        if (tracks.length > 0) {
-                            sel.innerHTML = tracks.map(t => `<option value="${t.audio_index}">${escapeAttr(t.label)}</option>`).join('');
-                            sel.classList.remove('hidden');
-                            lbl.textContent = tracks.length > 1 ? `Pista (${tracks.length} disponibles):` : 'Pista de audio:';
-                        } else {
-                            lbl.textContent = 'Si el video tiene doble pista o AC3:';
+                visualizerRafId = requestAnimationFrame(draw);
+
+                if (now - lastVisualizerFrameTime < VISUALIZER_FPS_INTERVAL) return;
+                lastVisualizerFrameTime = now;
+
+                if (!analyserNode) return;
+                const bufferLength = analyserNode.frequencyBinCount;
+
+                if (!freqData || freqData.length !== bufferLength) {
+                    freqData = new Uint8Array(bufferLength);
+                }
+                analyserNode.getByteFrequencyData(freqData);
+
+                // Detección instantánea de energía de graves (kick/ritmo) y brillo agudo para cambiar colores al ritmo
+                const bassSum = (freqData[1] + freqData[2] + freqData[3] + freqData[4]) / (4 * 255);
+                const midSum = (freqData[6] + freqData[8] + freqData[10] + freqData[12]) / (4 * 255);
+                const highSum = (freqData[15] + freqData[18] + freqData[21] + freqData[24]) / (4 * 255);
+                const beatPulse = Math.max(0, bassSum - beatEnergySmooth);
+                beatEnergySmooth = beatEnergySmooth * 0.72 + bassSum * 0.28;
+
+                // Desplazamiento dinámico de matiz (HSL): tonos fríos en calma -> fucsia/naranja/dorado en golpes de ritmo
+                const targetHue = (225 + bassSum * 135 + beatPulse * 180 + highSum * 60) % 360;
+                beatHueSmooth = beatHueSmooth + (targetHue - beatHueSmooth) * 0.35;
+                const h1 = Math.round(beatHueSmooth);
+                const h2 = (h1 + Math.round(45 + midSum * 55)) % 360;
+                const h3 = (h2 + Math.round(50 + highSum * 65)) % 360;
+                const lumBoost = Math.round(54 + Math.min(18, (bassSum + beatPulse) * 24));
+
+                if (svgVisGradStops.length === 3) {
+                    svgVisGradStops[0].setAttribute('stop-color', `hsl(${h1}, 90%, ${lumBoost}%)`);
+                    svgVisGradStops[1].setAttribute('stop-color', `hsl(${h2}, 94%, ${lumBoost + 4}%)`);
+                    svgVisGradStops[2].setAttribute('stop-color', `hsl(${h3}, 90%, ${lumBoost + 2}%)`);
+                }
+
+                if (visualizerStyle === 'wave') {
+                    if (!timeData || timeData.length !== bufferLength) {
+                        timeData = new Uint8Array(bufferLength);
+                    }
+                    analyserNode.getByteTimeDomainData(timeData);
+                    if (svgVisPolyline) {
+                        const pts = [];
+                        const usableBins = Math.min(bufferLength, 48);
+                        const stepX = 320 / Math.max(1, usableBins - 1);
+                        for (let i = 0; i < usableBins; i++) {
+                            const centered = (timeData[i] - 128) / 128;
+                            const y = 22 + centered * (20 + beatPulse * 10);
+                            pts.push(`${(i * stepX).toFixed(1)},${Math.max(2, Math.min(42, y)).toFixed(1)}`);
                         }
-                    })
-                    .catch(() => {});
-                return;
-            }
-
-            body.innerHTML = '<div class="text-xs text-slate-400 animate-pulse">Generando vista previa...</div>';
-            try {
-                const res = await fetch(`/api/file/preview?${qParams}`);
-                const data = await res.json();
-                if (data.kind === 'text') {
-                    body.innerHTML = `<pre class="w-full max-h-[72vh] overflow-auto bg-slate-900 border border-slate-800 rounded-xl p-4 text-xs font-mono text-slate-200 whitespace-pre-wrap">${escapeAttr(data.content)}</pre>`;
-                } else if (data.kind === 'office') {
-                    body.innerHTML = `<div class="w-full max-h-[72vh] overflow-auto bg-slate-900 border border-slate-800 rounded-xl p-5 text-xs text-slate-200">${data.html}</div>`;
+                        svgVisPolyline.setAttribute('points', pts.join(' '));
+                    }
                 } else {
-                    body.innerHTML = `<div class="text-center space-y-3"><p class="text-xs text-slate-400">Vista previa directa no disponible para <strong>.${escapeAttr(ext)}</strong>.</p><a href="${streamUrl}" target="_blank" class="inline-block px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white">Descargar / Abrir archivo</a></div>`;
+                    const isMirror = visualizerStyle === 'mirror';
+                    // Distribución logarítmica sobre las frecuencias audibles para mayor precisión musical
+                    const maxUsefulBin = Math.min(bufferLength - 1, 44);
+                    for (let i = 0; i < SVG_BARS_COUNT; i++) {
+                        const normPos = i / (SVG_BARS_COUNT - 1);
+                        const binIdx = Math.min(maxUsefulBin, Math.floor(Math.pow(normPos, 1.35) * maxUsefulBin));
+                        const rawVal = freqData[binIdx] / 255;
+                        // Compensación de agudos + impulso en el golpe de ritmo
+                        const gainBoost = 1 + normPos * 0.42 + beatPulse * 0.35;
+                        const val = Math.min(1, Math.pow(rawVal * gainBoost, 1.15));
+                        const h = Math.max(3, Math.round(val * 41));
+                        const y = isMirror ? Math.round((44 - h) / 2) : (44 - h);
+                        const rect = svgVisBars[i];
+                        if (rect) {
+                            rect.setAttribute('y', String(y));
+                            rect.setAttribute('height', String(h));
+                        }
+                    }
                 }
-            } catch (e) {
-                body.innerHTML = '<div class="text-xs text-rose-400">Error cargando vista previa del archivo.</div>';
             }
+            visualizerRafId = requestAnimationFrame(draw);
         }
 
-        function closePreviewModal() {
-            const modal = document.getElementById('previewModal');
-            const vid = document.getElementById('activePreviewVideo');
-            if (vid) {
-                vid.pause();
-                vid.removeAttribute('src');
-                vid.load();
-            }
-            document.getElementById('previewBody').innerHTML = '';
-            modal.classList.add('hidden');
-            modal.classList.remove('flex');
-        }
-
-        // =========================================================================
-        // MENÚ CONTEXTUAL (ABRIR, PLAYLIST, SUBIR/DESCARGAR, RENOMBRAR, ELIMINAR)
-        // =========================================================================
-        function closeExplorerContextMenu() {
-            const menu = document.getElementById('explorerContextMenu');
-            if (menu) menu.classList.add('hidden');
-        }
-
-        document.addEventListener('click', closeExplorerContextMenu);
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') {
-                closeExplorerContextMenu();
-                closePreviewModal();
-                closeRenameModal();
-                closePropertiesModal();
+        document.addEventListener('visibilitychange', () => {
+            const audioEl = document.getElementById('dockAudioElement');
+            if (!document.hidden && visualizerEnabled && audioEl && !audioEl.paused && musicDockMode !== 'minimized') {
+                startVisualizerLoop();
             }
         });
+
+        async function openFileInNativeProgram(source, itemMeta) {
+            if (!itemMeta || itemMeta.type === 'folder') return;
+            const taskName = document.getElementById('taskSelector').value || '';
+            const vidEl = document.getElementById('activePreviewVideo');
+            if (vidEl && !vidEl.paused) {
+                vidEl.pause();
+            }
+            try {
+                const res = await fetch('/api/explorer/open_native', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        source,
+                        id: itemMeta.id,
+                        name: itemMeta.name,
+                        size: itemMeta.size || 0,
+                        mtime: itemMeta.mtime || 0,
+                        full_path: itemMeta.full_path || '',
+                        root_path: localActiveDriveRoot || '',
+                        task: taskName,
+                        rel_path: itemMeta.rel_path || ''
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    if (source === 'remote' && data.job_id) {
+                        startTransferTracking(
+                            data.job_id,
+                            `Preparando en caché: ${itemMeta.name}`,
+                            'download',
+                            () => {
+                                if (itemMeta.id) prefetchedRemoteIds.add(String(itemMeta.id));
+                            }
+                        );
+                    }
+                    refreshStatusAndLogs();
+                } else {
+                    showNotice('Error al abrir archivo', data.error || 'No se pudo abrir con la aplicación del sistema.');
+                }
+            } catch (e) {
+                showNotice('Error de Red', 'No se pudo comunicar con el servidor para abrir el archivo localmente.');
+            }
+        }
 
         function openExplorerContextMenu(event, source, itemMeta) {
             event.preventDefault();
@@ -5595,10 +5916,16 @@ HTML_TEMPLATE = r"""
 
             const menu = document.getElementById('explorerContextMenu');
             const isFolder = itemMeta.type === 'folder';
-            const canQueueAudio = isFolder || isAudioFilename(itemMeta.name);
+            const isAudio = !isFolder && isAudioFilename(itemMeta.name);
+            const canQueueAudio = isFolder || isAudio;
+            const canOpenNative = !isFolder && !isAudio;
             const itemsHtml = [];
 
             itemsHtml.push(`<button onclick="ctxActionOpen()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 flex items-center gap-2.5"><span>📂</span><span>Abrir</span></button>`);
+
+            if (canOpenNative) {
+                itemsHtml.push(`<button onclick="ctxActionOpenNative()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 text-amber-300 flex items-center gap-2.5"><span>🖥️</span><span>Abrir con programa local</span></button>`);
+            }
 
             if (canQueueAudio) {
                 itemsHtml.push(`<button onclick="ctxActionAddToPlaylist()" class="w-full px-3.5 py-2 text-left hover:bg-slate-800 text-indigo-300 flex items-center gap-2.5"><span>🎵</span><span>Agregar a la lista de reproducción</span></button>`);
@@ -5624,21 +5951,61 @@ HTML_TEMPLATE = r"""
             menu.innerHTML = itemsHtml.join('');
             menu.classList.remove('hidden');
 
-            const x = Math.min(event.clientX, window.innerWidth - 250);
-            const y = Math.min(event.clientY, window.innerHeight - 280);
-            menu.style.left = `${Math.max(8, x)}px`;
-            menu.style.top = `${Math.max(8, y)}px`;
+            const menuWidth = 240;
+            const menuHeight = 250;
+            const posX = Math.min(event.clientX, window.innerWidth - menuWidth - 8);
+            const posY = Math.min(event.clientY, window.innerHeight - menuHeight - 8);
+            menu.style.left = `${Math.max(8, posX)}px`;
+            menu.style.top = `${Math.max(8, posY)}px`;
         }
+
+        function closeExplorerContextMenu() {
+            const menu = document.getElementById('explorerContextMenu');
+            if (menu) menu.classList.add('hidden');
+        }
+
+        document.addEventListener('click', closeExplorerContextMenu);
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeExplorerContextMenu();
+        });
 
         function ctxActionOpen() {
             if (!activeContextTarget) return;
             const { source, item } = activeContextTarget;
             closeExplorerContextMenu();
-            if (item.type === 'folder') {
-                if (source === 'local') selectLocalFolder(item.rel_path || '');
-                else selectRemoteNode(String(item.id || remoteBaseRootId));
+            if (source === 'local') {
+                if (item.type === 'folder') {
+                    selectLocalFolder(item.rel_path || '');
+                } else {
+                    openExplorerFile('local', item);
+                }
             } else {
-                openExplorerFile(source, item);
+                if (item.type === 'folder') {
+                    selectRemoteNode(String(item.id));
+                } else {
+                    openExplorerFile('remote', item);
+                }
+            }
+        }
+
+        function ctxActionOpenNative() {
+            if (!activeContextTarget) return;
+            const { source, item } = activeContextTarget;
+            closeExplorerContextMenu();
+            openFileInNativeProgram(source, item);
+        }
+
+        function cycleVisualizerStyle() {
+            const order = ['bars', 'mirror', 'wave'];
+            const labels = { bars: 'SVG Barras', mirror: 'SVG Espejo', wave: 'SVG Onda' };
+            const nextIdx = (order.indexOf(visualizerStyle) + 1) % order.length;
+            visualizerStyle = order[nextIdx];
+            const btn = document.getElementById('dockVisStyleBtn');
+            if (btn) btn.textContent = labels[visualizerStyle];
+            syncSvgVisualizerMode();
+            const audioEl = document.getElementById('dockAudioElement');
+            if (visualizerEnabled && audioEl && !audioEl.paused) {
+                startVisualizerLoop();
             }
         }
 
@@ -5796,7 +6163,7 @@ HTML_TEMPLATE = r"""
             widget.classList.remove('hidden');
 
             if (mode === 'minimized') {
-                widget.className = 'fixed bottom-4 left-4 z-50 transition-all duration-200';
+                widget.className = 'fixed bottom-4 left-4 z-50';
                 minEl.classList.remove('hidden');
                 expEl.classList.add('hidden');
                 return;
@@ -5806,13 +6173,13 @@ HTML_TEMPLATE = r"""
             expEl.classList.remove('hidden');
 
             if (mode === 'maximized') {
-                widget.className = 'fixed inset-0 w-screen h-screen p-3 sm:p-6 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md transition-all duration-200';
-                expEl.className = 'w-full h-full max-w-3xl max-h-[85vh] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                widget.className = 'fixed inset-0 w-screen h-screen p-3 sm:p-6 z-50 flex items-center justify-center bg-slate-950/90';
+                expEl.className = 'w-full h-full max-w-3xl max-h-[85vh] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
                 itemsList.className = 'flex-1 overflow-y-auto divide-y divide-slate-800/40 text-xs';
                 if (maxBtn) { maxBtn.textContent = '🗗'; maxBtn.title = 'Restaurar tamaño'; }
             } else {
-                widget.className = 'fixed bottom-4 left-4 z-50 transition-all duration-200';
-                expEl.className = 'w-80 sm:w-[440px] bg-slate-900/95 backdrop-blur border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
+                widget.className = 'fixed bottom-4 left-4 z-50';
+                expEl.className = 'w-80 sm:w-[440px] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
                 itemsList.className = 'max-h-36 overflow-y-auto divide-y divide-slate-800/40 text-xs';
                 if (maxBtn) { maxBtn.textContent = '⛶'; maxBtn.title = 'Maximizar detalle'; }
             }
@@ -5913,7 +6280,7 @@ HTML_TEMPLATE = r"""
             }
         }
 
-        function startTransferTracking(jobId, initialTitle, direction) {
+        function startTransferTracking(jobId, initialTitle, direction, onCompleted = null) {
             if (activeTransferPollTimer) {
                 clearInterval(activeTransferPollTimer);
                 activeTransferPollTimer = null;
@@ -5944,7 +6311,9 @@ HTML_TEMPLATE = r"""
                     if (job.status === 'completed' || job.status === 'error') {
                         clearInterval(activeTransferPollTimer);
                         activeTransferPollTimer = null;
-                        if (job.direction === 'download') {
+                        if (typeof onCompleted === 'function') {
+                            onCompleted(job);
+                        } else if (job.direction === 'download') {
                             await fetchLocalNodeChildren(localSelectedPath || '');
                             renderLocalTreePanel();
                             renderLocalContentsPanel();
