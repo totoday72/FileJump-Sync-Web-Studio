@@ -403,7 +403,7 @@
                     <button type="button" onclick="event.stopPropagation(); setActiveProfileRow(this.closest('.profile-row')); captureCurrentRemoteIntoProfile(true);" class="px-2 py-1.5 rounded-lg bg-sky-600/20 hover:bg-sky-600/35 border border-sky-500/40 text-sky-300 text-xs shrink-0" title="Leer carpeta seleccionada en Explorador Remoto">☁️</button>
                 </div>
                 <input type="number" min="1" max="100" value="${threshold}" title="Umbral máximo de cambios (%) antes de pedir confirmación" class="profile-threshold lg:col-span-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white text-center focus:border-indigo-500 focus:outline-none">
-                <button type="button" onclick="event.stopPropagation(); const r = this.closest('.profile-row'); if (activeProfileRowEl === r) activeProfileRowEl = null; r.remove(); updateSyncProfilesCount();" class="lg:col-span-1 text-rose-400 hover:text-rose-300 text-sm font-bold text-center py-1" title="Eliminar perfil">✕</button>
+                <button type="button" onclick="event.stopPropagation(); removeSyncProfileRow(this);" class="lg:col-span-1 text-rose-400 hover:text-rose-300 text-sm font-bold text-center py-1" title="Eliminar perfil">✕</button>
             `;
             container.appendChild(row);
             setActiveProfileRow(row);
@@ -518,6 +518,52 @@
             modal.classList.remove('flex');
         }
 
+
+        async function removeSyncProfileRow(btnEl) {
+            const row = btnEl.closest('.profile-row');
+            if (!row) return;
+            const removedName = row.querySelector('.profile-name') ? row.querySelector('.profile-name').value.trim() : '';
+            if (activeProfileRowEl === row) activeProfileRowEl = null;
+            row.remove();
+            updateSyncProfilesCount();
+
+            // Si el perfil eliminado ya existía guardado en currentConfig.tasks, actualizar inmediatamente local + remoto
+            if (removedName && Array.isArray(currentConfig.tasks) && currentConfig.tasks.some(t => t.name === removedName)) {
+                const remainingTasks = [];
+                document.querySelectorAll('#syncProfilesListContainer .profile-row').forEach(r => {
+                    const name = r.querySelector('.profile-name').value.trim();
+                    const path = r.querySelector('.profile-path').value.trim();
+                    const dirBtn = r.querySelector('.profile-direction');
+                    const sync_direction = dirBtn ? (dirBtn.dataset.direction || 'local_to_remote') : 'local_to_remote';
+                    const remInput = r.querySelector('.profile-remote-path');
+                    const remote_path = remInput ? remInput.value.trim() : '/ (Raíz de FileJump)';
+                    const remote_folder_id = remInput ? (remInput.dataset.remoteId || 'ROOT') : 'ROOT';
+                    const min_impact_percentage = Number(r.querySelector('.profile-threshold').value || 40);
+                    if (name && path) {
+                        remainingTasks.push({ name, path, sync_direction, remote_path, remote_folder_id, min_impact_percentage });
+                    }
+                });
+
+                const updatedConfig = {
+                    ...currentConfig,
+                    tasks: remainingTasks
+                };
+
+                try {
+                    const res = await fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ config: updatedConfig })
+                    });
+                    const data = await res.json();
+                    if (res.ok && data.success) {
+                        currentConfig = updatedConfig;
+                        renderTaskSelector();
+                    }
+                } catch (e) {}
+            }
+        }
+
         async function saveSyncProfiles() {
             const tasks = [];
             const seenNames = new Set();
@@ -574,7 +620,7 @@
                     return;
                 }
 
-                closeSyncProfilesModal();
+                closeSyncProfilesModal(); if (data.remote_message) { showNotice('Perfiles Actualizados', data.remote_message); }
                 await loadInitialConfig();
 
                 const sel = document.getElementById('taskSelector');

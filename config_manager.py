@@ -1,4 +1,6 @@
 import os
+import socket
+import platform
 import json
 import time
 import threading
@@ -20,7 +22,25 @@ TEMP_CACHE_DIR = BASE_DIR / "temp_cache"
 CACHE_META_FILE = TEMP_CACHE_DIR / ".cache_index.json"
 LOCAL_FAVORITES_FALLBACK = BASE_DIR / "favorites_cache.json"
 REMOTE_APP_CONFIG_DIR = "filejump_sync_studio"
+REMOTE_PLAYLISTS_SUBDIR = "playlist"
 REMOTE_FAVORITES_FILENAME = "favorites.json"
+REMOTE_FAVORITES_M3U_FILENAME = "favorites.m3u"
+REMOTE_MACHINE_PROFILES_FILENAME = "sync_profiles.json"
+LOCAL_PLAYLISTS_DIR = BASE_DIR / "playlists"
+LOCAL_PLAYLISTS_DIR.mkdir(exist_ok=True)
+
+
+def get_machine_name():
+    """Obtiene el nombre neto del equipo (ej. DELL3040CASA en Windows o hostname en Linux/macOS)."""
+    raw_name = (
+        os.environ.get("COMPUTERNAME")
+        or platform.node()
+        or socket.gethostname()
+        or "EQUIPO_LOCAL"
+    ).strip()
+    clean_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in raw_name).strip("_")
+    return clean_name or "EQUIPO_LOCAL"
+
 
 RECORDS_DIR.mkdir(exist_ok=True)
 TEMP_CACHE_DIR.mkdir(exist_ok=True)

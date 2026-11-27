@@ -7,7 +7,7 @@
 
 ---
 
-**FileJump Sync Studio** es una suite web local desarrollada en Python y Flask que combina un **comparador y sincronizador bidireccional/incremental** para **FileJump REST API** con un **explorador dual estilo Windows** (Equipo Local vs. Nube FileJump) y un **reproductor multimedia integrado** con lectura de etiquetas ID3, ecualizador gráfico de 5 bandas y visualizador rítmico en tiempo real.
+**FileJump Sync Studio** es una suite web local desarrollada en Python y Flask que combina un **comparador y sincronizador bidireccional/incremental** para **FileJump REST API**, un **explorador dual estilo Windows** (Equipo Local vs. Nube FileJump) y un reproductor multimedia con playlists M3U, favoritos sincronizados y perfiles de sincronización por equipo.
 
 ---
 
@@ -18,6 +18,7 @@
 * **Subida Paralela de Alta Velocidad:** Soporte multihilo (`ThreadPoolExecutor`) y conexión directa al endpoint de subida rápida de FileJump.
 * **Protección contra Cambios Masivos:** Umbral de impacto configurable (%) que solicita confirmación explícita antes de sobrescribir o alterar grandes volúmenes de archivos.
 * **Gestión Segura de Credenciales:** Configuración visual de tokens `Bearer` y URLs almacenadas localmente en `.env`.
+* **Perfiles por equipo en la nube:** Descarga perfiles de sincronización desde `filejump_sync_studio/<NOMBRE_EQUIPO>/sync_profiles.json` al iniciar y publica automáticamente los cambios realizados a los perfiles locales.
 
 ### 🗂️ Explorador Dual Estilo Windows
 * **Panel Dividido (Árbol + Contenido):** Árbol jerárquico lateral izquierdo con **carga perezosa (`+` / `−`)** bajo demanda y tabla de contenido a la derecha con barra de ruta (*breadcrumbs*) y navegación por doble clic.
@@ -38,6 +39,17 @@
 * **Precarga en Caché + Modo Aleatorio:** Genera colas aleatorias y descarga en segundo plano la siguiente canción remota para una reproducción sin interrupciones.
 * **Ecualizador Gráfico de 5 Bandas (`Web Audio API`):** Bandas de `60Hz`, `230Hz`, `910Hz`, `3.6kHz` y `14kHz` (`-12 dB` a `+12 dB`) con presets (*Plano, Bass Boost, Electrónica, Pop, Rock, Vocal*).
 * **Visualizador Rítmico en Tiempo Real:** Analizador de espectro en `<canvas>` activable/desactivable con 3 modos visuales (*Barras, Espejo, Onda*).
+* **Playlists M3U en la nube:** Guarda la cola actual como `.m3u` estándar en `filejump_sync_studio/playlist/`, con metadatos `#EXTINF` y `#EXTFJ`; se evita reemplazar una lista existente con el mismo nombre.
+* **Gestor de playlists guardadas:** Explora las listas remotas y su número de pistas, selecciónalas, reprodúcelas o elimínalas desde el reproductor maximizado. También puedes abrir archivos `.m3u` y `.m3u8` directamente desde ambos exploradores.
+* **Favoritos sincronizados:** Marca pistas desde el reproductor para mantener favoritos en `favorites.json` y generar automáticamente `filejump_sync_studio/playlist/favorites.m3u`, con una copia local de respaldo.
+* **Sugerencia de nombre para M3U:** Propone el nombre de la carpeta común de las pistas o, si pertenecen a distintas ubicaciones, `playlist-DD-MM-YYYY`.
+
+### 🧰 Estabilidad y compatibilidad
+* **Listados remotos completos:** La paginación de archivos y carpetas contempla metadatos `meta`, `links`, `next_page` y `last_page`, y evita repetir páginas si la API ignora el parámetro solicitado.
+* **Escaneo sin bloquear la interfaz:** La búsqueda recursiva de audio se ejecuta en segundo plano e informa el progreso mientras se siguen usando los exploradores.
+* **Perfiles únicos por equipo:** Al actualizar perfiles se reemplaza la copia remota anterior para conservar un único `sync_profiles.json` por equipo.
+* **Gestor de playlists estable:** La función global `escapeHtml()` evita errores al renderizar los nombres de las listas guardadas.
+* **Metadatos y fechas preservados:** Las playlists M3U guardan los datos necesarios para resolver archivos locales y remotos; las transferencias conservan la fecha de modificación original cuando está disponible.
 
 ---
 
@@ -69,17 +81,25 @@
 ## 📁 Estructura del Proyecto
 
 ```text
-├── filejump_sync_web_studio.py # Servidor Flask, UI, visor y reproductor Web Audio
-├── exec.bat               # Lanzador para Windows (requiere Python en PATH)
+├── filejump_sync_web_studio.py # Punto de entrada Flask
+├── config_manager.py       # Configuración, perfiles por equipo y rutas locales de datos
+├── filejump_client.py      # Cliente REST de FileJump y operaciones de playlists/favoritos
+├── routes_api.py           # Endpoints de la aplicación
+├── sync_engine.py          # Comparación y sincronización
+├── media_utils.py          # Metadatos y utilidades multimedia
+├── templates/index.html    # Interfaz principal
+├── static/js/              # Explorador, reproductor y lógica de interfaz
+├── static/css/styles.css   # Estilos de la aplicación
 ├── requirements.txt        # Dependencias de Python
-├── .env                    # Credenciales API (ignorado en Git por seguridad)
-├── sync_config.json        # Tareas y parámetros de sincronización
-├── sync_records/           # Historial JSON de archivos sincronizados por tarea
-└── temp_cache/             # Caché persistente; se elimina al cambiar la API key
+├── .env                    # Credenciales API (ignorado en Git)
+├── sync_config.json        # Tareas y perfiles de sincronización (local)
+├── sync_records/           # Historial local de sincronización
+├── temp_cache/             # Caché local persistente de archivos remotos
+└── playlists/              # Playlists M3U locales y respaldo de favoritos
 ```
 
 ---
 
 ## 🔒 Datos locales
 
-.env, `sync_config.json`, `sync_records/` y `temp_cache/` contienen credenciales o datos locales y están excluidos del repositorio mediante `.gitignore`.
+`.env`, `sync_config.json`, `sync_records/`, `temp_cache/`, `favorites_cache.json` y `playlists/` contienen credenciales, caché o datos del usuario y están excluidos del repositorio mediante `.gitignore`. Los perfiles por equipo y las playlists seleccionadas pueden sincronizarse con FileJump en `filejump_sync_studio/`.

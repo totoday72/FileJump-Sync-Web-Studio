@@ -13,8 +13,13 @@ from config_manager import (
     ENV_FILE,
     TEMP_CACHE_DIR,
     LOCAL_FAVORITES_FALLBACK,
+    LOCAL_PLAYLISTS_DIR,
     REMOTE_APP_CONFIG_DIR,
+    REMOTE_PLAYLISTS_SUBDIR,
     REMOTE_FAVORITES_FILENAME,
+    REMOTE_FAVORITES_M3U_FILENAME,
+    REMOTE_MACHINE_PROFILES_FILENAME,
+    get_machine_name,
     log_event,
     compute_api_key_hash,
     ensure_cache_matches_api_key,
@@ -662,6 +667,307 @@ class FileJumpClient:
                     self.rename_item("file", new_id, REMOTE_FAVORITES_FILENAME)
                 return True, "Favoritos sincronizados en FileJump"
             return False, getattr(self, "last_upload_error", "No se pudo subir favorites.json")
+        except Exception as e:
+            return False, str(e)
+
+    def ensure_remote_machine_profiles_dir(self):
+        """Asegura '/filejump_sync_studio/<NOMBRE_DEL_EQUIPO>' en FileJump y devuelve su ID."""
+        if not self.api_key:
+            return None
+        app_dir_id = self.ensure_remote_app_config_dir()
+        if not app_dir_id:
+            return None
+        machine_name = get_machine_name()
+        subfolders = self.list_folders(parent_id=app_dir_id)
+        for sf in subfolders:
+            if (sf.get("name") or "").strip().lower() == machine_name.lower() and sf.get("id") is not None:
+                return sf.get("id")
+        return self.create_folder(machine_name, parent_id=app_dir_id)
+
+    def load_remote_machine_profiles(self):
+        """Descarga el archivo único '/filejump_sync_studio/<EQUIPO>/sync_profiles.json' hacia local."""
+        if not self.api_key:
+            return None
+        machine_dir_id = self.ensure_remote_machine_profiles_dir()
+        if not machine_dir_id:
+            return None
+        try:
+            files = self.list_files(folder_id=machine_dir_id)
+            matching_files = [
+                fl for fl in files
+                if (fl.get("name") or fl.get("file_name") or "").strip().lower() == REMOTE_MACHINE_PROFILES_FILENAME.lower()
+                and fl.get("id") is not None
+            ]
+            if not matching_files:
+                return None
+
+            # Tomar el más reciente (mayor ID o updated_at) y limpiar duplicados si existieran
+            matching_files.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or x.get("id") or ""), reverse=True)
+            target_file = matching_files[0]
+            for extra_dup in matching_files[1:]:
+                try:
+                    self.delete_file(extra_dup.get("id"))
+                except Exception:
+                    pass
+
+            fid = target_file.get("id")
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            for url in (f"{self.base_url}/files/{fid}/download", f"{self.base_url}/drive/file-entries/{fid}/download"):
+                try:
+                    resp = requests.get(url, headers=headers, timeout=20)
+                    if resp.status_code == 200 and resp.text.strip():
+                        parsed = json.loads(resp.text)
+                        if isinstance(parsed, dict):
+                            return parsed
+                except Exception:
+                    pass
+        except Exception as e:
+            log_event("warning", f"No se pudieron leer perfiles remotos del equipo: {e}")
+        return None
+
+    def save_remote_machine_profiles(self, config_data):
+        """
+        Reemplaza el archivo único '/filejump_sync_studio/<NOMBRE_DEL_EQUIPO>/sync_profiles.json'
+        en FileJump cada vez que se crea, modifica o elimina un perfil localmente.
+        """
+        if not self.api_key:
+            return False, "Falta FILEJUMP_API_KEY"
+        machine_name = get_machine_name()
+        machine_dir_id = self.ensure_remote_machine_profiles_dir()
+        if not machine_dir_id:
+            return False, f"No se pudo crear la carpeta remota '{REMOTE_APP_CONFIG_DIR}/{machine_name}'"
+
+        payload_data = {
+            "machine_name": machine_name,
+            "updated_at": datetime.datetime.now(timezone.utc).isoformat(),
+            "max_workers": config_data.get("max_workers", 4),
+            "min_impact_percentage": config_data.get("min_impact_percentage", 40),
+            "use_high_speed_upload": config_data.get("use_high_speed_upload", True),
+            "tasks": config_data.get("tasks", [])
+        }
+
+        try:
+            # Eliminar cualquier archivo previo de perfiles en la carpeta del equipo para mantener uno solo
+            existing_files = self.list_files(folder_id=machine_dir_id)
+            for fl in existing_files:
+                fname = (fl.get("name") or fl.get("file_name") or "").strip()
+                if fname.lower() == REMOTE_MACHINE_PROFILES_FILENAME.lower() and fl.get("id") is not None:
+                    self.delete_file(fl.get("id"))
+
+            TEMP_CACHE_DIR.mkdir(exist_ok=True)
+            tmp_json_path = TEMP_CACHE_DIR / REMOTE_MACHINE_PROFILES_FILENAME
+            with open(tmp_json_path, "w", encoding="utf-8") as f:
+                json.dump(payload_data, f, indent=4, ensure_ascii=False)
+
+            res = self.upload_file(str(tmp_json_path), folder_id=machine_dir_id, use_high_speed=False)
+            try:
+                tmp_json_path.unlink()
+            except Exception:
+                pass
+
+            if res is not None:
+                return True, f"Archivo '{REMOTE_APP_CONFIG_DIR}/{machine_name}/{REMOTE_MACHINE_PROFILES_FILENAME}' actualizado en FileJump."
+            return False, "FileJump no confirmó la subida del archivo de perfiles."
+        except Exception as e:
+            return False, str(e)
+
+    def ensure_remote_playlists_dir(self):
+        """Asegura '/filejump_sync_studio/playlist' en FileJump y devuelve su folder_id."""
+        if not self.api_key:
+            return None
+        app_dir_id = self.ensure_remote_app_config_dir()
+        if not app_dir_id:
+            return None
+        subfolders = self.list_folders(parent_id=app_dir_id)
+        for sf in subfolders:
+            if (sf.get("name") or "").strip().lower() == REMOTE_PLAYLISTS_SUBDIR.lower() and sf.get("id") is not None:
+                return sf.get("id")
+        return self.create_folder(REMOTE_PLAYLISTS_SUBDIR, parent_id=app_dir_id)
+
+    def sync_favorites_m3u_playlist(self, favorites_map):
+        """
+        Genera y actualiza '/filejump_sync_studio/playlist/favorites.m3u' (y copia local)
+        a partir del mapa actual de canciones favoritas.
+        """
+        favs = favorites_map if isinstance(favorites_map, dict) else {}
+        lines = ["#EXTM3U", "#PLAYLIST:Favoritos"]
+
+        # Ordenar por added_at ascendente para conservar el orden en que se fueron marcando
+        ordered_entries = sorted(
+            favs.values(),
+            key=lambda x: str(x.get("added_at") or "") if isinstance(x, dict) else ""
+        )
+
+        for item in ordered_entries:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or item.get("name") or "Pista").strip()
+            artist = str(item.get("artist") or "").strip()
+            display_label = f"{artist} - {title}" if artist and artist.lower() != "artista desconocido" else title
+            source = str(item.get("source") or ("remote" if item.get("remote_id") else "local")).strip()
+
+            if source == "remote" and item.get("remote_id"):
+                rem_id = item.get("remote_id")
+                rel_or_name = item.get("rel_path") or item.get("name") or f"{title}.mp3"
+                meta_json = json.dumps({
+                    "source": "remote",
+                    "id": rem_id,
+                    "name": item.get("name") or Path(rel_or_name).name,
+                    "rel_path": rel_or_name,
+                    "size": item.get("size", 0),
+                    "mtime": item.get("mtime", 0)
+                }, ensure_ascii=False)
+                lines.append(f"#EXTFJ:{meta_json}")
+                lines.append(f"#EXTINF:-1,{display_label}")
+                lines.append(f"filejump://{rem_id}/{rel_or_name}")
+            elif item.get("full_path"):
+                full_path = str(item.get("full_path")).strip()
+                meta_json = json.dumps({
+                    "source": "local",
+                    "full_path": full_path,
+                    "name": item.get("name") or Path(full_path).name,
+                    "rel_path": item.get("rel_path") or Path(full_path).name,
+                    "size": item.get("size", 0),
+                    "mtime": item.get("mtime", 0)
+                }, ensure_ascii=False)
+                lines.append(f"#EXTFJ:{meta_json}")
+                lines.append(f"#EXTINF:-1,{display_label}")
+                lines.append(full_path)
+
+        m3u_content = "\n".join(lines) + "\n"
+        LOCAL_PLAYLISTS_DIR.mkdir(exist_ok=True)
+        local_fav_m3u = LOCAL_PLAYLISTS_DIR / REMOTE_FAVORITES_M3U_FILENAME
+        try:
+            with open(local_fav_m3u, "w", encoding="utf-8") as lf:
+                lf.write(m3u_content)
+        except Exception:
+            pass
+
+        if not self.api_key:
+            return False, "Falta FILEJUMP_API_KEY en .env"
+
+        playlists_dir_id = self.ensure_remote_playlists_dir()
+        if not playlists_dir_id:
+            return False, f"No se pudo acceder o crear '{REMOTE_APP_CONFIG_DIR}/{REMOTE_PLAYLISTS_SUBDIR}'."
+
+        try:
+            existing_files = self.list_files(folder_id=playlists_dir_id)
+            for fl in existing_files:
+                fname = (fl.get("name") or fl.get("file_name") or "").strip()
+                if fname.lower() == REMOTE_FAVORITES_M3U_FILENAME.lower() and fl.get("id") is not None:
+                    self.delete_file(fl.get("id"))
+
+            res = self.upload_file(str(local_fav_m3u), folder_id=playlists_dir_id, use_high_speed=False)
+            if res is not None:
+                return True, f"'{REMOTE_FAVORITES_M3U_FILENAME}' actualizado en '{REMOTE_APP_CONFIG_DIR}/{REMOTE_PLAYLISTS_SUBDIR}/'."
+            return False, f"No se pudo subir '{REMOTE_FAVORITES_M3U_FILENAME}' a FileJump."
+        except Exception as e:
+            return False, str(e)
+
+    def save_remote_m3u_playlist(self, filename_m3u, m3u_content):
+        """
+        Guarda un archivo .m3u en '/filejump_sync_studio/playlist/' verificando antes que no exista
+        otro archivo con el mismo nombre para evitar cualquier reemplazo.
+        """
+        if not self.api_key:
+            return False, "Falta FILEJUMP_API_KEY en .env", None
+
+        playlists_dir_id = self.ensure_remote_playlists_dir()
+        if not playlists_dir_id:
+            return False, f"No se pudo acceder o crear la carpeta '{REMOTE_APP_CONFIG_DIR}/{REMOTE_PLAYLISTS_SUBDIR}' en FileJump.", None
+
+        existing_files = self.list_files(folder_id=playlists_dir_id)
+        for fl in existing_files:
+            existing_name = (fl.get("name") or fl.get("file_name") or "").strip()
+            if existing_name.lower() == filename_m3u.lower():
+                return False, f"Ya existe una lista llamada '{existing_name}' en '{REMOTE_APP_CONFIG_DIR}/{REMOTE_PLAYLISTS_SUBDIR}'. Elige otro nombre para evitar reemplazarla.", None
+
+        LOCAL_PLAYLISTS_DIR.mkdir(exist_ok=True)
+        local_copy = LOCAL_PLAYLISTS_DIR / filename_m3u
+        if local_copy.exists():
+            return False, f"Ya existe una lista local llamada '{filename_m3u}'. Elige otro nombre para evitar reemplazarla.", None
+
+        try:
+            with open(local_copy, "w", encoding="utf-8") as lf:
+                lf.write(m3u_content)
+
+            res = self.upload_file(str(local_copy), folder_id=playlists_dir_id, use_high_speed=False)
+            if res is not None:
+                remote_id = res.get("id") if isinstance(res, dict) else None
+                return True, f"Lista '{filename_m3u}' guardada correctamente en '{REMOTE_APP_CONFIG_DIR}/{REMOTE_PLAYLISTS_SUBDIR}/'.", remote_id
+            return False, "No se pudo subir el archivo .m3u a FileJump.", None
+        except Exception as e:
+            return False, str(e), None
+
+    def _count_m3u_tracks(self, file_id, filename, remote_mtime=0.0):
+        """Cuenta las pistas de audio válidas dentro de un archivo .m3u (usando copia local o caché)."""
+        try:
+            local_copy = LOCAL_PLAYLISTS_DIR / Path(filename).name
+            m3u_text = ""
+            if local_copy.exists() and local_copy.stat().st_size > 0:
+                m3u_text = local_copy.read_text(encoding="utf-8", errors="replace")
+            else:
+                cached = self.download_file_to_cache(file_id, filename, remote_mtime=remote_mtime)
+                if cached and cached.exists():
+                    m3u_text = cached.read_text(encoding="utf-8", errors="replace")
+            if not m3u_text:
+                return 0
+            count = 0
+            for raw_line in m3u_text.splitlines():
+                line = raw_line.strip()
+                if line and not line.startswith("#"):
+                    count += 1
+            return count
+        except Exception:
+            return 0
+
+    def list_remote_m3u_playlists(self):
+        """Lista todos los archivos .m3u / .m3u8 guardados en '/filejump_sync_studio/playlist/' junto con su cantidad de pistas."""
+        if not self.api_key:
+            return False, "Falta FILEJUMP_API_KEY en .env", []
+        playlists_dir_id = self.ensure_remote_playlists_dir()
+        if not playlists_dir_id:
+            return False, f"No se pudo acceder a '{REMOTE_APP_CONFIG_DIR}/{REMOTE_PLAYLISTS_SUBDIR}' en FileJump.", []
+
+        try:
+            files = self.list_files(folder_id=playlists_dir_id)
+            playlists = []
+            for fl in files:
+                fname = (fl.get("name") or fl.get("file_name") or "").strip()
+                if fname.lower().endswith((".m3u", ".m3u8")) and fl.get("id") is not None:
+                    fid = fl.get("id")
+                    upd = fl.get("updated_at") or fl.get("created_at") or ""
+                    rmtime = parse_iso_timestamp(upd)
+                    track_count = self._count_m3u_tracks(fid, fname, remote_mtime=rmtime)
+                    playlists.append({
+                        "id": fid,
+                        "name": fname,
+                        "display_name": Path(fname).stem,
+                        "track_count": track_count,
+                        "size": int(fl.get("file_size") or fl.get("size") or 0),
+                        "updated_at": upd
+                    })
+            playlists.sort(key=lambda x: x["name"].lower())
+            return True, "OK", playlists
+        except Exception as e:
+            return False, str(e), []
+
+    def delete_remote_m3u_playlist(self, file_id, filename=""):
+        """Elimina un archivo .m3u de '/filejump_sync_studio/playlist/' en FileJump y su copia local."""
+        if not self.api_key:
+            return False, "Falta FILEJUMP_API_KEY en .env"
+        try:
+            ok = self.delete_file(file_id)
+            if filename:
+                local_copy = LOCAL_PLAYLISTS_DIR / Path(filename).name
+                if local_copy.exists():
+                    try:
+                        local_copy.unlink()
+                    except Exception:
+                        pass
+            if ok:
+                return True, f"Lista '{filename or file_id}' eliminada de '{REMOTE_APP_CONFIG_DIR}/{REMOTE_PLAYLISTS_SUBDIR}/'."
+            return False, "FileJump no confirmó la eliminación del archivo .m3u."
         except Exception as e:
             return False, str(e)
 

@@ -183,7 +183,7 @@
 
             tbody.innerHTML = items.map(item => {
                 const isFolder = item.type === 'folder';
-                const icon = isFolder ? '📁' : (isAudioFilename(item.name) ? '🎵' : '📄');
+                const icon = isFolder ? '📁' : (isM3uPlaylistFilename(item.name) ? '🎶' : (isAudioFilename(item.name) ? '🎵' : '📄'));
                 const metaJson = escapeAttr(JSON.stringify(item));
                 const dblClick = isFolder
                     ? `selectLocalFolder('${escapeAttr(item.rel_path)}')`
@@ -385,7 +385,7 @@
 
             tbody.innerHTML = items.map(item => {
                 const isFolder = item.type === 'folder';
-                const icon = isFolder ? '📁' : (isAudioFilename(item.name) ? '🎵' : '☁️');
+                const icon = isFolder ? '📁' : (isM3uPlaylistFilename(item.name) ? '🎶' : (isAudioFilename(item.name) ? '🎵' : '☁️'));
                 const metaJson = escapeAttr(JSON.stringify(item));
                 const dblClick = isFolder
                     ? `selectRemoteNode('${escapeAttr(item.id)}')`
@@ -408,10 +408,19 @@
             }).join('');
         }
 
+        function isM3uPlaylistFilename(name) {
+            const lower = String(name || '').toLowerCase();
+            return lower.endsWith('.m3u') || lower.endsWith('.m3u8');
+        }
+
         function openExplorerFile(source, fileMeta) {
             currentPreviewSource = source;
+            if (isM3uPlaylistFilename(fileMeta.name)) {
+                openM3uPlaylistFile(source, fileMeta);
+                return;
+            }
             const folderFiles = getCurrentFolderFiles(source);
-            const nonAudioFiles = folderFiles.filter(f => !isAudioFilename(f.name));
+            const nonAudioFiles = folderFiles.filter(f => !isAudioFilename(f.name) && !isM3uPlaylistFilename(f.name));
             if (isAudioFilename(fileMeta.name)) {
                 openMusicDockPlayer(source, fileMeta, false);
                 return;

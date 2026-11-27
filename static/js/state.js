@@ -420,3 +420,13 @@ async function fetchUserStorageInfo() {
                 (data.cached_ids || []).forEach(id => prefetchedRemoteIds.add(String(id)));
             } catch (e) {}
         }
+
+
+        function escapeHtml(str) {
+            return String(str ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }

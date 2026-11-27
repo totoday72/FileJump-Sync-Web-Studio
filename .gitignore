@@ -226,5 +226,7 @@ __marimo__/
 # FileJump local configuration and generated data
 sync_config.json
 favorites_cache.json
+favorites.m3u
+playlists/
 sync_records/
 temp_cache/

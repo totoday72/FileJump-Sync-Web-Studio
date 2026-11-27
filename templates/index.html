@@ -627,9 +627,17 @@
                                 <div id="dockTrackAlbum" class="text-[11px] text-slate-400 truncate mt-0.5"></div>
                             </div>
                         </div>
-                        <button type="button" id="dockNormalLocateBtn" onclick="locateCurrentTrackInPlaylist()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-indigo-600/30 border border-slate-700 hover:border-indigo-500/50 text-indigo-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Ubicar canción en reproducción en la lista">
-                            🎯
-                        </button>
+                        <div class="flex flex-col items-center gap-1.5 shrink-0">
+                            <button type="button" id="dockNormalLocateBtn" onclick="locateCurrentTrackInPlaylist()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-indigo-600/30 border border-slate-700 hover:border-indigo-500/50 text-indigo-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Ubicar canción en reproducción en la lista">
+                                🎯
+                            </button>
+                            <button type="button" id="dockSavePlaylistBtn" onclick="openSavePlaylistModal()" class="hidden w-8 h-8 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/40 text-emerald-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Guardar lista de reproducción (.m3u) en filejump_sync_studio/playlist">
+                                💾
+                            </button>
+                            <button type="button" id="dockSavedPlaylistsBtn" onclick="openSavedPlaylistsModal()" class="hidden w-8 h-8 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Abrir listas de reproducción (.m3u) guardadas en filejump_sync_studio/playlist">
+                                📂
+                            </button>
+                        </div>
                     </div>
 
                     <!-- Barra de Progreso Interactiva -->
@@ -905,6 +913,75 @@
             </div>
             <div class="flex justify-end">
                 <button onclick="closePropertiesModal()" class="px-4 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200">Cerrar</button>
+            </div>
+        </div>
+    </div>
+
+
+
+    <!-- MODAL PARA VER, REPRODUCIR (DOBLE CLIC) Y ELIMINAR LISTAS GUARDADAS (.M3U) -->
+    <div id="savedPlaylistsModal" onclick="if(event.target===this) closeSavedPlaylistsModal()" class="fixed inset-0 bg-black/85 hidden items-center justify-center p-4 z-[65]">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl flex flex-col max-h-[85vh]">
+            <div class="flex items-center justify-between shrink-0">
+                <div>
+                    <h3 class="text-base font-bold text-white flex items-center gap-2">
+                        <span>📂</span>
+                        <span>Listas de Reproducción Guardadas (.m3u)</span>
+                    </h3>
+                    <p class="text-[11px] text-slate-400 mt-0.5">
+                        Carpeta <code class="text-indigo-300">filejump_sync_studio/playlist/</code> • Un clic para seleccionar, <strong>doble clic</strong> para reproducir.
+                    </p>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <button type="button" onclick="loadSavedPlaylistsList()" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-xs transition" title="Actualizar lista">🔄</button>
+                    <button type="button" onclick="closeSavedPlaylistsModal()" class="text-slate-400 hover:text-white text-xl leading-none px-1">&times;</button>
+                </div>
+            </div>
+
+            <div class="flex-1 min-h-[200px] max-h-[45vh] overflow-y-auto bg-slate-950 border border-slate-800 rounded-xl divide-y divide-slate-800/60" id="savedPlaylistsListContainer">
+                <div class="py-10 text-center text-xs text-slate-400 animate-pulse">Cargando playlists desde FileJump...</div>
+            </div>
+
+            <div class="flex items-center justify-between gap-2 pt-1 shrink-0">
+                <button type="button" id="deleteSelectedPlaylistBtn" onclick="deleteSelectedSavedPlaylist()" disabled class="px-3.5 py-1.5 rounded-xl bg-rose-600/20 hover:bg-rose-600/40 disabled:opacity-40 disabled:pointer-events-none border border-rose-500/40 text-xs font-semibold text-rose-300 transition flex items-center gap-1.5">
+                    <span>🗑️</span><span>Eliminar Playlist</span>
+                </button>
+                <div class="flex items-center gap-2">
+                    <button type="button" onclick="closeSavedPlaylistsModal()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 transition">Cerrar</button>
+                    <button type="button" id="playSelectedPlaylistBtn" onclick="playSelectedSavedPlaylist()" disabled class="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:pointer-events-none text-xs font-semibold text-white shadow-lg shadow-indigo-600/20 transition flex items-center gap-1.5">
+                        <span>▶️</span><span>Reproducir</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL PARA GUARDAR LISTA DE REPRODUCCIÓN (.M3U) -->
+    <div id="savePlaylistModal" onclick="if(event.target===this) closeSavePlaylistModal()" class="fixed inset-0 bg-black/85 hidden items-center justify-center p-4 z-[65]">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div class="flex items-center justify-between">
+                <h3 class="text-base font-bold text-white flex items-center gap-2">
+                    <span>💾</span>
+                    <span>Guardar Lista de Reproducción (.m3u)</span>
+                </h3>
+                <button type="button" onclick="closeSavePlaylistModal()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <p class="text-xs text-slate-400 leading-relaxed">
+                Se guardará en formato <code class="text-indigo-300">M3U</code> estándar dentro de <code class="text-emerald-300">filejump_sync_studio/playlist/</code>. Si ya existe una lista con el mismo nombre, se evitará su reemplazo.
+            </p>
+            <div>
+                <label class="block text-xs font-medium text-slate-300 mb-1.5">Nombre de la lista de reproducción:</label>
+                <div class="flex items-center gap-1.5">
+                    <input type="text" id="savePlaylistNameInput" onkeydown="if(event.key==='Enter') submitSavePlaylistModal()" placeholder="Ej. playlist-26-11-2026" class="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:border-emerald-500 focus:outline-none">
+                    <span class="px-2.5 py-2 rounded-xl bg-slate-800 border border-slate-700 text-xs font-mono text-slate-300">.m3u</span>
+                </div>
+                <p id="savePlaylistDefaultHint" class="text-[11px] text-slate-500 mt-1.5"></p>
+            </div>
+            <div class="flex justify-end gap-2.5 pt-2">
+                <button type="button" onclick="closeSavePlaylistModal()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 transition">Cancelar</button>
+                <button type="button" id="confirmSavePlaylistBtn" onclick="submitSavePlaylistModal()" class="px-4 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white shadow-lg shadow-emerald-600/20 transition flex items-center gap-1.5">
+                    <span>💾</span><span>Guardar Lista</span>
+                </button>
             </div>
         </div>
     </div>

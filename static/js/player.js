@@ -62,6 +62,10 @@
                     visWrap.className = `bg-slate-950 border border-slate-800 rounded-xl p-2 relative overflow-hidden h-14 flex items-center${visualizerEnabled ? '' : ' hidden'}`;
                 }
                 if (maxBtn) { maxBtn.textContent = '🗗'; maxBtn.title = 'Restaurar tamaño'; }
+                const savePlBtn = document.getElementById('dockSavePlaylistBtn');
+                if (savePlBtn) savePlBtn.classList.remove('hidden');
+                const savedPlBtn = document.getElementById('dockSavedPlaylistsBtn');
+                if (savedPlBtn) savedPlBtn.classList.remove('hidden');
             } else {
                 widget.className = 'fixed bottom-4 right-4 z-50';
                 expEl.className = 'w-80 sm:w-[410px] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col';
@@ -75,6 +79,10 @@
                     visWrap.className = `bg-slate-950 border border-slate-800 rounded-xl p-2 relative overflow-hidden h-14 flex items-center${visualizerEnabled ? '' : ' hidden'}`;
                 }
                 if (maxBtn) { maxBtn.textContent = '⛶'; maxBtn.title = 'Maximizar reproductor'; }
+                const savePlBtn = document.getElementById('dockSavePlaylistBtn');
+                if (savePlBtn) savePlBtn.classList.add('hidden');
+                const savedPlBtn = document.getElementById('dockSavedPlaylistsBtn');
+                if (savedPlBtn) savedPlBtn.classList.add('hidden');
             }
 
             const audioEl = document.getElementById('dockAudioElement');
@@ -270,7 +278,11 @@
                             artist: track.id3_artist || '',
                             album: track.id3_album || '',
                             source: musicSource,
-                            remote_id: track.id || null
+                            remote_id: track.id || null,
+                            full_path: track.full_path || '',
+                            rel_path: track.rel_path || track.name || '',
+                            size: track.size || 0,
+                            mtime: track.mtime || 0
                         }
                     })
                 });
@@ -644,4 +656,327 @@
             const modal = document.getElementById('coverLightboxModal');
             modal.classList.add('hidden');
             modal.classList.remove('flex');
+        }
+
+
+        // =========================================================================
+        // GUARDAR Y ABRIR LISTAS DE REPRODUCCIÓN (.M3U ESTÁNDAR)
+        // =========================================================================
+        function computeDefaultPlaylistName() {
+            const now = new Date();
+            const dd = String(now.getDate()).padStart(2, '0');
+            const mm = String(now.getMonth() + 1).padStart(2, '0');
+            const yyyy = now.getFullYear();
+            const fallbackDateName = `playlist-${dd}-${mm}-${yyyy}`;
+
+            if (!Array.isArray(musicPlaylist) || musicPlaylist.length === 0) {
+                return fallbackDateName;
+            }
+
+            const folderNames = new Set();
+            let hasRootTrack = false;
+
+            for (const tr of musicPlaylist) {
+                const src = tr.source || musicSource || 'local';
+                if (src === 'remote') {
+                    const rel = String(tr.rel_path || '').replace(/^\/+|\/+$/g, '');
+                    const parts = rel.split('/').filter(Boolean);
+                    if (parts.length > 1) {
+                        folderNames.add(parts[parts.length - 2]);
+                    } else {
+                        const rSubEl = document.getElementById('remotePathSubtitle');
+                        const rSub = rSubEl ? rSubEl.textContent.trim() : '';
+                        const subParts = rSub.split('/').map(s => s.trim()).filter(Boolean);
+                        if (subParts.length > 0 && !rSub.includes('Raíz')) {
+                            folderNames.add(subParts[subParts.length - 1]);
+                        } else {
+                            hasRootTrack = true;
+                        }
+                    }
+                } else {
+                    const fp = String(tr.full_path || '').replace(/\\/g, '/');
+                    const parts = fp.split('/').filter(Boolean);
+                    if (parts.length >= 3) {
+                        folderNames.add(parts[parts.length - 2]);
+                    } else {
+                        hasRootTrack = true;
+                    }
+                }
+            }
+
+            if (!hasRootTrack && folderNames.size === 1) {
+                const singleFolder = Array.from(folderNames)[0];
+                if (singleFolder && singleFolder.toLowerCase() !== 'root' && singleFolder !== '/') {
+                    return singleFolder;
+                }
+            }
+            return fallbackDateName;
+        }
+
+        function openSavePlaylistModal() {
+            if (!Array.isArray(musicPlaylist) || musicPlaylist.length === 0) {
+                showNotice('Lista vacía', 'No hay pistas cargadas en el reproductor para guardar.');
+                return;
+            }
+            const defaultName = computeDefaultPlaylistName();
+            const input = document.getElementById('savePlaylistNameInput');
+            const hint = document.getElementById('savePlaylistDefaultHint');
+            if (input) {
+                input.value = defaultName;
+            }
+            if (hint) {
+                hint.textContent = `Sugerencia automática (${musicPlaylist.length} pista(s)): ${defaultName}.m3u`;
+            }
+            const modal = document.getElementById('savePlaylistModal');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            setTimeout(() => {
+                if (input) {
+                    input.focus();
+                    input.select();
+                }
+            }, 60);
+        }
+
+        function closeSavePlaylistModal() {
+            const modal = document.getElementById('savePlaylistModal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        async function submitSavePlaylistModal() {
+            const input = document.getElementById('savePlaylistNameInput');
+            const btn = document.getElementById('confirmSavePlaylistBtn');
+            const nameVal = input ? input.value.trim() : '';
+            if (!nameVal) {
+                showNotice('Nombre requerido', 'Ingresa un nombre para la lista de reproducción.');
+                return;
+            }
+
+            const payloadTracks = musicPlaylist.map(tr => ({
+                ...tr,
+                source: tr.source || musicSource || 'local'
+            }));
+
+            if (btn) {
+                btn.disabled = true;
+                btn.classList.add('opacity-60');
+            }
+            try {
+                const res = await fetch('/api/music/playlist/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: nameVal,
+                        tracks: payloadTracks
+                    })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    closeSavePlaylistModal();
+                    showNotice('Lista Guardada', data.message || `Lista "${data.filename}" guardada en filejump_sync_studio/playlist.`);
+                } else {
+                    showNotice('No se pudo guardar la lista', data.error || 'Ya existe un archivo con ese nombre o hubo un error.');
+                }
+            } catch (e) {
+                showNotice('Error de Red', 'Error de comunicación con el servidor al guardar la lista .m3u.');
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.classList.remove('opacity-60');
+                }
+            }
+        }
+
+        async function openM3uPlaylistFile(source, fileMeta) {
+            try {
+                const res = await fetch('/api/music/playlist/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        source,
+                        id: fileMeta.id,
+                        name: fileMeta.name,
+                        full_path: fileMeta.full_path,
+                        mtime: fileMeta.mtime || 0
+                    })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.success || !Array.isArray(data.tracks) || data.tracks.length === 0) {
+                    showNotice('Lista de Reproducción', data.error || 'No se pudieron cargar canciones desde el archivo .m3u.');
+                    return;
+                }
+
+                musicPlaylist = data.tracks;
+                musicSource = data.tracks[0].source || source;
+                rebuildMusicPlayOrder(0);
+                setMusicDockMode('maximized');
+                await playDockTrackAtOrderPos(0);
+            } catch (e) {
+                showNotice('Error al abrir .m3u', 'No se pudo procesar el archivo de lista de reproducción.');
+            }
+        }
+
+
+        // =========================================================================
+        // VENTANA DE LISTAS DE REPRODUCCIÓN GUARDADAS (.M3U EN FILEJUMP_SYNC_STUDIO)
+        // =========================================================================
+        let savedPlaylistsCache = [];
+        let selectedSavedPlaylistId = null;
+
+        function openSavedPlaylistsModal() {
+            selectedSavedPlaylistId = null;
+            updateSavedPlaylistsActionButtons();
+            const modal = document.getElementById('savedPlaylistsModal');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            loadSavedPlaylistsList();
+        }
+
+        function closeSavedPlaylistsModal() {
+            const modal = document.getElementById('savedPlaylistsModal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        function updateSavedPlaylistsActionButtons() {
+            const delBtn = document.getElementById('deleteSelectedPlaylistBtn');
+            const playBtn = document.getElementById('playSelectedPlaylistBtn');
+            const hasSel = selectedSavedPlaylistId !== null && savedPlaylistsCache.some(p => String(p.id) === String(selectedSavedPlaylistId));
+            if (delBtn) delBtn.disabled = !hasSel;
+            if (playBtn) playBtn.disabled = !hasSel;
+        }
+
+        function selectSavedPlaylistRow(playlistId) {
+            selectedSavedPlaylistId = String(playlistId);
+            renderSavedPlaylistsList();
+            updateSavedPlaylistsActionButtons();
+        }
+
+        function renderSavedPlaylistsList() {
+            const container = document.getElementById('savedPlaylistsListContainer');
+            if (!container) return;
+
+            if (!Array.isArray(savedPlaylistsCache) || savedPlaylistsCache.length === 0) {
+                container.innerHTML = '<div class="py-12 px-4 text-center text-xs text-slate-500">No hay listas de reproducción (.m3u) guardadas en <code>filejump_sync_studio/playlist/</code>.</div>';
+                updateSavedPlaylistsActionButtons();
+                return;
+            }
+
+            container.innerHTML = savedPlaylistsCache.map(pl => {
+                const isSelected = String(pl.id) === String(selectedSavedPlaylistId);
+                const rowClass = isSelected
+                    ? 'bg-indigo-600/25 border-l-2 border-l-indigo-400 text-white'
+                    : 'hover:bg-slate-900/90 text-slate-200';
+                const baseLabel = pl.display_name || String(pl.name || '').replace(/\.m3u8?$/i, '');
+                const countNum = Number(pl.track_count || 0);
+                const pistasLabel = `${countNum} ${countNum === 1 ? 'pista' : 'pistas'}`;
+                const sizeText = pl.size > 0 ? formatBytes(pl.size) : '';
+                const dateText = pl.updated_at ? String(pl.updated_at).replace('T', ' ').slice(0, 16) : '';
+                const subMeta = [pl.name, sizeText, dateText].filter(Boolean).join(' • ');
+
+                return `
+                    <div onclick="selectSavedPlaylistRow('${escapeAttr(String(pl.id))}')"
+                         ondblclick="playSavedPlaylistById('${escapeAttr(String(pl.id))}')"
+                         class="px-3.5 py-2.5 flex items-center justify-between gap-3 cursor-pointer select-none transition ${rowClass}">
+                        <div class="flex items-center gap-2.5 min-w-0 flex-1">
+                            <span class="text-base shrink-0">🎶</span>
+                            <div class="min-w-0 flex-1">
+                                <div class="flex items-center gap-2 min-w-0 text-xs font-semibold">
+                                    <span class="truncate text-white">${escapeHtml(baseLabel)}</span>
+                                    <span class="text-slate-600 font-mono shrink-0">------</span>
+                                    <span class="px-2 py-0.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-[11px] font-mono text-indigo-300 shrink-0">${escapeHtml(pistasLabel)}</span>
+                                </div>
+                                <div class="text-[10px] text-slate-400 truncate mt-0.5">${escapeHtml(subMeta || 'Lista M3U en FileJump')}</div>
+                            </div>
+                        </div>
+                        <span class="text-[10px] font-mono text-slate-500 shrink-0">#${escapeHtml(String(pl.id))}</span>
+                    </div>
+                `;
+            }).join('');
+
+            updateSavedPlaylistsActionButtons();
+        }
+
+        async function loadSavedPlaylistsList() {
+            const container = document.getElementById('savedPlaylistsListContainer');
+            if (container) {
+                container.innerHTML = '<div class="py-10 text-center text-xs text-slate-400 animate-pulse">Cargando playlists desde filejump_sync_studio/playlist...</div>';
+            }
+            try {
+                const res = await fetch('/api/music/playlists');
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    savedPlaylistsCache = data.playlists || [];
+                    if (selectedSavedPlaylistId !== null && !savedPlaylistsCache.some(p => String(p.id) === String(selectedSavedPlaylistId))) {
+                        selectedSavedPlaylistId = null;
+                    }
+                    renderSavedPlaylistsList();
+                } else {
+                    savedPlaylistsCache = [];
+                    if (container) {
+                        container.innerHTML = `<div class="py-10 px-4 text-center text-xs text-rose-400">${escapeHtml(data.error || 'No se pudieron cargar las playlists.')}</div>`;
+                    }
+                }
+            } catch (e) {
+                if (container) {
+                    container.innerHTML = '<div class="py-10 px-4 text-center text-xs text-rose-400">Error de red al consultar las listas guardadas.</div>';
+                }
+            }
+        }
+
+        async function playSavedPlaylistById(playlistId) {
+            const pl = savedPlaylistsCache.find(p => String(p.id) === String(playlistId));
+            if (!pl) return;
+            selectedSavedPlaylistId = String(pl.id);
+            renderSavedPlaylistsList();
+            closeSavedPlaylistsModal();
+            await openM3uPlaylistFile('remote', {
+                id: pl.id,
+                name: pl.name,
+                mtime: 0
+            });
+        }
+
+        async function playSelectedSavedPlaylist() {
+            if (selectedSavedPlaylistId === null) return;
+            await playSavedPlaylistById(selectedSavedPlaylistId);
+        }
+
+        async function deleteSelectedSavedPlaylist() {
+            if (selectedSavedPlaylistId === null) return;
+            const pl = savedPlaylistsCache.find(p => String(p.id) === String(selectedSavedPlaylistId));
+            if (!pl) return;
+
+            const delBtn = document.getElementById('deleteSelectedPlaylistBtn');
+            if (delBtn) {
+                delBtn.disabled = true;
+                delBtn.classList.add('opacity-60');
+            }
+            try {
+                const res = await fetch('/api/music/playlist/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        id: pl.id,
+                        name: pl.name
+                    })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    savedPlaylistsCache = savedPlaylistsCache.filter(p => String(p.id) !== String(pl.id));
+                    selectedSavedPlaylistId = null;
+                    renderSavedPlaylistsList();
+                    showNotice('Playlist Eliminado', data.message || `Se eliminó "${pl.name}" de filejump_sync_studio.`);
+                } else {
+                    showNotice('Error al eliminar', data.error || 'No se pudo eliminar la lista de reproducción.');
+                }
+            } catch (e) {
+                showNotice('Error de Red', 'Error de comunicación con el servidor al eliminar el playlist.');
+            } finally {
+                if (delBtn) {
+                    delBtn.classList.remove('opacity-60');
+                    updateSavedPlaylistsActionButtons();
+                }
+            }
         }

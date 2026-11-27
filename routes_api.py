@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import time
 import uuid
@@ -33,6 +34,8 @@ from config_manager import (
     save_config,
     load_task_record,
     save_task_record,
+    get_machine_name,
+    REMOTE_APP_CONFIG_DIR,
 )
 from filejump_client import FileJumpClient
 from media_utils import (
@@ -138,16 +141,244 @@ def api_music_favorites():
             "album": track_meta.get("album", ""),
             "source": track_meta.get("source", "remote"),
             "remote_id": track_meta.get("remote_id"),
+            "full_path": track_meta.get("full_path", ""),
+            "rel_path": track_meta.get("rel_path", ""),
+            "size": track_meta.get("size", 0),
+            "mtime": track_meta.get("mtime", 0),
             "added_at": datetime.datetime.now(timezone.utc).isoformat()
         }
         is_fav = True
 
     ok, msg = client.save_remote_favorites(favs)
     if ok:
+        ok_m3u, msg_m3u = client.sync_favorites_m3u_playlist(favs)
         title_lbl = track_meta.get("title") or track_meta.get("name") or track_key
-        log_event("info", f"{'❤️ Agregada a favoritos' if is_fav else '🤍 Quitada de favoritos'}: {title_lbl}")
+        log_event("info", f"{'❤️ Agregada a favoritos y favorites.m3u' if is_fav else '🤍 Quitada de favoritos y favorites.m3u'}: {title_lbl}")
+        if not ok_m3u:
+            log_event("warning", f"Aviso actualizando favorites.m3u: {msg_m3u}")
         return jsonify({"success": True, "is_favorite": is_fav, "favorites": favs})
     return jsonify({"success": False, "error": msg, "is_favorite": is_fav, "favorites": favs}), 500
+
+
+@api_bp.route("/api/music/playlist/save", methods=["POST"])
+def api_save_m3u_playlist():
+    """
+    Genera y guarda una lista de reproducción en formato M3U estándar dentro de
+    '/filejump_sync_studio/' en FileJump, verificando antes que no exista un archivo
+    con el mismo nombre para evitar reemplazos.
+    """
+    data = request.json or {}
+    raw_name = str(data.get("name") or "").strip()
+    tracks = data.get("tracks") or []
+
+    if not raw_name:
+        return jsonify({"success": False, "error": "Debes ingresar un nombre para la lista de reproducción."}), 400
+    if not tracks:
+        return jsonify({"success": False, "error": "La lista de reproducción actual está vacía."}), 400
+
+    base_name = raw_name[:-4] if raw_name.lower().endswith(".m3u") else raw_name
+    safe_base = "".join(c if c not in '<>:"/\\|?*' else "_" for c in base_name).strip().strip(".")
+    if not safe_base:
+        return jsonify({"success": False, "error": "El nombre ingresado no es válido."}), 400
+    filename_m3u = f"{safe_base}.m3u"
+
+    lines = ["#EXTM3U", f"#PLAYLIST:{safe_base}"]
+    for tr in tracks:
+        title = str(tr.get("title") or tr.get("name") or "Pista").strip()
+        artist = str(tr.get("artist") or "").strip()
+        display_label = f"{artist} - {title}" if artist and artist.lower() != "artista desconocido" else title
+        source = str(tr.get("source") or "local").strip()
+
+        if source == "remote":
+            rem_id = tr.get("id") or tr.get("remote_id") or ""
+            rel_or_name = tr.get("rel_path") or tr.get("name") or f"{title}.mp3"
+            meta_json = json.dumps({
+                "source": "remote",
+                "id": rem_id,
+                "name": tr.get("name") or rel_or_name,
+                "rel_path": rel_or_name,
+                "size": tr.get("size", 0),
+                "mtime": tr.get("mtime", 0)
+            }, ensure_ascii=False)
+            lines.append(f"#EXTFJ:{meta_json}")
+            lines.append(f"#EXTINF:-1,{display_label}")
+            lines.append(f"filejump://{rem_id}/{rel_or_name}")
+        else:
+            full_path = str(tr.get("full_path") or tr.get("rel_path") or tr.get("name") or "").strip()
+            meta_json = json.dumps({
+                "source": "local",
+                "full_path": full_path,
+                "name": tr.get("name") or Path(full_path).name,
+                "rel_path": tr.get("rel_path") or Path(full_path).name,
+                "size": tr.get("size", 0),
+                "mtime": tr.get("mtime", 0)
+            }, ensure_ascii=False)
+            lines.append(f"#EXTFJ:{meta_json}")
+            lines.append(f"#EXTINF:-1,{display_label}")
+            lines.append(full_path)
+
+    m3u_content = "\n".join(lines) + "\n"
+    client = FileJumpClient()
+    ok, msg, remote_id = client.save_remote_m3u_playlist(filename_m3u, m3u_content)
+    if ok:
+        log_event("success", f"🎵 {msg}")
+        return jsonify({"success": True, "filename": filename_m3u, "remote_id": remote_id, "message": msg})
+    return jsonify({"success": False, "error": msg}), 409 if "Ya existe" in msg else 400
+
+
+@api_bp.route("/api/music/playlist/load", methods=["POST"])
+def api_load_m3u_playlist():
+    """
+    Abre un archivo .m3u desde el explorador local o remoto, lo parsea según el estándar M3U
+    y devuelve la lista de pistas lista para cargar en el reproductor musical.
+    """
+    data = request.json or {}
+    source = str(data.get("source") or "local").strip()
+    m3u_text = ""
+    base_dir = None
+
+    if source == "remote":
+        file_id = data.get("id")
+        filename = str(data.get("name") or "playlist.m3u")
+        if not file_id:
+            return jsonify({"success": False, "error": "Falta ID del archivo .m3u remoto."}), 400
+        client = FileJumpClient()
+        if not client.api_key:
+            return jsonify({"success": False, "error": "Falta FILEJUMP_API_KEY en .env."}), 400
+        cached = client.download_file_to_cache(file_id, filename, remote_mtime=float(data.get("mtime") or 0))
+        if not cached or not cached.exists():
+            return jsonify({"success": False, "error": "No se pudo descargar el archivo .m3u desde FileJump."}), 404
+        m3u_text = cached.read_text(encoding="utf-8", errors="replace")
+    else:
+        full_path = str(data.get("full_path") or "").strip()
+        if not full_path or not os.path.exists(full_path):
+            return jsonify({"success": False, "error": "El archivo .m3u local no existe."}), 404
+        p_obj = Path(full_path)
+        base_dir = p_obj.parent
+        m3u_text = p_obj.read_text(encoding="utf-8", errors="replace")
+
+    tracks = []
+    pending_extinf = ""
+    pending_extfj = None
+
+    for raw_line in m3u_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTM3U") or line.startswith("#PLAYLIST:"):
+            continue
+        if line.startswith("#EXTFJ:"):
+            try:
+                pending_extfj = json.loads(line[7:].strip())
+            except Exception:
+                pending_extfj = None
+            continue
+        if line.startswith("#EXTINF:"):
+            parts = line.split(",", 1)
+            pending_extinf = parts[1].strip() if len(parts) > 1 else ""
+            continue
+        if line.startswith("#"):
+            continue
+
+        if pending_extfj and isinstance(pending_extfj, dict):
+            tr_src = pending_extfj.get("source", source)
+            if tr_src == "remote" and pending_extfj.get("id"):
+                tracks.append({
+                    "type": "file",
+                    "source": "remote",
+                    "id": pending_extfj.get("id"),
+                    "name": pending_extfj.get("name") or Path(line).name,
+                    "rel_path": pending_extfj.get("rel_path") or Path(line).name,
+                    "size": pending_extfj.get("size", 0),
+                    "mtime": pending_extfj.get("mtime", 0),
+                    "title": pending_extinf or pending_extfj.get("name") or Path(line).name
+                })
+                pending_extinf = ""
+                pending_extfj = None
+                continue
+            elif tr_src == "local" and pending_extfj.get("full_path") and os.path.exists(pending_extfj["full_path"]):
+                fp = Path(pending_extfj["full_path"])
+                st = fp.stat()
+                tracks.append({
+                    "type": "file",
+                    "source": "local",
+                    "name": fp.name,
+                    "full_path": str(fp),
+                    "rel_path": fp.name,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "title": pending_extinf or fp.stem
+                })
+                pending_extinf = ""
+                pending_extfj = None
+                continue
+
+        if line.startswith("filejump://"):
+            rest = line[len("filejump://"):]
+            seg = rest.split("/", 1)
+            rem_id = seg[0].strip()
+            rem_name = seg[1].strip() if len(seg) > 1 else f"audio_{rem_id}.mp3"
+            if rem_id:
+                tracks.append({
+                    "type": "file",
+                    "source": "remote",
+                    "id": int(rem_id) if rem_id.isdigit() else rem_id,
+                    "name": Path(rem_name).name,
+                    "rel_path": rem_name,
+                    "size": 0,
+                    "mtime": 0,
+                    "title": pending_extinf or Path(rem_name).stem
+                })
+        else:
+            candidate = Path(line)
+            if not candidate.is_absolute() and base_dir:
+                candidate = (base_dir / candidate).resolve()
+            if candidate.exists() and candidate.is_file():
+                st = candidate.stat()
+                tracks.append({
+                    "type": "file",
+                    "source": "local",
+                    "name": candidate.name,
+                    "full_path": str(candidate),
+                    "rel_path": candidate.name,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "title": pending_extinf or candidate.stem
+                })
+
+        pending_extinf = ""
+        pending_extfj = None
+
+    if not tracks:
+        return jsonify({"success": False, "error": "No se encontraron archivos de audio válidos dentro de la lista .m3u."}), 404
+
+    return jsonify({"success": True, "tracks": tracks, "count": len(tracks)})
+
+
+@api_bp.route("/api/music/playlists", methods=["GET"])
+def api_list_m3u_playlists():
+    """Devuelve todas las listas de reproducción (.m3u) guardadas en '/filejump_sync_studio/'."""
+    client = FileJumpClient()
+    ok, msg, playlists = client.list_remote_m3u_playlists()
+    if ok:
+        return jsonify({"success": True, "playlists": playlists})
+    return jsonify({"success": False, "error": msg, "playlists": []}), 400
+
+
+@api_bp.route("/api/music/playlist/delete", methods=["POST"])
+def api_delete_m3u_playlist():
+    """Elimina una lista de reproducción (.m3u) seleccionada de '/filejump_sync_studio/'."""
+    data = request.json or {}
+    file_id = data.get("id")
+    filename = str(data.get("name") or "").strip()
+    if not file_id:
+        return jsonify({"success": False, "error": "Falta el ID de la lista de reproducción a eliminar."}), 400
+    client = FileJumpClient()
+    ok, msg = client.delete_remote_m3u_playlist(file_id, filename=filename)
+    if ok:
+        log_event("info", f"🗑️ {msg}")
+        return jsonify({"success": True, "message": msg})
+    return jsonify({"success": False, "error": msg}), 400
 
 
 # ==============================================================================
@@ -295,16 +526,34 @@ def api_remote_children():
 # ==============================================================================
 @api_bp.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
-    """Lee o actualiza la configuración (.env y sync_config.json)."""
+    """Lee o actualiza la configuración (.env, sync_config.json y filejump_sync_studio/<EQUIPO>/sync_profiles.json)."""
     if request.method == "GET":
         load_dotenv(ENV_FILE, override=True)
+        cfg = load_config()
+        machine_name = get_machine_name()
+        client = FileJumpClient()
+        if client.api_key:
+            remote_machine_cfg = client.load_remote_machine_profiles()
+            if isinstance(remote_machine_cfg, dict) and isinstance(remote_machine_cfg.get("tasks"), list):
+                cfg["tasks"] = remote_machine_cfg["tasks"]
+                if "max_workers" in remote_machine_cfg:
+                    cfg["max_workers"] = remote_machine_cfg["max_workers"]
+                if "min_impact_percentage" in remote_machine_cfg:
+                    cfg["min_impact_percentage"] = remote_machine_cfg["min_impact_percentage"]
+                if "use_high_speed_upload" in remote_machine_cfg:
+                    cfg["use_high_speed_upload"] = remote_machine_cfg["use_high_speed_upload"]
+                save_config(cfg)
+                log_event("info", f"Perfiles descargados desde {REMOTE_APP_CONFIG_DIR}/{machine_name}/sync_profiles.json ({len(cfg['tasks'])} perfil(es)).")
+            elif cfg.get("tasks"):
+                client.save_remote_machine_profiles(cfg)
         return jsonify({
+            "machine_name": machine_name,
             "env": {
                 "FILEJUMP_BASE_URL": os.getenv("FILEJUMP_BASE_URL", "https://filejump.com/api"),
                 "FILEJUMP_UPLOAD_URL": os.getenv("FILEJUMP_UPLOAD_URL", "https://uploads.filejump.com/api/upload"),
                 "HAS_API_KEY": bool(os.getenv("FILEJUMP_API_KEY", "").strip())
             },
-            "config": load_config()
+            "config": cfg
         })
 
     data = request.json or {}
@@ -319,6 +568,7 @@ def api_settings():
     if env_updates.get("FILEJUMP_UPLOAD_URL"):
         set_key(str(ENV_FILE), "FILEJUMP_UPLOAD_URL", env_updates["FILEJUMP_UPLOAD_URL"].strip())
 
+    remote_sync_msg = ""
     if "config" in data:
         existing_cfg = load_config()
         incoming_cfg = data["config"]
@@ -327,9 +577,20 @@ def api_settings():
         if "tasks" not in incoming_cfg:
             incoming_cfg["tasks"] = existing_cfg.get("tasks", [])
         save_config(incoming_cfg)
-        log_event("info", f"Configuración guardada en sync_config.json ({len(incoming_cfg.get('tasks', []))} perfil(es)).")
 
-    return jsonify({"success": True})
+        machine_name = get_machine_name()
+        client = FileJumpClient()
+        if client.api_key:
+            ok_rem, msg_rem = client.save_remote_machine_profiles(incoming_cfg)
+            if ok_rem:
+                remote_sync_msg = msg_rem
+                log_event("success", f"Perfiles de '{machine_name}' guardados en {REMOTE_APP_CONFIG_DIR}/{machine_name}/")
+            else:
+                log_event("warning", f"Guardado local OK, pero aviso en nube ({machine_name}): {msg_rem}")
+        else:
+            log_event("info", f"Configuración guardada localmente para equipo '{machine_name}'.")
+
+    return jsonify({"success": True, "machine_name": get_machine_name(), "remote_message": remote_sync_msg})
 
 
 @api_bp.route("/api/inspect/<task_name>", methods=["GET"])
