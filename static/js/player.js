@@ -328,6 +328,87 @@
             await playDockTrackAtOrderPos(musicOrderPos >= 0 ? musicOrderPos : 0);
         }
 
+
+
+        // =========================================================================
+        // LETRAS DE PISTA (TAG INCRUSTADO)
+        // =========================================================================
+        let lyricsEnabled = localStorage.getItem('fj_lyrics_enabled') !== 'false';
+
+        function initLyricsCheckboxState() {
+            const cb = document.getElementById('dockLyricsEnabledCheckbox');
+            if (cb) cb.checked = lyricsEnabled;
+            applyLyricsBoxVisibility();
+        }
+
+        function applyLyricsBoxVisibility() {
+            const box = document.getElementById('dockLyricsTextBox');
+            if (!box) return;
+            if (lyricsEnabled) {
+                box.classList.remove('hidden');
+            } else {
+                box.classList.add('hidden');
+            }
+        }
+
+        function onToggleLyricsCheckbox(isChecked) {
+            lyricsEnabled = Boolean(isChecked);
+            localStorage.setItem('fj_lyrics_enabled', lyricsEnabled ? 'true' : 'false');
+            applyLyricsBoxVisibility();
+            if (musicOrderPos >= 0 && musicPlayOrder.length > 0) {
+                const track = musicPlaylist[musicPlayOrder[musicOrderPos]];
+                if (track) renderEmbeddedLyrics(track.id3_lyrics || '');
+            }
+        }
+
+        function renderEmbeddedLyrics(lyrics) {
+            const box = document.getElementById('dockLyricsTextBox');
+            const badge = document.getElementById('dockLyricsSourceBadge');
+            if (!box) return;
+            const text = String(lyrics || '').trim();
+            box.textContent = text || 'Este archivo no contiene letras incrustadas.';
+            box.scrollTop = 0;
+            if (badge) badge.textContent = text ? 'TAG incrustado' : 'Sin letra incrustada';
+        }
+
+        function updateDockDjTagsUI(genreText = '', keyText = '') {
+            const wrap = document.getElementById('dockTrackDjTags');
+            const genreBadge = document.getElementById('dockTrackGenreBadge');
+            const genreEl = document.getElementById('dockTrackGenre');
+            const keyBadge = document.getElementById('dockTrackKeyBadge');
+            const keyEl = document.getElementById('dockTrackKey');
+            if (!wrap || !genreBadge || !genreEl || !keyBadge || !keyEl) return;
+
+            const cleanGenre = String(genreText || '').trim();
+            const cleanKey = String(keyText || '').trim();
+
+            if (cleanGenre) {
+                genreEl.textContent = cleanGenre;
+                genreBadge.title = `Género: ${cleanGenre}`;
+                genreBadge.classList.remove('hidden');
+            } else {
+                genreEl.textContent = '';
+                genreBadge.classList.add('hidden');
+            }
+
+            if (cleanKey) {
+                keyEl.textContent = cleanKey;
+                keyBadge.title = `Tonalidad DJ: ${cleanKey}`;
+                keyBadge.classList.remove('hidden');
+            } else {
+                keyEl.textContent = '';
+                keyBadge.classList.add('hidden');
+            }
+
+            if (cleanGenre || cleanKey) {
+                wrap.classList.remove('hidden');
+                wrap.classList.add('flex');
+            } else {
+                wrap.classList.add('hidden');
+                wrap.classList.remove('flex');
+            }
+        }
+
         async function playDockTrackAtOrderPos(orderPos) {
             if (musicPlayOrder.length === 0 || orderPos < 0 || orderPos >= musicPlayOrder.length) return;
             musicOrderPos = orderPos;
@@ -346,6 +427,16 @@
             document.getElementById('dockTrackTitle').title = track.name || fallbackTitle;
             document.getElementById('dockTrackArtist').textContent = musicSource === 'remote' ? 'Cargando desde FileJump...' : 'Archivo local';
             document.getElementById('dockTrackAlbum').textContent = '';
+            updateDockDjTagsUI(track.id3_genre || '', track.id3_key || '');
+            initLyricsCheckboxState();
+            const lyrBox = document.getElementById('dockLyricsTextBox');
+            const lyrBadge = document.getElementById('dockLyricsSourceBadge');
+            if (lyrBox) {
+                lyrBox.innerHTML = '<span class="text-slate-500 italic">Leyendo TAG de la pista...</span>';
+            }
+            if (lyrBadge) {
+                lyrBadge.textContent = '';
+            }
             document.getElementById('miniTrackTitle').textContent = fallbackTitle;
             document.getElementById('miniTrackArtist').textContent = 'Reproduciendo...';
             document.getElementById('dockTrackCounter').textContent = `(${musicOrderPos + 1}/${musicPlayOrder.length})`;
@@ -416,13 +507,21 @@
                     const title = meta.title || fallbackTitle;
                     const artist = meta.artist || 'Artista desconocido';
                     const album = meta.album || '';
+                    const genre = meta.genre || '';
+                    const musicalKey = meta.key || '';
+                    const embeddedLyrics = meta.lyrics || '';
                     track.id3_title = title;
                     track.id3_artist = artist;
                     track.id3_album = album;
+                    track.id3_genre = genre;
+                    track.id3_key = musicalKey;
+                    track.id3_lyrics = embeddedLyrics;
                     document.getElementById('dockTrackTitle').textContent = title;
                     document.getElementById('dockTrackTitle').title = title;
                     document.getElementById('dockTrackArtist').textContent = artist;
                     document.getElementById('dockTrackAlbum').textContent = album;
+                    updateDockDjTagsUI(genre, musicalKey);
+                    renderEmbeddedLyrics(embeddedLyrics);
                     document.getElementById('miniTrackTitle').textContent = title;
                     document.getElementById('miniTrackArtist').textContent = artist;
                     renderMusicPlaylist();

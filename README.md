@@ -35,7 +35,8 @@
 
 ### 🎵 Reproductor Musical Flotante (ID3 + EQ 5 Bandas + Visualizador)
 * **3 Modos de Vista:** Minimizado en burbuja compacta tipo chat en vivo, panel flotante normal o vista **Maximizada** con carátula en gran tamaño y lista de reproducción (*Playlist*).
-* **Lector Nativo de Metadatos ID3v2 / ID3v1:** Extrae Título, Artista, Álbum y **carátula incrustada (`APIC`)** directamente desde los MP3 locales o remotos; permite ampliar la imagen y descargarla conservando el formato.
+* **Metadatos musicales:** Extrae Título, Artista, Álbum, **género** desde `TCON`/ID3v1 y metadatos compatibles, y **tonalidad DJ** desde `TKEY` o campos `TXXX` (como `INITIALKEY`, `KEY` y `CAMELOT`). Para formatos no ID3 también consulta etiquetas de `ffprobe`, si está instalado.
+* **Carátula y letras incrustadas:** Lee la carátula (`APIC`) y letras desde `USLT` o etiquetas `TXXX` del archivo; permite ampliar y descargar la carátula. El panel de letras muestra únicamente contenido incrustado en la pista y puede ocultarse con una preferencia persistida localmente.
 * **Precarga en Caché + Modo Aleatorio:** Genera colas aleatorias y descarga en segundo plano la siguiente canción remota para una reproducción sin interrupciones.
 * **Ecualizador Gráfico de 5 Bandas (`Web Audio API`):** Bandas de `60Hz`, `230Hz`, `910Hz`, `3.6kHz` y `14kHz` (`-12 dB` a `+12 dB`) con presets (*Plano, Bass Boost, Electrónica, Pop, Rock, Vocal*).
 * **Visualizador Rítmico en Tiempo Real:** Analizador de espectro en `<canvas>` activable/desactivable con 3 modos visuales (*Barras, Espejo, Onda*).
@@ -50,6 +51,7 @@
 * **Perfiles únicos por equipo:** Al actualizar perfiles se reemplaza la copia remota anterior para conservar un único `sync_profiles.json` por equipo.
 * **Gestor de playlists estable:** La función global `escapeHtml()` evita errores al renderizar los nombres de las listas guardadas.
 * **Metadatos y fechas preservados:** Las playlists M3U guardan los datos necesarios para resolver archivos locales y remotos; las transferencias conservan la fecha de modificación original cuando está disponible.
+* **Servidor Flask concurrente:** Atiende solicitudes en paralelo para que la reproducción y las operaciones de la interfaz no se bloqueen entre sí.
 
 ---
 

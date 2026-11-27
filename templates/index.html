@@ -625,6 +625,14 @@
                                 <div id="dockTrackTitle" class="text-sm font-bold text-white truncate" title="">Título de canción</div>
                                 <div id="dockTrackArtist" class="text-xs text-indigo-300 truncate mt-0.5">Artista desconocido</div>
                                 <div id="dockTrackAlbum" class="text-[11px] text-slate-400 truncate mt-0.5"></div>
+                                <div id="dockTrackDjTags" class="hidden flex-wrap items-center gap-1.5 mt-1.5">
+                                    <span id="dockTrackGenreBadge" class="hidden inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-indigo-500/15 border border-indigo-500/30 text-[10px] font-medium text-indigo-200 max-w-[170px] truncate" title="Género (TAG ID3)">
+                                        <span>🏷️</span><span id="dockTrackGenre" class="truncate"></span>
+                                    </span>
+                                    <span id="dockTrackKeyBadge" class="hidden inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/35 text-[10px] font-mono font-semibold text-amber-300 shrink-0" title="Tonalidad DJ (Initial Key / Camelot)">
+                                        <span>🎹</span><span id="dockTrackKey"></span>
+                                    </span>
+                                </div>
                             </div>
                         </div>
                         <div class="flex flex-col items-center gap-1.5 shrink-0">
@@ -637,6 +645,20 @@
                             <button type="button" id="dockSavedPlaylistsBtn" onclick="openSavedPlaylistsModal()" class="hidden w-8 h-8 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-300 hover:text-white flex items-center justify-center text-sm transition shrink-0" title="Abrir listas de reproducción (.m3u) guardadas en filejump_sync_studio/playlist">
                                 📂
                             </button>
+                        </div>
+                    </div>
+
+                    <!-- Panel de letras incrustadas en la pista -->
+                    <div id="dockLyricsSection" class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5 space-y-2">
+                        <div class="flex items-center justify-between gap-2">
+                            <label for="dockLyricsEnabledCheckbox" class="inline-flex items-center gap-2 cursor-pointer select-none">
+                                <input type="checkbox" id="dockLyricsEnabledCheckbox" checked onchange="onToggleLyricsCheckbox(this.checked)" class="w-3.5 h-3.5 rounded border-slate-600 bg-slate-900 text-indigo-500 focus:ring-indigo-500/40 cursor-pointer">
+                                <span class="text-[11px] font-semibold text-slate-200">Letras de Pista</span>
+                            </label>
+                            <span id="dockLyricsSourceBadge" class="text-[10px] text-slate-400 truncate max-w-[160px]" title="Las letras se leen únicamente desde los metadatos incrustados"></span>
+                        </div>
+                        <div id="dockLyricsTextBox" class="h-24 overflow-y-auto pr-1.5 text-xs text-slate-300 leading-relaxed whitespace-pre-line font-sans bg-slate-900/60 border border-slate-800/80 rounded-lg px-2.5 py-2 select-text">
+                            <span class="text-slate-500 italic">Esperando lectura de metadatos de la pista...</span>
                         </div>
                     </div>
 
