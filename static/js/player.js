@@ -331,9 +331,11 @@
 
 
         // =========================================================================
-        // LETRAS DE PISTA (TAG INCRUSTADO)
+        // LETRAS DE PISTA (TAG INCRUSTADO O BÚSQUEDA EN INTERNET + ALTERNATIVAS)
         // =========================================================================
         let lyricsEnabled = localStorage.getItem('fj_lyrics_enabled') !== 'false';
+        let lyricsSeenHashesByTrack = {};
+        let currentLyricsFetchToken = 0;
 
         function initLyricsCheckboxState() {
             const cb = document.getElementById('dockLyricsEnabledCheckbox');
@@ -343,11 +345,16 @@
 
         function applyLyricsBoxVisibility() {
             const box = document.getElementById('dockLyricsTextBox');
+            const refBtn = document.getElementById('dockLyricsRefreshBtn');
+            const badge = document.getElementById('dockLyricsSourceBadge');
             if (!box) return;
             if (lyricsEnabled) {
                 box.classList.remove('hidden');
+                if (refBtn) refBtn.disabled = false;
             } else {
                 box.classList.add('hidden');
+                if (refBtn) refBtn.disabled = true;
+                if (badge) badge.textContent = 'Deshabilitado';
             }
         }
 
@@ -355,20 +362,97 @@
             lyricsEnabled = Boolean(isChecked);
             localStorage.setItem('fj_lyrics_enabled', lyricsEnabled ? 'true' : 'false');
             applyLyricsBoxVisibility();
-            if (musicOrderPos >= 0 && musicPlayOrder.length > 0) {
+            if (lyricsEnabled && musicOrderPos >= 0 && musicPlayOrder.length > 0) {
                 const track = musicPlaylist[musicPlayOrder[musicOrderPos]];
-                if (track) renderEmbeddedLyrics(track.id3_lyrics || '');
+                if (track) {
+                    fetchTrackLyrics(track, false);
+                }
             }
         }
 
-        function renderEmbeddedLyrics(lyrics) {
+        function getCurrentTrackLyricsKey(track) {
+            if (!track) return '';
+            return String(track.id || track.full_path || track.name || '');
+        }
+
+        async function fetchTrackLyrics(track, forceAlternative = false) {
             const box = document.getElementById('dockLyricsTextBox');
             const badge = document.getElementById('dockLyricsSourceBadge');
-            if (!box) return;
-            const text = String(lyrics || '').trim();
-            box.textContent = text || 'Este archivo no contiene letras incrustadas.';
-            box.scrollTop = 0;
-            if (badge) badge.textContent = text ? 'TAG incrustado' : 'Sin letra incrustada';
+            const refBtn = document.getElementById('dockLyricsRefreshBtn');
+            if (!box || !track) return;
+
+            if (!lyricsEnabled) {
+                applyLyricsBoxVisibility();
+                return;
+            }
+
+            const trackKey = getCurrentTrackLyricsKey(track);
+            if (!forceAlternative) {
+                lyricsSeenHashesByTrack[trackKey] = [];
+            }
+            const seenHashes = lyricsSeenHashesByTrack[trackKey] || [];
+            const token = ++currentLyricsFetchToken;
+
+            box.innerHTML = `<span class="text-indigo-300 animate-pulse">${forceAlternative ? 'Buscando otra opción de letra en internet...' : 'Buscando letra de la canción...'}</span>`;
+            if (badge) badge.textContent = 'Buscando...';
+            if (refBtn) {
+                refBtn.disabled = true;
+                refBtn.classList.add('animate-spin');
+            }
+
+            try {
+                const res = await fetch('/api/file/audio_lyrics', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        title: track.id3_title || (track.name || '').replace(/\.[^/.]+$/, ''),
+                        artist: track.id3_artist || '',
+                        embedded_lyrics: track.id3_lyrics || '',
+                        exclude_hashes: seenHashes
+                    })
+                });
+                const data = await res.json();
+                if (token !== currentLyricsFetchToken) return;
+
+                if (res.ok && data.success && data.lyrics) {
+                    if (data.hash && !seenHashes.includes(data.hash)) {
+                        seenHashes.push(data.hash);
+                        lyricsSeenHashesByTrack[trackKey] = seenHashes;
+                    }
+                    box.textContent = data.lyrics;
+                    box.scrollTop = 0;
+                    if (badge) {
+                        badge.textContent = data.source || 'Letra encontrada';
+                        badge.title = `${data.source || ''} • ${data.matched_artist || ''} - ${data.matched_title || ''}`;
+                    }
+                } else {
+                    if (forceAlternative && data.no_more_alternatives && seenHashes.length > 0) {
+                        // Mantener la letra actual en pantalla y avisar en el badge
+                        if (badge) badge.textContent = 'Sin más opciones';
+                        showNotice('Letras de Pista', data.error || 'No se encontraron más opciones diferentes de letra.');
+                    } else {
+                        box.innerHTML = `<span class="text-slate-500 italic">${escapeHtml(data.error || 'No se encontró letra para esta pista.')}</span>`;
+                        if (badge) badge.textContent = 'Sin letra';
+                    }
+                }
+            } catch (e) {
+                if (token !== currentLyricsFetchToken) return;
+                const detail = e && e.message ? ` (${escapeHtml(e.message)})` : '';
+                box.innerHTML = `<span class="text-rose-400/90 italic">No se pudo consultar la letra en este momento${detail}.</span>`;
+                if (badge) badge.textContent = 'Error';
+            } finally {
+                if (token === currentLyricsFetchToken && refBtn) {
+                    refBtn.disabled = !lyricsEnabled;
+                    refBtn.classList.remove('animate-spin');
+                }
+            }
+        }
+
+        function refreshTrackLyricsAlternative() {
+            if (!lyricsEnabled || musicOrderPos < 0 || musicPlayOrder.length === 0) return;
+            const track = musicPlaylist[musicPlayOrder[musicOrderPos]];
+            if (!track) return;
+            fetchTrackLyrics(track, true);
         }
 
         function updateDockDjTagsUI(genreText = '', keyText = '') {
@@ -431,10 +515,10 @@
             initLyricsCheckboxState();
             const lyrBox = document.getElementById('dockLyricsTextBox');
             const lyrBadge = document.getElementById('dockLyricsSourceBadge');
-            if (lyrBox) {
+            if (lyrBox && lyricsEnabled) {
                 lyrBox.innerHTML = '<span class="text-slate-500 italic">Leyendo TAG de la pista...</span>';
             }
-            if (lyrBadge) {
+            if (lyrBadge && lyricsEnabled) {
                 lyrBadge.textContent = '';
             }
             document.getElementById('miniTrackTitle').textContent = fallbackTitle;
@@ -452,7 +536,7 @@
 
             initDockWebAudio(audioEl);
             if (audioCtx && audioCtx.state === 'suspended') {
-                audioCtx.resume().catch(() => {});
+                audioCtx.resume().catch(() => { if (lyricsEnabled) fetchTrackLyrics(track, false); });
             }
 
             audioEl.src = streamUrl;
@@ -521,7 +605,9 @@
                     document.getElementById('dockTrackArtist').textContent = artist;
                     document.getElementById('dockTrackAlbum').textContent = album;
                     updateDockDjTagsUI(genre, musicalKey);
-                    renderEmbeddedLyrics(embeddedLyrics);
+                    if (lyricsEnabled) {
+                        fetchTrackLyrics(track, false);
+                    }
                     document.getElementById('miniTrackTitle').textContent = title;
                     document.getElementById('miniTrackArtist').textContent = artist;
                     renderMusicPlaylist();

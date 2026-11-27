@@ -648,14 +648,19 @@
                         </div>
                     </div>
 
-                    <!-- Panel de letras incrustadas en la pista -->
+                    <!-- Panel de Letras de Pista (Incrustada o Internet) -->
                     <div id="dockLyricsSection" class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5 space-y-2">
                         <div class="flex items-center justify-between gap-2">
                             <label for="dockLyricsEnabledCheckbox" class="inline-flex items-center gap-2 cursor-pointer select-none">
                                 <input type="checkbox" id="dockLyricsEnabledCheckbox" checked onchange="onToggleLyricsCheckbox(this.checked)" class="w-3.5 h-3.5 rounded border-slate-600 bg-slate-900 text-indigo-500 focus:ring-indigo-500/40 cursor-pointer">
                                 <span class="text-[11px] font-semibold text-slate-200">Letras de Pista</span>
                             </label>
-                            <span id="dockLyricsSourceBadge" class="text-[10px] text-slate-400 truncate max-w-[160px]" title="Las letras se leen únicamente desde los metadatos incrustados"></span>
+                            <div class="flex items-center gap-1.5 min-w-0">
+                                <span id="dockLyricsSourceBadge" class="text-[10px] text-slate-400 truncate max-w-[160px]" title="Origen de la letra"></span>
+                                <button type="button" id="dockLyricsRefreshBtn" onclick="refreshTrackLyricsAlternative()" class="w-6 h-6 rounded-lg bg-slate-800 hover:bg-indigo-600/35 border border-slate-700 hover:border-indigo-500/50 text-indigo-300 hover:text-white flex items-center justify-center text-xs transition shrink-0" title="Actualizar y buscar otra opción de letra">
+                                    🔄
+                                </button>
+                            </div>
                         </div>
                         <div id="dockLyricsTextBox" class="h-24 overflow-y-auto pr-1.5 text-xs text-slate-300 leading-relaxed whitespace-pre-line font-sans bg-slate-900/60 border border-slate-800/80 rounded-lg px-2.5 py-2 select-text">
                             <span class="text-slate-500 italic">Esperando lectura de metadatos de la pista...</span>

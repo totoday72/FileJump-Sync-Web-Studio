@@ -1,10 +1,14 @@
 import os
+import re
 import json
 import sys
 import time
 import uuid
 import shutil
 import hashlib
+import unicodedata
+import urllib.parse
+import html as html_lib
 import mimetypes
 import subprocess
 import threading
@@ -1547,6 +1551,339 @@ def api_file_audio_meta():
         return jsonify({"error": err}), 404
     meta = extract_id3_metadata(file_path)
     return jsonify(meta)
+
+
+def _strip_accents(text):
+    """Elimina tildes y diacríticos manteniendo la Ñ/ñ o normalizando ASCII según se requiera."""
+    if not text:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", str(text))
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
+def _normalize_lyrics_text(raw_text):
+    """Limpia marcas de tiempo LRC opcionales, entidades HTML y normaliza saltos de línea."""
+    if not raw_text:
+        return ""
+    unescaped = html_lib.unescape(str(raw_text))
+    lines = []
+    for line in unescaped.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        cleaned = re.sub(r"^\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]\s*", "", line).strip()
+        lines.append(cleaned)
+    text = "\n".join(lines).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def _lyrics_fingerprint(text):
+    norm = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    return hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _clean_track_title_variants(title, artist):
+    """Genera pares (artista, título) con variantes limpias y sin acentos para maximizar aciertos."""
+    t_orig = str(title or "").strip()
+    a_orig = str(artist or "").strip()
+    if a_orig.lower() in {"artista desconocido", "unknown artist", "desconocido", "various artists"}:
+        a_orig = ""
+
+    # Si el título trae "Artista - Título" y no había artista en el tag, separarlo
+    if not a_orig and " - " in t_orig:
+        parts = t_orig.split(" - ", 1)
+        a_orig = parts[0].strip()
+        t_orig = parts[1].strip()
+
+    variants = []
+    seen_pairs = set()
+
+    def add_pair(a_val, t_val):
+        a_c = str(a_val or "").strip()
+        t_c = str(t_val or "").strip()
+        if not t_c:
+            return
+        for pair in ((a_c, t_c), (_strip_accents(a_c), _strip_accents(t_c))):
+            key = (pair[0].lower(), pair[1].lower())
+            if pair[1] and key not in seen_pairs:
+                seen_pairs.add(key)
+                variants.append(pair)
+
+    add_pair(a_orig, t_orig)
+
+    # Quitar sufijos entre paréntesis o corchetes tipo (Radio Edit), (Original Mix), [Extended], etc.
+    t_no_parens = re.sub(
+        r"\s*[\(\[][^\)\]]*(?:mix|edit|version|remix|rework|dub|radio|extended|club|feat|ft\.|vip|bootleg|remaster|en vivo|live)[^\)\]]*[\)\]]",
+        "",
+        t_orig,
+        flags=re.IGNORECASE
+    ).strip()
+    add_pair(a_orig, t_no_parens)
+
+    t_strip_all_brackets = re.sub(r"\s*[\(\[][^\)\]]+[\)\]]", "", t_orig).strip()
+    add_pair(a_orig, t_strip_all_brackets)
+
+    # Limpiar colaboradores en artista ("Artist feat. X" -> "Artist")
+    if a_orig:
+        a_main = re.split(r"\s+(?:feat\.?|ft\.?|vs\.?|&|x|,)\s+", a_orig, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        add_pair(a_main, t_orig)
+        add_pair(a_main, t_no_parens)
+        add_pair(a_main, t_strip_all_brackets)
+
+    return variants
+
+
+def _query_lrclib_get(artist_q, title_q, headers):
+    results = []
+    try:
+        params = {"track_name": title_q}
+        if artist_q:
+            params["artist_name"] = artist_q
+        resp = requests.get("https://lrclib.net/api/get", params=params, headers=headers, timeout=6)
+        if resp.status_code == 200:
+            item = resp.json() or {}
+            lyr = item.get("plainLyrics") or item.get("syncedLyrics") or ""
+            if lyr:
+                results.append((
+                    lyr,
+                    "Internet (LRCLIB)",
+                    item.get("trackName") or title_q,
+                    item.get("artistName") or artist_q
+                ))
+    except Exception:
+        pass
+    return results
+
+
+def _query_lrclib_search(query_str, fallback_title, fallback_artist, headers):
+    results = []
+    try:
+        resp = requests.get("https://lrclib.net/api/search", params={"q": query_str}, headers=headers, timeout=6)
+        if resp.status_code == 200 and isinstance(resp.json(), list):
+            for item in resp.json()[:6]:
+                lyr = item.get("plainLyrics") or item.get("syncedLyrics") or ""
+                if lyr:
+                    alb = str(item.get("albumName") or "").strip()
+                    src_lbl = f"Internet (LRCLIB • {alb[:22]})" if alb else "Internet (LRCLIB)"
+                    results.append((
+                        lyr,
+                        src_lbl,
+                        item.get("trackName") or fallback_title,
+                        item.get("artistName") or fallback_artist
+                    ))
+    except Exception:
+        pass
+    return results
+
+
+def _query_lyrics_ovh(artist_q, title_q, headers):
+    results = []
+    if not artist_q or not title_q:
+        return results
+    try:
+        enc_a = urllib.parse.quote(artist_q)
+        enc_t = urllib.parse.quote(title_q)
+        resp = requests.get(f"https://api.lyrics.ovh/v1/{enc_a}/{enc_t}", headers=headers, timeout=6)
+        if resp.status_code == 200:
+            item = resp.json() or {}
+            lyr = item.get("lyrics") or ""
+            if lyr:
+                results.append((lyr, "Internet (Lyrics.ovh)", title_q, artist_q))
+    except Exception:
+        pass
+    return results
+
+
+def _query_letras_com(artist_q, title_q, headers):
+    """Consulta Letras.com (excelente cobertura para música en español como Los Temerarios, baladas, etc.)."""
+    results = []
+    if not artist_q or not title_q:
+        return results
+    try:
+        def slugify(val):
+            s = _strip_accents(val).lower().replace("ñ", "n")
+            s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+            return s
+
+        a_slug = slugify(artist_q)
+        t_slug = slugify(title_q)
+        if not a_slug or not t_slug:
+            return results
+        url = f"https://www.letras.com/{a_slug}/{t_slug}/"
+        resp = requests.get(url, headers=headers, timeout=6)
+        if resp.status_code == 200 and "lyric-original" in resp.text:
+            m = re.search(r'<div[^>]*class="[^"]*lyric-original[^"]*"[^>]*>(.*?)</div>', resp.text, flags=re.DOTALL | re.IGNORECASE)
+            if m:
+                block = m.group(1)
+                block = re.sub(r"<br\s*/?>", "\n", block, flags=re.IGNORECASE)
+                block = re.sub(r"</p>\s*<p[^>]*>", "\n\n", block, flags=re.IGNORECASE)
+                block = re.sub(r"<[^>]+>", "", block)
+                clean_text = _normalize_lyrics_text(block)
+                if len(clean_text) >= 30:
+                    results.append((clean_text, "Internet (Letras.com)", title_q, artist_q))
+    except Exception:
+        pass
+    return results
+
+
+
+def _query_musixmatch(artist_q, title_q, headers):
+    """Consulta Musixmatch (es/busqueda y página de letra) extrayendo __NEXT_DATA__ o bloques de letra."""
+    results = []
+    q_terms = f"{artist_q} {title_q}".strip()
+    if not q_terms:
+        return results
+    try:
+        search_url = f"https://www.musixmatch.com/es/busqueda?query={urllib.parse.quote(q_terms)}"
+        resp = requests.get(search_url, headers=headers, timeout=6)
+        if resp.status_code != 200:
+            return results
+
+        # Buscar enlaces a canciones /es/letras/... o /lyrics/...
+        links = re.findall(r'href="(/(?:es/letras|lyrics)/[^"?#]+)"', resp.text, flags=re.IGNORECASE)
+        seen_links = []
+        for lk in links:
+            if lk not in seen_links:
+                seen_links.append(lk)
+
+        for lk in seen_links[:2]:
+            song_url = f"https://www.musixmatch.com{lk}"
+            s_resp = requests.get(song_url, headers=headers, timeout=6)
+            if s_resp.status_code != 200:
+                continue
+
+            # Intentar extraer desde __NEXT_DATA__ JSON
+            m_next = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', s_resp.text, flags=re.DOTALL)
+            if m_next:
+                try:
+                    nd = json.loads(m_next.group(1))
+                    raw_dump = json.dumps(nd)
+                    # Buscar campo "body" de lyrics en el JSON de Musixmatch
+                    for m_body in re.finditer(r'"body"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_dump):
+                        candidate_body = json.loads(f'"{m_body.group(1)}"')
+                        clean_lyr = _normalize_lyrics_text(candidate_body)
+                        if len(clean_lyr) >= 40 and "\n" in clean_lyr:
+                            results.append((clean_lyr, "Internet (Musixmatch)", title_q, artist_q))
+                            return results
+                except Exception:
+                    pass
+
+            # Fallback HTML de bloques mxm-lyrics__content
+            blocks = re.findall(r'<span[^>]*class="[^"]*lyrics__content[^"]*"[^>]*>(.*?)</span>', s_resp.text, flags=re.DOTALL | re.IGNORECASE)
+            if blocks:
+                joined = "\n".join(re.sub(r"<[^>]+>", "", b) for b in blocks)
+                clean_lyr = _normalize_lyrics_text(joined)
+                if len(clean_lyr) >= 40:
+                    results.append((clean_lyr, "Internet (Musixmatch)", title_q, artist_q))
+                    return results
+    except Exception:
+        pass
+    return results
+
+
+@api_bp.route("/api/file/audio_lyrics", methods=["POST"])
+def api_file_audio_lyrics():
+    """
+    Obtiene la letra de una pista de audio priorizando el TAG incrustado y luego
+    consultando en paralelo múltiples fuentes (LRCLIB, Letras.com y Lyrics.ovh).
+    Soporta excluir letras ya mostradas (`exclude_hashes`) para buscar otra opción.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        title = str(data.get("title") or "").strip()
+        artist = str(data.get("artist") or "").strip()
+        embedded = _normalize_lyrics_text(data.get("embedded_lyrics") or "")
+        exclude_hashes = set(str(h) for h in (data.get("exclude_hashes") or []) if h)
+
+        candidates = []
+        seen_hashes = set()
+
+        def push_candidate(raw_lyrics, source_label, matched_title="", matched_artist=""):
+            clean_lyr = _normalize_lyrics_text(raw_lyrics)
+            if not clean_lyr or len(clean_lyr) < 15:
+                return
+            fp = _lyrics_fingerprint(clean_lyr)
+            if fp in seen_hashes:
+                return
+            seen_hashes.add(fp)
+            candidates.append({
+                "lyrics": clean_lyr,
+                "hash": fp,
+                "source": source_label,
+                "matched_title": matched_title or title,
+                "matched_artist": matched_artist or artist
+            })
+
+        # 1. Letra incrustada en el archivo
+        if embedded:
+            push_candidate(embedded, "TAG Incrustado", title, artist)
+            if candidates and candidates[0]["hash"] not in exclude_hashes:
+                c0 = candidates[0]
+                return jsonify({
+                    "success": True,
+                    "lyrics": c0["lyrics"],
+                    "hash": c0["hash"],
+                    "source": c0["source"],
+                    "matched_title": c0["matched_title"],
+                    "matched_artist": c0["matched_artist"]
+                })
+
+        variants = _clean_track_title_variants(title, artist)
+        if not variants:
+            return jsonify({
+                "success": False,
+                "error": "No hay título o artista suficiente para buscar la letra."
+            }), 404
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FileJumpSyncStudio/1.0",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
+        }
+
+        # 2. Consultar en paralelo todas las fuentes con las variantes principales (con y sin acentos)
+        tasks = []
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            for a_q, t_q in variants[:2]:
+                tasks.append(executor.submit(_query_lrclib_get, a_q, t_q, headers))
+                tasks.append(executor.submit(_query_musixmatch, a_q, t_q, headers))
+                tasks.append(executor.submit(_query_letras_com, a_q, t_q, headers))
+                tasks.append(executor.submit(_query_lyrics_ovh, a_q, t_q, headers))
+                q_str = f"{a_q} {t_q}".strip()
+                tasks.append(executor.submit(_query_lrclib_search, q_str, t_q, a_q, headers))
+
+            for fut in as_completed(tasks, timeout=10):
+                try:
+                    items = fut.result() or []
+                    for lyr, src_lbl, m_title, m_artist in items:
+                        push_candidate(lyr, src_lbl, m_title, m_artist)
+                except Exception:
+                    pass
+
+        for cand in candidates:
+            if cand["hash"] not in exclude_hashes:
+                return jsonify({
+                    "success": True,
+                    "lyrics": cand["lyrics"],
+                    "hash": cand["hash"],
+                    "source": cand["source"],
+                    "matched_title": cand["matched_title"],
+                    "matched_artist": cand["matched_artist"]
+                })
+
+        if exclude_hashes and candidates:
+            return jsonify({
+                "success": False,
+                "no_more_alternatives": True,
+                "error": "No se encontraron más opciones diferentes de letra para esta canción."
+            }), 404
+
+        return jsonify({
+            "success": False,
+            "error": "No se encontró letra incrustada ni en internet para esta pista."
+        }), 404
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": f"Error interno al buscar letra: {exc}"
+        }), 500
 
 
 @api_bp.route("/api/file/prefetch", methods=["GET"])
